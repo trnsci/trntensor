@@ -2,7 +2,7 @@
 trntensor — Tensor contractions for AWS Trainium via NKI.
 
 Einstein summation, contraction planning, and tensor decompositions
-for scientific computing. Part of the trn-* suite by Playground Logic.
+for scientific computing. Part of the trnsci scientific computing suite.
 """
 
 __version__ = "0.1.0"

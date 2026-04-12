@@ -8,7 +8,7 @@
 
 Tensor contractions for AWS Trainium via NKI.
 
-Einstein summation with contraction planning, CP and Tucker decompositions. Expresses scientific tensor workloads naturally instead of decomposing to GEMM. Part of the **trn-\*** suite by [Playground Logic](https://playgroundlogic.co).
+Einstein summation with contraction planning, CP and Tucker decompositions. Expresses scientific tensor workloads naturally instead of decomposing to GEMM. Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
 ## Install
 
@@ -73,4 +73,4 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 
 ## License
 
-Apache 2.0 — Playground Logic LLC
+Apache 2.0 — Copyright 2026 Scott Friedman

@@ -1,7 +1,7 @@
 # trntensor
 
 Tensor contractions for AWS Trainium via NKI.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trnsci scientific computing suite.
 
 ## What This Is
 
