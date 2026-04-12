@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+.tox/
+.venv/
+venv/
+*.so
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+files.zip
+
+# Terraform — never commit state (leaks resource IDs and may contain secrets)
+infra/terraform/.terraform/
+infra/terraform/.terraform.lock.hcl
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/*.tfvars
+
+# mkdocs build output
+site/

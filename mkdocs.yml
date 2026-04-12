@@ -1,0 +1,30 @@
+site_name: trntensor
+site_description: Tensor contractions for AWS Trainium via NKI
+site_url: https://trnsci.github.io/trntensor/
+repo_url: https://github.com/trnsci/trntensor
+repo_name: trnsci/trntensor
+
+theme:
+  name: material
+  palette:
+    scheme: default
+    primary: indigo
+  features:
+    - content.code.copy
+    - navigation.sections
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quickstart: quickstart.md
+  - API Reference: api.md
+  - Architecture: architecture.md
+  - Deployment:
+      - AWS Setup for Neuron CI: aws_setup.md
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+  - toc:
+      permalink: true
