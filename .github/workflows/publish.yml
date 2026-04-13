@@ -22,6 +22,7 @@ jobs:
   publish-pypi:
     needs: build
     runs-on: ubuntu-latest
+    # Only publish stable releases (v1.2.3), not pre-releases (v1.2.3-rc1)
     if: ${{ !contains(github.event.release.tag_name, '-') }}
     environment:
       name: pypi
@@ -38,6 +39,7 @@ jobs:
   publish-testpypi:
     needs: build
     runs-on: ubuntu-latest
+    # Only publish pre-releases to TestPyPI
     if: ${{ contains(github.event.release.tag_name, '-') }}
     environment:
       name: testpypi
