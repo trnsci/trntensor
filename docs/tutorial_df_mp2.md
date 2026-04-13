@@ -92,6 +92,23 @@ for i in range(nocc):
 
 will reveal exactly where NKI is or isn't being used.
 
+## Fusing the whole calculation
+
+The Python loop above does 25 einsum calls, 25 elementwise passes, and 25 host reductions — each landing in HBM between steps. On Trainium, trntensor can compile the entire DF-MP2 energy into **one NKI program**:
+
+```python
+E = trntensor.mp2_energy(B, eps_occ, eps_vir)
+```
+
+Inside that single call:
+
+1. `T_ab = Σ_P B[i,a,P] B[j,b,P]` accumulates in PSUM via `nc_matmul`
+2. The spin-adapted numerator `(2T − T^T)` and the denominator `Δ_ab = ε_i + ε_j − ε_a − ε_b` are built on the Vector Engine from SBUF-resident ε tiles
+3. `(T·(2T − T^T) / Δ).sum()` folds into a scalar accumulator in SBUF
+4. One HBM partial per `(i, j)` pair; host sums to the final scalar
+
+No intermediate `T` tensor is ever materialized to HBM. See [API: quantum](api/quantum.md) and [Architecture](architecture.md) for the full description.
+
 ## Current limitations
 
 - The energy denominator is a separate element-wise op. A fused kernel that folds the division into the PSUM accumulation — `E = Σ T²/Δ` in one kernel — is tracked in [#13][i13]. Landing it collapses the pair-energy loop into a single tensor-engine invocation per `(i,j)`.

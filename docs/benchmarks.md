@@ -33,6 +33,19 @@ Both columns ran on the same trn1.2xlarge instance — CPU (Intel Xeon 8375C) vs
 
 **NKI wins**: 2048×2048 matmul (1.6× faster than CPU). All other sizes still favor CPU on this hardware.
 
+## DF-MP2 energy — fused vs Python-loop
+
+Fused `trntensor.mp2_energy` (single NKI program) vs the reference loop from `examples/df_mp2_einsum.py` (25–256 einsum calls), both on trn1.2xlarge:
+
+| Workload | Python loop | Fused NKI | Winner |
+|---|---:|---:|---|
+| `(nocc, nvir, naux) = (5, 19, 72)` | **1.5 ms** | 15.6 ms | Loop 10× |
+| `(nocc, nvir, naux) = (16, 128, 128)` | **25.5 ms** | 41.3 ms | Loop 1.6× |
+
+The fused kernel is **architecturally** what we want — one program, no intermediate HBM materialization of the four-index `T` tensor, PSUM/SBUF-resident across contract → elementwise → reduce. But NKI's per-call dispatch + compile overhead (~15–40 ms floor) still eats the win at current sizes. The gap closes with scale (10× → 1.6× as workload grows), consistent with the overhead being a fixed cost the compute amortizes. See [#33][i33] and [#34][i34].
+
+
+
 ## Size-based dispatch threshold
 
 Because per-call NKI dispatch currently carries ~1 ms of XLA launch overhead, `nki_matmul` and `nki_batched_matmul` short-circuit to the PyTorch path when the contraction is below `TRNTENSOR_MIN_NKI_FLOPS` (default **2 GFLOPs**, calibrated at ≈ half the smallest NKI-winning size). The `plan.backend` field reflects this: it reports `"nki"` only when the dispatch will actually invoke a kernel, and `"pytorch"` otherwise.
@@ -54,3 +67,4 @@ Recommendation for users:
 - Until #33 lands, tight loops of small contractions (DF-MP2 pair-energy style) see no NKI benefit and are served by the PyTorch path.
 
 [i33]: https://github.com/trnsci/trntensor/issues/33
+[i34]: https://github.com/trnsci/trntensor/issues/34
