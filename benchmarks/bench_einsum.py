@@ -64,19 +64,42 @@ class TestMp2Bench:
     """Compare the fused mp2_energy kernel against the Python-loop form."""
 
     @pytest.fixture
-    def mp2_inputs(self):
+    def mp2_inputs_small(self):
+        # Demo size — realistic for tiny molecules.
         nocc, nvir, naux = 5, 19, 72
         B = torch.randn(nocc, nvir, naux) * 0.1
         eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
         eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
         return B, eps_occ, eps_vir
 
-    def test_mp2_energy_fused(self, benchmark, mp2_inputs):
-        B, eps_occ, eps_vir = mp2_inputs
+    @pytest.fixture
+    def mp2_inputs_full(self):
+        # Saturate the single-tile kernel: nvir=naux=128 at nocc=16 yields
+        # 16² = 256 (i,j) pairs, each a 128×128 nc_matmul.
+        nocc, nvir, naux = 16, 128, 128
+        B = torch.randn(nocc, nvir, naux) * 0.1
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+        return B, eps_occ, eps_vir
+
+    def test_fused_small(self, benchmark, mp2_inputs_small):
+        B, eps_occ, eps_vir = mp2_inputs_small
         benchmark(trntensor.mp2_energy, B, eps_occ, eps_vir)
 
-    def test_mp2_energy_python_loop(self, benchmark, mp2_inputs):
-        B, eps_occ, eps_vir = mp2_inputs
+    def test_loop_small(self, benchmark, mp2_inputs_small):
+        B, eps_occ, eps_vir = mp2_inputs_small
+        self._run_loop(benchmark, B, eps_occ, eps_vir)
+
+    def test_fused_full(self, benchmark, mp2_inputs_full):
+        B, eps_occ, eps_vir = mp2_inputs_full
+        benchmark(trntensor.mp2_energy, B, eps_occ, eps_vir)
+
+    def test_loop_full(self, benchmark, mp2_inputs_full):
+        B, eps_occ, eps_vir = mp2_inputs_full
+        self._run_loop(benchmark, B, eps_occ, eps_vir)
+
+    @staticmethod
+    def _run_loop(benchmark, B, eps_occ, eps_vir):
         # The old "trntensor.einsum inside a Python loop" form — what
         # the fused kernel replaces.
         def loop():
