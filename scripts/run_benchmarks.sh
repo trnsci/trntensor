@@ -19,7 +19,7 @@ set -euo pipefail
 
 INSTANCE_TYPE="${1:-trn1}"
 TAG="trntensor-ci-${INSTANCE_TYPE}"
-REGION="${AWS_REGION:-us-east-1}"
+REGION="${AWS_REGION:-us-west-2}"
 SHA="$(git rev-parse HEAD)"
 LOCAL_OUT="${BENCH_OUTPUT:-benchmark_results.json}"
 

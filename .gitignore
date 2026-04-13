@@ -31,3 +31,8 @@ site/
 # coverage artifacts
 .coverage
 htmlcov/
+
+# terraform local state
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate*
+infra/terraform/.terraform.lock.hcl

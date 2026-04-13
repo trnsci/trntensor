@@ -11,7 +11,7 @@ terraform {
 variable "aws_region" {
   description = "AWS region for the CI instance"
   type        = string
-  default     = "us-east-1"
+  default     = "us-west-2"
 }
 
 variable "instance_type" {

@@ -72,16 +72,17 @@ def _execute_contraction(
 
 
 def _execute_matmul(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
-    """Execute as a single matmul (2D contraction)."""
+    """Execute as a single matmul (2D contraction).
+
+    Pre-transposes per the plan so the NKI kernel always sees the
+    canonical ``A @ B`` form.
+    """
+    from .nki.dispatch import nki_matmul
+
     A, B = operands
-    if plan.transA and plan.transB:
-        return torch.matmul(A.T, B.T)
-    elif plan.transA:
-        return torch.matmul(A.T, B)
-    elif plan.transB:
-        return torch.matmul(A, B.T)
-    else:
-        return torch.matmul(A, B)
+    a = A.T if plan.transA else A
+    b = B.T if plan.transB else B
+    return nki_matmul(a, b)
 
 
 def _execute_bmm(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
