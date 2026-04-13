@@ -33,17 +33,29 @@ class ContractionPlan:
     estimated_flops: int = 0
 
 
-def _backend_for(strategy: str) -> str:
+def _backend_for(strategy: str, operands: tuple) -> str:
     """Resolve which executor will run a given strategy.
 
     Returns ``"nki"`` only when the strategy maps to a NKI kernel
-    (``matmul`` or ``bmm``) and ``neuronxcc`` is importable.
+    (``matmul`` or ``bmm``), ``neuronxcc`` is importable, and the
+    contraction has enough FLOPs to clear the dispatch-overhead
+    threshold. Otherwise returns ``"pytorch"`` — matching what
+    ``nki_matmul`` / ``nki_batched_matmul`` will do at runtime.
     """
-    if strategy in ("matmul", "bmm"):
-        from .nki.dispatch import HAS_NKI
-        if HAS_NKI:
-            return "nki"
-    return "pytorch"
+    if strategy not in ("matmul", "bmm"):
+        return "pytorch"
+    from .nki.dispatch import HAS_NKI, _MIN_NKI_FLOPS
+    if not HAS_NKI:
+        return "pytorch"
+    if strategy == "matmul":
+        M, K = operands[0].shape
+        _, N = operands[1].shape
+        flops = M * K * N
+    else:  # bmm
+        Bsz, M, K = operands[0].shape
+        _, _, N = operands[1].shape
+        flops = Bsz * M * K * N
+    return "nki" if flops >= _MIN_NKI_FLOPS else "pytorch"
 
 
 def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPlan:
@@ -55,7 +67,7 @@ def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPla
         plan = _plan_binary(subscripts, input_indices, output_str, operands)
     else:
         plan = ContractionPlan(subscripts=subscripts, strategy="torch")
-    plan.backend = _backend_for(plan.strategy)
+    plan.backend = _backend_for(plan.strategy, operands)
     return plan
 
 

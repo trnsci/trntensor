@@ -16,8 +16,15 @@ RTOL = 1e-4
 
 
 @pytest.fixture
-def nki_backend():
+def nki_backend(monkeypatch):
+    """Force the NKI path for the duration of the test, ignoring the
+    FLOP threshold that would otherwise send small shapes to ``torch``.
+    The kernels themselves need to be exercised even when the wrapper
+    would decline them for performance reasons.
+    """
     import trntensor
+    from trntensor.nki import dispatch
+    monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS", 0)
     prev = trntensor.get_backend()
     trntensor.set_backend("nki")
     yield

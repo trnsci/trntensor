@@ -64,18 +64,26 @@ class TestPlanStrategy:
     def test_backend_reports_nki_or_pytorch(self):
         """`plan.backend` reports the executor that will run the contraction.
 
-        On Neuron hosts, matmul/bmm strategies report `"nki"`; on CPU they
-        report `"pytorch"`. The torch fallback always reports `"pytorch"`.
+        On Neuron hosts, matmul/bmm strategies large enough to clear the
+        dispatch-overhead threshold report `"nki"`; smaller matmuls and
+        the torch fallback always report `"pytorch"`.
         """
         from trntensor.nki.dispatch import HAS_NKI
 
-        plan_mm = trntensor.plan_contraction(
+        # Large matmul — above _MIN_NKI_FLOPS (2 GFLOPs) on Neuron.
+        plan_big = trntensor.plan_contraction(
+            "ij,jk->ik", torch.randn(2048, 2048), torch.randn(2048, 2048)
+        )
+        # Small matmul — below threshold, falls back to PyTorch even on Neuron.
+        plan_small = trntensor.plan_contraction(
             "ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5)
         )
+        # 3-operand contraction — never a NKI strategy.
         plan_torch = trntensor.plan_contraction(
             "ij,jk,kl->il", torch.randn(3, 4), torch.randn(4, 5), torch.randn(5, 2)
         )
-        assert plan_mm.backend == ("nki" if HAS_NKI else "pytorch")
+        assert plan_big.backend == ("nki" if HAS_NKI else "pytorch")
+        assert plan_small.backend == "pytorch"
         assert plan_torch.backend == "pytorch"
 
 

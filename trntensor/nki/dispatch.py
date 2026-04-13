@@ -23,6 +23,14 @@ from ._kernels import HAS_NKI, TILE_K, TILE_M, TILE_N
 # validation suite to surface silent kernel breakage during iteration.
 _REQUIRE_NKI = os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
 
+# Total-FLOP threshold below which we skip NKI and use torch.matmul / torch.bmm
+# directly. The NKI wrapper has ~1 ms of XLA dispatch overhead per call; for
+# small contractions the PyTorch path finishes in less time than the overhead
+# alone. Calibrated on trn1.2xlarge: matmul_2048 (8.6 GFLOPs) wins with NKI,
+# matmul_1024 (1.07 GFLOPs) loses. Set the threshold at 2 GFLOPs conservatively;
+# override with TRNTENSOR_MIN_NKI_FLOPS.
+_MIN_NKI_FLOPS = int(os.environ.get("TRNTENSOR_MIN_NKI_FLOPS", "2000000000"))
+
 _backend = "auto"
 
 
@@ -77,10 +85,13 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     if not (_use_nki() and HAS_NKI):
         return torch.matmul(A, B)
 
-    from ._kernels import matmul_kernel
-
     M, K = A.shape
     _, N = B.shape
+    # Skip NKI when dispatch overhead would exceed kernel work.
+    if M * K * N < _MIN_NKI_FLOPS:
+        return torch.matmul(A, B)
+
+    from ._kernels import matmul_kernel
     M_pad = _round_up(M, TILE_M)
     K_pad = _round_up(K, TILE_K)
     N_pad = N if N <= TILE_N else _round_up(N, TILE_N)
@@ -115,10 +126,12 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     if not (_use_nki() and HAS_NKI):
         return torch.bmm(A, B)
 
-    from ._kernels import batched_matmul_kernel
-
     Bsz, M, K = A.shape
     _, _, N = B.shape
+    if Bsz * M * K * N < _MIN_NKI_FLOPS:
+        return torch.bmm(A, B)
+
+    from ._kernels import batched_matmul_kernel
     M_pad = _round_up(M, TILE_M)
     K_pad = _round_up(K, TILE_K)
     N_pad = N if N <= TILE_N else _round_up(N, TILE_N)
