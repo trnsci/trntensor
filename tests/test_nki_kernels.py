@@ -80,3 +80,53 @@ class TestNkiMatmul:
         out = trntensor.einsum("ij,jk->ik", A, B)
         ref = A @ B
         torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+    def test_df_mp2_pair_pattern(self, nki_backend):
+        """``ap,bp->ab`` — DF-MP2 pair contraction. Verifies #12 is covered
+        by the existing 2-index matmul kernel via ``plan.transB=True``.
+        """
+        import trntensor
+
+        torch.manual_seed(5)
+        nvir, naux = 19, 72
+        Bi = torch.randn(nvir, naux)
+        Bj = torch.randn(nvir, naux)
+        out = trntensor.einsum("ap,bp->ab", Bi, Bj)
+        ref = Bi @ Bj.T
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+
+class TestNkiBatchedMatmul:
+
+    def test_aligned_batch(self, nki_backend):
+        """Batch dim, M, K, N all aligned; exercises the base code path."""
+        import trntensor
+
+        torch.manual_seed(10)
+        A = torch.randn(4, 128, 128)
+        B = torch.randn(4, 128, 256)
+        out = trntensor.einsum("bij,bjk->bik", A, B)
+        ref = torch.bmm(A, B)
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+    def test_unpadded_inner(self, nki_backend):
+        """Irregular M, K, N within each batch slice; tests padding path."""
+        import trntensor
+
+        torch.manual_seed(11)
+        A = torch.randn(3, 100, 70)
+        B = torch.randn(3, 70, 200)
+        out = trntensor.einsum("bij,bjk->bik", A, B)
+        ref = torch.bmm(A, B)
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+    def test_large_N(self, nki_backend):
+        """Batched case with N > TILE_N; exercises N-tiling."""
+        import trntensor
+
+        torch.manual_seed(12)
+        A = torch.randn(2, 128, 128)
+        B = torch.randn(2, 128, 1024)
+        out = trntensor.einsum("bij,bjk->bik", A, B)
+        ref = torch.bmm(A, B)
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)

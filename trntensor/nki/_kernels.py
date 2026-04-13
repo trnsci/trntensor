@@ -69,3 +69,46 @@ if HAS_NKI:
                 )
 
         return c
+
+    @nki.jit
+    def batched_matmul_kernel(a, b):
+        """Batched ``C[b] = A[b] @ B[b]`` — one matmul per batch slice.
+
+        Caller pads (M, K, N) the same way as ``matmul_kernel``. The
+        batch dim is iterated with ``nl.affine_range``; each slice
+        reuses the stationary-A tile layout.
+        """
+        B, M, K = a.shape
+        _, _, N = b.shape
+
+        tile_m = TILE_M
+        tile_k = TILE_K
+        tile_n = N if N <= TILE_N else TILE_N
+
+        c = nl.ndarray((B, M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+
+        for batch in nl.affine_range(B):
+            for m in nl.affine_range(M // tile_m):
+                for n in nl.affine_range(N // tile_n):
+                    m_off = m * tile_m
+                    n_off = n * tile_n
+
+                    psum = nl.zeros((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
+
+                    for k in nl.affine_range(K // tile_k):
+                        k_off = k * tile_k
+                        a_t = nl.load_transpose2d(
+                            a[batch, m_off:m_off + tile_m, k_off:k_off + tile_k]
+                        )
+                        b_tile = nl.load(
+                            b[batch, k_off:k_off + tile_k, n_off:n_off + tile_n]
+                        )
+                        psum[...] += nisa.nc_matmul(a_t, b_tile)
+
+                    c_sbuf = nl.copy(psum, dtype=a.dtype)
+                    nl.store(
+                        c[batch, m_off:m_off + tile_m, n_off:n_off + tile_n],
+                        value=c_sbuf,
+                    )
+
+        return c

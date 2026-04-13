@@ -87,8 +87,10 @@ def _execute_matmul(subscripts: str, operands: tuple, plan: ContractionPlan) -> 
 
 def _execute_bmm(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
     """Execute as batched matmul."""
+    from .nki.dispatch import nki_batched_matmul
+
     A, B = operands
-    return torch.bmm(A, B)
+    return nki_batched_matmul(A, B)
 
 
 def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:

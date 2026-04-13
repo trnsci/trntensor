@@ -95,3 +95,41 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         if _REQUIRE_NKI:
             raise
         return torch.matmul(A, B)
+
+
+def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Batched 2D matmul ``A @ B`` over a leading batch dim.
+
+    Routes through ``batched_matmul_kernel`` on Trainium. Pads M, K
+    and N to tile multiples per slice; batch dim is passed through
+    unchanged. Falls back to ``torch.bmm`` on any kernel failure
+    unless ``TRNTENSOR_REQUIRE_NKI=1``.
+    """
+    if not (_use_nki() and HAS_NKI):
+        return torch.bmm(A, B)
+
+    from ._kernels import batched_matmul_kernel
+
+    Bsz, M, K = A.shape
+    _, _, N = B.shape
+    M_pad = _round_up(M, TILE_M)
+    K_pad = _round_up(K, TILE_K)
+    N_pad = N if N <= TILE_N else _round_up(N, TILE_N)
+    needs_pad = (M_pad != M) or (K_pad != K) or (N_pad != N)
+
+    try:
+        if needs_pad:
+            A_p = torch.zeros(Bsz, M_pad, K_pad, dtype=A.dtype, device=A.device)
+            A_p[:, :M, :K] = A
+            B_p = torch.zeros(Bsz, K_pad, N_pad, dtype=B.dtype, device=B.device)
+            B_p[:, :K, :N] = B
+            (a, b), orig_device = _to_xla(A_p.contiguous(), B_p.contiguous())
+        else:
+            (a, b), orig_device = _to_xla(A.contiguous(), B.contiguous())
+        c = batched_matmul_kernel(a, b)
+        result = c.to(orig_device)
+        return result[:, :M, :N] if needs_pad else result
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+        return torch.bmm(A, B)

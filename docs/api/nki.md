@@ -29,8 +29,15 @@ available, otherwise `False`.
 
 - `matmul_kernel(a, b)` — 2-index matmul with stationary-A tile reuse.
   Tile constants: `TILE_M=128`, `TILE_K=128`, `TILE_N=512`.
+- `batched_matmul_kernel(a, b)` — per-batch-slice matmul. Batch dim
+  iterated via `nl.affine_range`; each slice reuses the stationary-A
+  tile layout.
 
-Additional kernels (batched matmul, DF-MP2 pair, fused energy
-denominator) are tracked in milestone [v0.2.0][m2].
+The DF-MP2 pair pattern `einsum("ap,bp->ab")` is served by
+`matmul_kernel` through the planner's `transB=True` route — no
+dedicated kernel needed. Fused energy-denominator kernel is tracked
+in [#13][i13].
+
+[i13]: https://github.com/trnsci/trntensor/issues/13
 
 [m2]: https://github.com/trnsci/trntensor/milestone/2
