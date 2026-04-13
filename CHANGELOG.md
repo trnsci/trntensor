@@ -12,8 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mkdocs site with `index`, `installation`, `quickstart`, `api`, `architecture`, `aws_setup`
 - `infra/terraform/` for on-hardware CI instance provisioning
 - `scripts/run_neuron_tests.sh` and benchmark helpers
-- GitHub Actions `ci.yml` for CPU-only pytest matrix
-- `Issues` URL in pyproject.toml
+- GitHub Actions `ci.yml`, `docs.yml`, `publish.yml`
+- `Issues` and `Documentation` URLs in pyproject.toml
+- `tests/test_plan.py` — dedicated planner unit tests (parsing,
+  strategy selection, FLOP estimates); extended CP / Tucker coverage
+  (all-zero tensor, rank > min dim, unequal mode ranks)
 
 ### Changed
 
