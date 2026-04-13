@@ -27,3 +27,7 @@ infra/terraform/*.tfvars
 
 # mkdocs build output
 site/
+
+# coverage artifacts
+.coverage
+htmlcov/

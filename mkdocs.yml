@@ -6,6 +6,9 @@ repo_name: trnsci/trntensor
 
 theme:
   name: material
+  font:
+    text: Atkinson Hyperlegible
+    code: Atkinson Hyperlegible Mono
   palette:
     scheme: default
     primary: indigo
