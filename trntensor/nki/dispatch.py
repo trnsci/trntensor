@@ -41,6 +41,13 @@ def get_backend() -> str:
 
 
 def _use_nki() -> bool:
+    # Env-var override takes precedence so benchmarks can sweep backends
+    # without code changes (e.g. TRNTENSOR_FORCE_BACKEND=pytorch).
+    forced = os.environ.get("TRNTENSOR_FORCE_BACKEND", "").lower()
+    if forced == "nki":
+        return True
+    if forced == "pytorch":
+        return False
     if _backend == "nki":
         return True
     if _backend == "pytorch":
