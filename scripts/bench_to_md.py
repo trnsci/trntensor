@@ -67,7 +67,7 @@ def render_markdown(rows: dict, machine_info: dict | None = None) -> str:
     out.append("| Operation | Variant | Param | Median (μs) | vs trntensor-PyTorch |")
     out.append("|-----------|---------|-------|------------:|-------------------:|")
 
-    for (group, op, param) in sorted(rows.keys()):
+    for group, op, param in sorted(rows.keys()):
         variants = rows[(group, op, param)]
         baseline = variants.get("trnrand_pytorch")
         for variant in ("nki", "trnrand_pytorch", "torch"):
@@ -79,14 +79,9 @@ def render_markdown(rows: dict, machine_info: dict | None = None) -> str:
                 speedup = ""
             else:
                 ratio = baseline / us
-                if ratio >= 1.0:
-                    speedup = f"{ratio:.2f}× faster"
-                else:
-                    speedup = f"{1/ratio:.2f}× slower"
+                speedup = f"{ratio:.2f}× faster" if ratio >= 1.0 else f"{1 / ratio:.2f}× slower"
             param_disp = param.replace("_", " ") if param else "-"
-            out.append(
-                f"| {group}.{op} | {label} | {param_disp} | {us:>10.2f} | {speedup} |"
-            )
+            out.append(f"| {group}.{op} | {label} | {param_disp} | {us:>10.2f} | {speedup} |")
     return "\n".join(out) + "\n"
 
 

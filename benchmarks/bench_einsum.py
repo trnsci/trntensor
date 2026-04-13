@@ -19,7 +19,6 @@ def _seed():
 
 
 class TestEinsumBench:
-
     def test_matmul_512(self, benchmark):
         A = torch.randn(512, 512)
         B = torch.randn(512, 512)
@@ -108,17 +107,14 @@ class TestMp2Bench:
             for i in range(nocc):
                 for j in range(nocc):
                     T = trntensor.einsum("ap,bp->ab", B[i], B[j])
-                    denom = (
-                        eps_occ[i] + eps_occ[j]
-                        - eps_vir.unsqueeze(1) - eps_vir.unsqueeze(0)
-                    )
+                    denom = eps_occ[i] + eps_occ[j] - eps_vir.unsqueeze(1) - eps_vir.unsqueeze(0)
                     e = e + (T * (2 * T - T.T) / denom).sum()
             return e
+
         benchmark(loop)
 
 
 class TestDecomposeBench:
-
     def test_cp_rank8(self, benchmark):
         T = torch.randn(16, 16, 16)
         benchmark(trntensor.cp_decompose, T, rank=8, max_iter=20)

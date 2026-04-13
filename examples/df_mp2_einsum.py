@@ -16,7 +16,9 @@ Usage:
 
 import argparse
 import time
+
 import torch
+
 import trntensor
 
 
@@ -28,7 +30,6 @@ def df_mp2_energy(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor)
     eps_vir: (nvir,)
     """
     nocc = B.shape[0]
-    nvir = B.shape[1]
 
     e_mp2 = 0.0
     for i in range(nocc):
@@ -56,9 +57,9 @@ def main():
     if args.demo:
         args.nocc, args.nvir, args.naux = 5, 19, 72
 
-    print(f"DF-MP2 via einsum:")
+    print("DF-MP2 via einsum:")
     print(f"  nocc={args.nocc}, nvir={args.nvir}, naux={args.naux}")
-    print(f"  Contraction: T_ab = einsum('ap,bp->ab', B[i], B[j])")
+    print("  Contraction: T_ab = einsum('ap,bp->ab', B[i], B[j])")
 
     torch.manual_seed(42)
     B = torch.randn(args.nocc, args.nvir, args.naux) * 0.1

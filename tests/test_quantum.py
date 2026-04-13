@@ -8,7 +8,6 @@ from trntensor.quantum import _cpu_mp2_energy
 
 
 class TestMp2EnergyReference:
-
     def test_matches_manual_small(self):
         """4-index DF-MP2 on a hand-sized case; compare against a
         fully unrolled reference.

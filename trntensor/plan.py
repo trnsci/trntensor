@@ -14,14 +14,15 @@ where many contractions share operands.
 from __future__ import annotations
 
 import re
-import torch
 from dataclasses import dataclass, field
-from typing import Optional
+
+import torch
 
 
 @dataclass
 class ContractionPlan:
     """Execution plan for a tensor contraction."""
+
     subscripts: str
     strategy: str  # algorithm: "matmul" | "bmm" | "torch"
     backend: str = "pytorch"  # executor: "nki" | "pytorch"
@@ -44,7 +45,8 @@ def _backend_for(strategy: str, operands: tuple) -> str:
     """
     if strategy not in ("matmul", "bmm"):
         return "pytorch"
-    from .nki.dispatch import HAS_NKI, _MIN_NKI_FLOPS
+    from .nki.dispatch import _MIN_NKI_FLOPS, HAS_NKI
+
     if not HAS_NKI:
         return "pytorch"
     if strategy == "matmul":
@@ -78,8 +80,9 @@ def _parse_subscripts(subscripts: str) -> tuple[str, str]:
     else:
         input_str = subscripts
         # Implicit output: all indices that appear exactly once
-        all_indices = re.findall(r'[a-zA-Z]', input_str.replace(",", ""))
+        all_indices = re.findall(r"[a-zA-Z]", input_str.replace(",", ""))
         from collections import Counter
+
         counts = Counter(all_indices)
         output_str = "".join(sorted(c for c, n in counts.items() if n == 1))
     return input_str, output_str
@@ -104,9 +107,6 @@ def _plan_binary(
     contracted = (set_a & set_b) - set_out
     # Batch indices: appear in both inputs and output
     batch = set_a & set_b & set_out
-    # Free indices: appear in one input and output
-    free_a = (set_a - set_b) & set_out
-    free_b = (set_b - set_a) & set_out
 
     A, B = operands
 
@@ -147,12 +147,12 @@ def _plan_binary(
 def estimate_flops(subscripts: str, *operands: torch.Tensor) -> int:
     """Estimate FLOPs for a contraction (multiply-add pairs)."""
     input_str, output_str = _parse_subscripts(subscripts)
-    all_indices = set(re.findall(r'[a-zA-Z]', input_str))
+    all_indices = set(re.findall(r"[a-zA-Z]", input_str))
 
     # Product of all dimension sizes
     index_sizes = {}
-    for op_str, op in zip(input_str.split(","), operands):
-        for idx, size in zip(op_str, op.shape):
+    for op_str, op in zip(input_str.split(","), operands, strict=False):
+        for idx, size in zip(op_str, op.shape, strict=False):
             index_sizes[idx] = size
 
     flops = 1

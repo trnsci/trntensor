@@ -59,19 +59,16 @@ def mp2_energy(
         raise ValueError(f"B must be 3D (nocc, nvir, naux); got shape {tuple(B.shape)}")
     nocc, nvir, _naux = B.shape
     if eps_occ.shape != (nocc,):
-        raise ValueError(
-            f"eps_occ must have shape ({nocc},); got {tuple(eps_occ.shape)}"
-        )
+        raise ValueError(f"eps_occ must have shape ({nocc},); got {tuple(eps_occ.shape)}")
     if eps_vir.shape != (nvir,):
-        raise ValueError(
-            f"eps_vir must have shape ({nvir},); got {tuple(eps_vir.shape)}"
-        )
+        raise ValueError(f"eps_vir must have shape ({nvir},); got {tuple(eps_vir.shape)}")
 
     if _use_nki() and HAS_NKI:
         # NotImplementedError propagates — it signals an unsupported shape,
         # not a transient kernel failure. Other exceptions fall back to CPU
         # unless TRNTENSOR_REQUIRE_NKI=1.
         from .nki.dispatch import _nki_mp2_energy
+
         if nvir > 128 or _naux > 128:
             raise NotImplementedError(
                 f"mp2_energy NKI path requires nvir ≤ 128 and naux ≤ 128 "
@@ -81,6 +78,7 @@ def mp2_energy(
             return _nki_mp2_energy(B, eps_occ, eps_vir)
         except Exception:
             import os
+
             if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
                 raise
     return _cpu_mp2_energy(B, eps_occ, eps_vir)

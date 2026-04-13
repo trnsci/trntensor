@@ -1,13 +1,13 @@
 """Test einsum and contraction planning."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trntensor
 
 
 class TestEinsum:
-
     def test_matmul(self):
         A = torch.randn(4, 3)
         B = torch.randn(3, 5)
@@ -85,7 +85,6 @@ class TestEinsum:
 
 
 class TestMultiEinsum:
-
     def test_multiple_contractions(self):
         A = torch.randn(4, 3)
         B = torch.randn(3, 5)
@@ -112,7 +111,6 @@ class TestMultiEinsum:
         A = torch.randn(3, 4)
         B = torch.randn(4, 5)
         C = torch.randn(5, 2)
-        D = torch.randn(3, 2)
         results = trntensor.multi_einsum(
             ("ij,jk,kl->il", A, B, C),
             ("ij,ij->", A, A),
@@ -123,7 +121,6 @@ class TestMultiEinsum:
 
 
 class TestPlan:
-
     def test_matmul_detected(self):
         A = torch.randn(4, 3)
         B = torch.randn(3, 5)

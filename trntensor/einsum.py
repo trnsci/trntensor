@@ -20,7 +20,6 @@ which is where cuTENSOR beats cuBLAS for tensor workloads.
 from __future__ import annotations
 
 import torch
-from typing import Optional
 
 from .plan import ContractionPlan, plan_contraction
 
@@ -53,9 +52,7 @@ def einsum(subscripts: str, *operands: torch.Tensor) -> torch.Tensor:
     return _execute_contraction(subscripts, operands, plan)
 
 
-def _execute_contraction(
-    subscripts: str, operands: tuple, plan: ContractionPlan
-) -> torch.Tensor:
+def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
     """Execute contraction according to plan.
 
     For now, delegates to torch.einsum. The plan infrastructure

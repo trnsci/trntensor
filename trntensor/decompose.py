@@ -13,7 +13,6 @@ All inner operations are matmuls → map to Tensor Engine via trnblas.
 from __future__ import annotations
 
 import torch
-from typing import Tuple, Optional
 
 
 def cp_decompose(
@@ -21,7 +20,7 @@ def cp_decompose(
     rank: int,
     max_iter: int = 100,
     tol: float = 1e-6,
-) -> Tuple[list[torch.Tensor], torch.Tensor]:
+) -> tuple[list[torch.Tensor], torch.Tensor]:
     """CP decomposition via alternating least squares (ALS).
 
     Approximates tensor T ≈ Σ_r λ_r * a_r ⊗ b_r ⊗ c_r ⊗ ...
@@ -49,7 +48,7 @@ def cp_decompose(
 
     weights = torch.ones(rank)
 
-    for iteration in range(max_iter):
+    for _ in range(max_iter):
         for mode in range(ndim):
             # Compute the Khatri-Rao product of all factors except current mode
             V = _khatri_rao_except(factors, mode)
@@ -101,7 +100,7 @@ def cp_reconstruct(factors: list[torch.Tensor], weights: torch.Tensor) -> torch.
 def tucker_decompose(
     tensor: torch.Tensor,
     ranks: tuple[int, ...],
-) -> Tuple[torch.Tensor, list[torch.Tensor]]:
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Tucker decomposition via higher-order SVD (HOSVD).
 
     T ≈ G ×_1 U_1 ×_2 U_2 ×_3 U_3 ...
@@ -121,7 +120,7 @@ def tucker_decompose(
     for mode in range(ndim):
         T_mode = _unfold(tensor, mode)
         U, S, Vh = torch.linalg.svd(T_mode, full_matrices=False)
-        factors.append(U[:, :ranks[mode]])
+        factors.append(U[:, : ranks[mode]])
 
     # Core tensor: G = T ×_1 U_1^T ×_2 U_2^T ×_3 U_3^T ...
     core = tensor.clone()
@@ -141,6 +140,7 @@ def tucker_reconstruct(core: torch.Tensor, factors: list[torch.Tensor]) -> torch
 
 # --- Tensor algebra helpers ---
 
+
 def _unfold(tensor: torch.Tensor, mode: int) -> torch.Tensor:
     """Mode-n unfolding (matricization) of a tensor."""
     return tensor.moveaxis(mode, 0).reshape(tensor.shape[mode], -1)
@@ -156,7 +156,9 @@ def _mode_product(tensor: torch.Tensor, matrix: torch.Tensor, mode: int) -> torc
     new_shape = list(tensor.shape)
     new_shape[mode] = matrix.shape[0]
     # Refold
-    result = result_unfolded.reshape(new_shape[mode], *[new_shape[i] for i in range(len(new_shape)) if i != mode])
+    result = result_unfolded.reshape(
+        new_shape[mode], *[new_shape[i] for i in range(len(new_shape)) if i != mode]
+    )
     # Move mode axis back
     result = result.moveaxis(0, mode)
     return result

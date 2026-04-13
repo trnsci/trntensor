@@ -24,6 +24,7 @@ def nki_backend(monkeypatch):
     """
     import trntensor
     from trntensor.nki import dispatch
+
     monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS", 0)
     prev = trntensor.get_backend()
     trntensor.set_backend("nki")
@@ -32,7 +33,6 @@ def nki_backend(monkeypatch):
 
 
 class TestNkiMatmul:
-
     def test_aligned_shapes(self, nki_backend):
         """M, K, N all multiples of their tile dims, N ≤ TILE_N."""
         import trntensor
@@ -49,8 +49,8 @@ class TestNkiMatmul:
         import trntensor
 
         torch.manual_seed(1)
-        A = torch.randn(100, 70)   # M, K both not tile multiples
-        B = torch.randn(70, 200)   # K=70 → pads to 128; N=200 ≤ TILE_N, no N-pad
+        A = torch.randn(100, 70)  # M, K both not tile multiples
+        B = torch.randn(70, 200)  # K=70 → pads to 128; N=200 ≤ TILE_N, no N-pad
         out = trntensor.einsum("ij,jk->ik", A, B)
         ref = A @ B
         torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
@@ -60,7 +60,7 @@ class TestNkiMatmul:
         import trntensor
 
         torch.manual_seed(2)
-        A = torch.randn(128, 64)   # shape (K, M) from the einsum perspective
+        A = torch.randn(128, 64)  # shape (K, M) from the einsum perspective
         B = torch.randn(128, 256)
         out = trntensor.einsum("ji,jk->ik", A, B)
         ref = A.T @ B
@@ -83,7 +83,7 @@ class TestNkiMatmul:
 
         torch.manual_seed(4)
         A = torch.randn(128, 128)
-        B = torch.randn(128, 1024)   # N=1024 > TILE_N=512
+        B = torch.randn(128, 1024)  # N=1024 > TILE_N=512
         out = trntensor.einsum("ij,jk->ik", A, B)
         ref = A @ B
         torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
@@ -104,7 +104,6 @@ class TestNkiMatmul:
 
 
 class TestNkiBatchedMatmul:
-
     def test_aligned_batch(self, nki_backend):
         """Batch dim, M, K, N all aligned; exercises the base code path."""
         import trntensor
@@ -178,8 +177,9 @@ class TestMp2Energy:
 
     def test_oversize_raises(self, nki_backend):
         """nvir > 128 or naux > 128 should raise until K/M tiling lands."""
-        import trntensor
         import pytest
+
+        import trntensor
 
         B = torch.randn(2, 200, 50)
         with pytest.raises(NotImplementedError, match="nvir.*≤.*128"):

@@ -69,6 +69,7 @@ def _round_up(n: int, multiple: int) -> int:
 
 def _to_xla(*tensors):
     import torch_xla.core.xla_model as xm
+
     device = xm.xla_device()
     orig = tensors[0].device
     return [t.to(device) for t in tensors], orig
@@ -92,6 +93,7 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         return torch.matmul(A, B)
 
     from ._kernels import matmul_kernel
+
     M_pad = _round_up(M, TILE_M)
     K_pad = _round_up(K, TILE_K)
     N_pad = N if N <= TILE_N else _round_up(N, TILE_N)
@@ -141,9 +143,7 @@ def _nki_mp2_energy(
             f"(got nvir={nvir}, naux={naux}). K/M tiling not yet implemented."
         )
 
-    (b, eo, ev), orig_device = _to_xla(
-        B.contiguous(), eps_occ.contiguous(), eps_vir.contiguous()
-    )
+    (b, eo, ev), orig_device = _to_xla(B.contiguous(), eps_occ.contiguous(), eps_vir.contiguous())
     partial = mp2_energy_kernel(b, eo, ev)
     return partial.to(orig_device).sum()
 
@@ -165,6 +165,7 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         return torch.bmm(A, B)
 
     from ._kernels import batched_matmul_kernel
+
     M_pad = _round_up(M, TILE_M)
     K_pad = _round_up(K, TILE_K)
     N_pad = N if N <= TILE_N else _round_up(N, TILE_N)

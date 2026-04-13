@@ -2,12 +2,12 @@
 
 import pytest
 import torch
+
 import trntensor
 from trntensor.plan import _parse_subscripts
 
 
 class TestParseSubscripts:
-
     def test_explicit_output(self):
         assert _parse_subscripts("ij,jk->ik") == ("ij,jk", "ik")
 
@@ -28,7 +28,6 @@ class TestParseSubscripts:
 
 
 class TestPlanStrategy:
-
     def test_matmul_both_transposed(self):
         """'ji,kj->ik' — contracted 'j' is first in A and second in B → both transposed."""
         A = torch.randn(3, 4)
@@ -39,9 +38,7 @@ class TestPlanStrategy:
         assert plan.transB is True
 
     def test_matmul_neither_transposed(self):
-        plan = trntensor.plan_contraction(
-            "ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5)
-        )
+        plan = trntensor.plan_contraction("ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5))
         assert plan.strategy == "matmul"
         assert plan.transA is False
         assert plan.transB is False
@@ -75,9 +72,7 @@ class TestPlanStrategy:
             "ij,jk->ik", torch.randn(2048, 2048), torch.randn(2048, 2048)
         )
         # Small matmul — below threshold, falls back to PyTorch even on Neuron.
-        plan_small = trntensor.plan_contraction(
-            "ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5)
-        )
+        plan_small = trntensor.plan_contraction("ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5))
         # 3-operand contraction — never a NKI strategy.
         plan_torch = trntensor.plan_contraction(
             "ij,jk,kl->il", torch.randn(3, 4), torch.randn(4, 5), torch.randn(5, 2)
@@ -88,7 +83,6 @@ class TestPlanStrategy:
 
 
 class TestEstimateFlops:
-
     def test_matmul_flops(self):
         A = torch.randn(10, 20)
         B = torch.randn(20, 30)
@@ -96,24 +90,17 @@ class TestEstimateFlops:
 
     def test_flops_scale_with_dims(self):
         """Doubling a contracted dim should double the FLOP count."""
-        small = trntensor.estimate_flops(
-            "ij,jk->ik", torch.randn(4, 5), torch.randn(5, 6)
-        )
-        big = trntensor.estimate_flops(
-            "ij,jk->ik", torch.randn(4, 10), torch.randn(10, 6)
-        )
+        small = trntensor.estimate_flops("ij,jk->ik", torch.randn(4, 5), torch.randn(5, 6))
+        big = trntensor.estimate_flops("ij,jk->ik", torch.randn(4, 10), torch.randn(10, 6))
         assert big == 2 * small
 
     def test_flops_batched(self):
         """Batched contraction: product includes batch dim."""
-        flops = trntensor.estimate_flops(
-            "bij,bjk->bik", torch.randn(7, 3, 4), torch.randn(7, 4, 5)
-        )
+        flops = trntensor.estimate_flops("bij,bjk->bik", torch.randn(7, 3, 4), torch.randn(7, 4, 5))
         assert flops == 7 * 3 * 4 * 5
 
 
 class TestExecute:
-
     def test_both_transposed_matmul(self):
         """Exercises the transA+transB branch of _execute_matmul."""
         import numpy as np

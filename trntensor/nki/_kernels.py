@@ -11,8 +11,9 @@ from __future__ import annotations
 
 try:
     import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
     import neuronxcc.nki.isa as nisa
+    import neuronxcc.nki.language as nl
+
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
@@ -54,17 +55,13 @@ if HAS_NKI:
 
                 for k in nl.affine_range(K // tile_k):
                     k_off = k * tile_k
-                    a_t = nl.load_transpose2d(
-                        a[m_off:m_off + tile_m, k_off:k_off + tile_k]
-                    )
-                    b_tile = nl.load(
-                        b[k_off:k_off + tile_k, n_off:n_off + tile_n]
-                    )
+                    a_t = nl.load_transpose2d(a[m_off : m_off + tile_m, k_off : k_off + tile_k])
+                    b_tile = nl.load(b[k_off : k_off + tile_k, n_off : n_off + tile_n])
                     psum[...] += nisa.nc_matmul(a_t, b_tile)
 
                 c_sbuf = nl.copy(psum, dtype=a.dtype)
                 nl.store(
-                    c[m_off:m_off + tile_m, n_off:n_off + tile_n],
+                    c[m_off : m_off + tile_m, n_off : n_off + tile_n],
                     value=c_sbuf,
                 )
 
@@ -98,16 +95,14 @@ if HAS_NKI:
                     for k in nl.affine_range(K // tile_k):
                         k_off = k * tile_k
                         a_t = nl.load_transpose2d(
-                            a[batch, m_off:m_off + tile_m, k_off:k_off + tile_k]
+                            a[batch, m_off : m_off + tile_m, k_off : k_off + tile_k]
                         )
-                        b_tile = nl.load(
-                            b[batch, k_off:k_off + tile_k, n_off:n_off + tile_n]
-                        )
+                        b_tile = nl.load(b[batch, k_off : k_off + tile_k, n_off : n_off + tile_n])
                         psum[...] += nisa.nc_matmul(a_t, b_tile)
 
                     c_sbuf = nl.copy(psum, dtype=a.dtype)
                     nl.store(
-                        c[batch, m_off:m_off + tile_m, n_off:n_off + tile_n],
+                        c[batch, m_off : m_off + tile_m, n_off : n_off + tile_n],
                         value=c_sbuf,
                     )
 
@@ -149,35 +144,35 @@ if HAS_NKI:
         partial = nl.ndarray((NOCC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
 
         # Pre-load eps_vir once; reused for every (i, j).
-        ev = nl.load(eps_vir[0:NVIR])           # shape (NVIR,)
+        ev = nl.load(eps_vir[0:NVIR])  # shape (NVIR,)
 
         for i in nl.affine_range(NOCC):
-            eo_i = nl.load(eps_occ[i:i + 1])    # (1,)
+            eo_i = nl.load(eps_occ[i : i + 1])  # (1,)
             # Load Bi once per i, transposed so partition dim = NAUX.
             # Shape becomes (NAUX, NVIR) in SBUF.
             Bi_t = nl.load_transpose2d(B[i, 0:NVIR, 0:NAUX])
 
             for j in nl.affine_range(NOCC):
-                eo_j = nl.load(eps_occ[j:j + 1])              # (1,)
-                eo_sum = nl.add(eo_i, eo_j)                   # (1,)
+                eo_j = nl.load(eps_occ[j : j + 1])  # (1,)
+                eo_sum = nl.add(eo_i, eo_j)  # (1,)
 
                 # Bj for this (i,j). Load transposed → (NAUX, NVIR).
                 Bj_t = nl.load_transpose2d(B[j, 0:NVIR, 0:NAUX])
 
                 # T = Bi @ Bj.T   — stationary Bi_t, moving Bj_t.
                 # T.T = Bj @ Bi.T — swap the roles.
-                psum_T  = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
+                psum_T = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
                 psum_Tt = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
-                psum_T[...]  += nisa.nc_matmul(Bi_t, Bj_t)
+                psum_T[...] += nisa.nc_matmul(Bi_t, Bj_t)
                 psum_Tt[...] += nisa.nc_matmul(Bj_t, Bi_t)
 
-                t   = nl.copy(psum_T,  dtype=B.dtype)         # (NVIR, NVIR)
+                t = nl.copy(psum_T, dtype=B.dtype)  # (NVIR, NVIR)
                 t_T = nl.copy(psum_Tt, dtype=B.dtype)
 
                 # Δ_ab = (ε_i + ε_j) - ε_a - ε_b
                 # Build the (NVIR, NVIR) denominator on the Vector Engine.
                 denom_rows = nl.subtract(eo_sum, ev.reshape((NVIR, 1)))  # (NVIR, 1)
-                denom = nl.subtract(denom_rows, ev.reshape((1, NVIR)))    # (NVIR, NVIR)
+                denom = nl.subtract(denom_rows, ev.reshape((1, NVIR)))  # (NVIR, NVIR)
 
                 # term = T * (2T - T.T) / Δ
                 two_t_minus_tT = nl.subtract(nl.multiply(t, 2.0), t_T)
@@ -186,6 +181,6 @@ if HAS_NKI:
 
                 # Reduce to scalar and store.
                 e_ij = nl.sum(term, axis=(0, 1))
-                nl.store(partial[i:i + 1, j:j + 1], value=e_ij)
+                nl.store(partial[i : i + 1, j : j + 1], value=e_ij)
 
         return partial
