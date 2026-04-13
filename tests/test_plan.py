@@ -61,6 +61,23 @@ class TestPlanStrategy:
         assert "j" in plan.contraction_indices
         assert "b" in plan.batch_indices
 
+    def test_backend_reports_nki_or_pytorch(self):
+        """`plan.backend` reports the executor that will run the contraction.
+
+        On Neuron hosts, matmul/bmm strategies report `"nki"`; on CPU they
+        report `"pytorch"`. The torch fallback always reports `"pytorch"`.
+        """
+        from trntensor.nki.dispatch import HAS_NKI
+
+        plan_mm = trntensor.plan_contraction(
+            "ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5)
+        )
+        plan_torch = trntensor.plan_contraction(
+            "ij,jk,kl->il", torch.randn(3, 4), torch.randn(4, 5), torch.randn(5, 2)
+        )
+        assert plan_mm.backend == ("nki" if HAS_NKI else "pytorch")
+        assert plan_torch.backend == "pytorch"
+
 
 class TestEstimateFlops:
 

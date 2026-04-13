@@ -23,7 +23,8 @@ from typing import Optional
 class ContractionPlan:
     """Execution plan for a tensor contraction."""
     subscripts: str
-    strategy: str  # "matmul", "bmm", "torch", "nki"
+    strategy: str  # algorithm: "matmul" | "bmm" | "torch"
+    backend: str = "pytorch"  # executor: "nki" | "pytorch"
     transA: bool = False
     transB: bool = False
     contraction_indices: list[str] = field(default_factory=list)
@@ -32,15 +33,30 @@ class ContractionPlan:
     estimated_flops: int = 0
 
 
+def _backend_for(strategy: str) -> str:
+    """Resolve which executor will run a given strategy.
+
+    Returns ``"nki"`` only when the strategy maps to a NKI kernel
+    (``matmul`` or ``bmm``) and ``neuronxcc`` is importable.
+    """
+    if strategy in ("matmul", "bmm"):
+        from .nki.dispatch import HAS_NKI
+        if HAS_NKI:
+            return "nki"
+    return "pytorch"
+
+
 def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPlan:
     """Analyze contraction and select execution strategy."""
     input_str, output_str = _parse_subscripts(subscripts)
     input_indices = input_str.split(",")
 
     if len(operands) == 2:
-        return _plan_binary(subscripts, input_indices, output_str, operands)
+        plan = _plan_binary(subscripts, input_indices, output_str, operands)
     else:
-        return ContractionPlan(subscripts=subscripts, strategy="torch")
+        plan = ContractionPlan(subscripts=subscripts, strategy="torch")
+    plan.backend = _backend_for(plan.strategy)
+    return plan
 
 
 def _parse_subscripts(subscripts: str) -> tuple[str, str]:

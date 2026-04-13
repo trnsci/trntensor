@@ -21,6 +21,9 @@ plan.transA, plan.transB  # whether to pre-transpose before matmul
 Dataclass with the fields above plus:
 
 - `subscripts` — the original subscript string
+- `backend` — executor that will run the contraction: `"nki"` (when
+  the strategy is `matmul`/`bmm` and `neuronxcc` is importable) or
+  `"pytorch"`
 - `estimated_flops: int`
 
 ## `estimate_flops(subscripts, *operands) -> int`
