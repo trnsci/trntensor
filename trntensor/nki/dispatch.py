@@ -25,6 +25,10 @@ _backend = "auto"
 def set_backend(backend: str):
     global _backend
     assert backend in ("auto", "pytorch", "nki")
+    if backend == "nki" and not HAS_NKI:
+        raise RuntimeError(
+            "NKI backend requires neuronxcc. Install with: pip install 'trntensor[neuron]'"
+        )
     _backend = backend
 
 def get_backend() -> str:
