@@ -25,9 +25,24 @@ class TestEinsumBench:
         B = torch.randn(512, 512)
         benchmark(trntensor.einsum, "ij,jk->ik", A, B)
 
+    def test_matmul_1024(self, benchmark):
+        A = torch.randn(1024, 1024)
+        B = torch.randn(1024, 1024)
+        benchmark(trntensor.einsum, "ij,jk->ik", A, B)
+
+    def test_matmul_2048(self, benchmark):
+        A = torch.randn(2048, 2048)
+        B = torch.randn(2048, 2048)
+        benchmark(trntensor.einsum, "ij,jk->ik", A, B)
+
     def test_bmm_batched(self, benchmark):
         A = torch.randn(16, 256, 256)
         B = torch.randn(16, 256, 256)
+        benchmark(trntensor.einsum, "bij,bjk->bik", A, B)
+
+    def test_bmm_large(self, benchmark):
+        A = torch.randn(32, 1024, 1024)
+        B = torch.randn(32, 1024, 1024)
         benchmark(trntensor.einsum, "bij,bjk->bik", A, B)
 
     def test_df_mp2_pair(self, benchmark):
