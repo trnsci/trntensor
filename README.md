@@ -10,6 +10,18 @@ Tensor contractions for AWS Trainium via NKI.
 
 Einstein summation with contraction planning, CP and Tucker decompositions. Expresses scientific tensor workloads naturally instead of decomposing to GEMM. Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
+## Current phase
+
+trntensor follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
+
+- **[Phase 1 — correctness](https://github.com/trnsci/trntensor/issues/27)** (active): matmul + batched-matmul NKI kernels in place; awaiting hardware validation + additional `@pytest.mark.neuron` coverage.
+- **[Phase 2 — precision](https://github.com/trnsci/trntensor/issues/28)**: precision-aware contraction path selection (depends on [trnblas#22](https://github.com/trnsci/trnblas/issues/22) double-double GEMM).
+- **[Phase 3 — perf](https://github.com/trnsci/trntensor/issues/29)**: opt_einsum-style path planner, plan cache reuse.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trntensor/issues/30)**: sharded tensor contractions.
+- **[Phase 5 — generation](https://github.com/trnsci/trntensor/issues/31)**: trn2 fused multi-contraction paths.
+
+Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
+
 ## Install
 
 ```bash
