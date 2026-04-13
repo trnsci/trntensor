@@ -26,9 +26,9 @@ A single sub-project in isolation:
 
 ```bash
 cd trnfft   # or any other
-pip install -e ".[dev]"
-pre-commit install      # ruff check + format on every commit
-pytest tests/ -v -m "not neuron"
+uv sync --extra dev
+uv run pre-commit install   # ruff check + format on every commit
+uv run pytest tests/ -v -m "not neuron"
 ```
 
 ## Tests

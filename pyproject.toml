@@ -25,12 +25,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-neuron = [
-    # Pinned >=2.24 for NKI 2.24+ nc_matmul calling convention (unified
-    # across the trnsci suite).
-    "neuronxcc>=2.24",
-    "torch-neuronx>=2.9",
-]
 dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
@@ -50,6 +44,14 @@ Issues = "https://github.com/trnsci/trntensor/issues"
 
 [tool.setuptools.packages.find]
 include = ["trntensor*"]
+
+# Neuron SDK note: on-hardware runs use the AWS Deep Learning AMI's
+# pre-built venv at /opt/aws_neuronx_venv_pytorch_*, which bundles
+# neuronxcc and the NKI runtime. There is no pip-install step for Neuron —
+# the DLAMI's terraform `most_recent = true` pulls the current image and
+# its venv tracks the current SDK (2.29 as of 2026-04-09, with NKI 0.3.0
+# Stable and the CPU simulator). trntensor does not declare neuronxcc in
+# its dep set; CPU-only installs resolve cleanly from PyPI.
 
 [tool.ruff]
 # Match the rest of the trnsci suite. Line length 100 is a compromise

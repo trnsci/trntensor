@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Dev workflow migrated to [uv](https://github.com/astral-sh/uv).
+  `uv sync --extra dev` replaces `pip install -e ".[dev]"`; CI uses
+  `astral-sh/setup-uv@v6` and invokes `uv run pytest` / `uvx ruff`.
+  `uv.lock` is committed for reproducible installs.
+- Removed the `[neuron]` optional-dependencies extra. `neuronxcc` and
+  the NKI runtime come from the AWS Deep Learning AMI's pre-built venv
+  (`/opt/aws_neuronx_venv_pytorch_*`), not pip — the extra was never
+  resolvable against any index. The DLAMI tracks Neuron SDK 2.29 /
+  NKI 0.3.0 Stable as of 2026-04-09.
+- `CONTRIBUTING.md` updated to reflect the uv-based setup.
+
 ## [0.1.2] — 2026-04-12
 
 ### Changed
