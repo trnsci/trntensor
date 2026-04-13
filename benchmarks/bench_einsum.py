@@ -60,6 +60,40 @@ class TestEinsumBench:
         benchmark(trntensor.einsum, "mi,mnP->inP", C, eri)
 
 
+class TestMp2Bench:
+    """Compare the fused mp2_energy kernel against the Python-loop form."""
+
+    @pytest.fixture
+    def mp2_inputs(self):
+        nocc, nvir, naux = 5, 19, 72
+        B = torch.randn(nocc, nvir, naux) * 0.1
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+        return B, eps_occ, eps_vir
+
+    def test_mp2_energy_fused(self, benchmark, mp2_inputs):
+        B, eps_occ, eps_vir = mp2_inputs
+        benchmark(trntensor.mp2_energy, B, eps_occ, eps_vir)
+
+    def test_mp2_energy_python_loop(self, benchmark, mp2_inputs):
+        B, eps_occ, eps_vir = mp2_inputs
+        # The old "trntensor.einsum inside a Python loop" form — what
+        # the fused kernel replaces.
+        def loop():
+            nocc = B.shape[0]
+            e = B.new_zeros(())
+            for i in range(nocc):
+                for j in range(nocc):
+                    T = trntensor.einsum("ap,bp->ab", B[i], B[j])
+                    denom = (
+                        eps_occ[i] + eps_occ[j]
+                        - eps_vir.unsqueeze(1) - eps_vir.unsqueeze(0)
+                    )
+                    e = e + (T * (2 * T - T.T) / denom).sum()
+            return e
+        benchmark(loop)
+
+
 class TestDecomposeBench:
 
     def test_cp_rank8(self, benchmark):
