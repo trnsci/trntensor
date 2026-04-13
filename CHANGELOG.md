@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-04-12
+
+### Changed
+
+- `set_backend("nki")` now raises `RuntimeError` on non-Neuron hosts
+  instead of silently accepting the backend and failing later. Matches
+  the sibling-suite pattern.
+- CI actions bumped to `actions/checkout@v6` + `actions/setup-python@v6`
+  (Node.js 24), ahead of GitHub's June 2026 default switch.
+- pyproject metadata normalized across the trnsci suite (author email,
+  URLs, classifier list).
+- Standalone `docs.yml` removed — docs are now served via `trnsci.dev`
+  through the umbrella's combined build. `notify-umbrella.yml` pings
+  the umbrella on docs changes.
+- `infra/terraform/main.tf`: user-data clone URL corrected to
+  `trnsci/trntensor`.
+
+### Added
+
+- `benchmarks/bench_einsum.py` — pytest-benchmark cases for einsum
+  dispatch and decompositions. CPU baseline numbers populated in
+  `docs/benchmarks.md`.
+- `tests/test_nki.py` — backend-dispatch unit tests (CPU path).
+
 ## [0.1.1] — 2026-04-12
 
 ### Added

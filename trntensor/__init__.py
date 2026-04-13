@@ -5,7 +5,7 @@ Einstein summation, contraction planning, and tensor decompositions
 for scientific computing. Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 from .einsum import einsum, multi_einsum
 from .plan import ContractionPlan, plan_contraction, estimate_flops
