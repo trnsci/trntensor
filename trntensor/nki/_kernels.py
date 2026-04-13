@@ -112,3 +112,80 @@ if HAS_NKI:
                     )
 
         return c
+
+    @nki.jit
+    def mp2_energy_kernel(B, eps_occ, eps_vir):
+        """Fully fused DF-MP2 correlation energy.
+
+        For each ``(i, j)`` pair, this program:
+
+        1. computes ``T_ab = Σ_P B[i,a,P] B[j,b,P]`` via ``nc_matmul`` —
+           result lives in PSUM, never hits HBM;
+        2. computes ``T^T_ab = T_ba`` via a second ``nc_matmul`` with
+           the operand roles swapped, also in PSUM;
+        3. builds the MP2 denominator ``Δ_ab = ε_i + ε_j - ε_a - ε_b``
+           on the Vector Engine from SBUF-resident ε tiles;
+        4. evaluates ``term = T * (2T - T^T) / Δ`` element-wise in
+           SBUF;
+        5. folds ``Σ_ab term`` into a scalar SBUF accumulator — one
+           HBM store per (i, j) instead of one per ab tile.
+
+        The whole energy summation is one NKI program — one dispatch,
+        one HBM round-trip for the final partial array. Assumes
+        ``nvir ≤ 128`` and ``naux ≤ 128`` (single-tile path). Larger
+        cases will need K/M tiling; not in this kernel.
+
+        Inputs
+        ------
+        B       : (nocc, nvir, naux) — DF coefficients.
+        eps_occ : (nocc,)           — occupied orbital energies.
+        eps_vir : (nvir,)           — virtual orbital energies.
+
+        Returns
+        -------
+        (nocc, nocc) float32 partial tensor. Host sums to scalar.
+        """
+        NOCC, NVIR, NAUX = B.shape
+        partial = nl.ndarray((NOCC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        # Pre-load eps_vir once; reused for every (i, j).
+        ev = nl.load(eps_vir[0:NVIR])           # shape (NVIR,)
+
+        for i in nl.affine_range(NOCC):
+            eo_i = nl.load(eps_occ[i:i + 1])    # (1,)
+            # Load Bi once per i, transposed so partition dim = NAUX.
+            # Shape becomes (NAUX, NVIR) in SBUF.
+            Bi_t = nl.load_transpose2d(B[i, 0:NVIR, 0:NAUX])
+
+            for j in nl.affine_range(NOCC):
+                eo_j = nl.load(eps_occ[j:j + 1])              # (1,)
+                eo_sum = nl.add(eo_i, eo_j)                   # (1,)
+
+                # Bj for this (i,j). Load transposed → (NAUX, NVIR).
+                Bj_t = nl.load_transpose2d(B[j, 0:NVIR, 0:NAUX])
+
+                # T = Bi @ Bj.T   — stationary Bi_t, moving Bj_t.
+                # T.T = Bj @ Bi.T — swap the roles.
+                psum_T  = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
+                psum_Tt = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
+                psum_T[...]  += nisa.nc_matmul(Bi_t, Bj_t)
+                psum_Tt[...] += nisa.nc_matmul(Bj_t, Bi_t)
+
+                t   = nl.copy(psum_T,  dtype=B.dtype)         # (NVIR, NVIR)
+                t_T = nl.copy(psum_Tt, dtype=B.dtype)
+
+                # Δ_ab = (ε_i + ε_j) - ε_a - ε_b
+                # Build the (NVIR, NVIR) denominator on the Vector Engine.
+                denom_rows = nl.subtract(eo_sum, ev.reshape((NVIR, 1)))  # (NVIR, 1)
+                denom = nl.subtract(denom_rows, ev.reshape((1, NVIR)))    # (NVIR, NVIR)
+
+                # term = T * (2T - T.T) / Δ
+                two_t_minus_tT = nl.subtract(nl.multiply(t, 2.0), t_T)
+                numerator = nl.multiply(t, two_t_minus_tT)
+                term = nl.divide(numerator, denom)
+
+                # Reduce to scalar and store.
+                e_ij = nl.sum(term, axis=(0, 1))
+                nl.store(partial[i:i + 1, j:j + 1], value=e_ij)
+
+        return partial

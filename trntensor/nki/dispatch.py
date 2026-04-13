@@ -115,6 +115,39 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         return torch.matmul(A, B)
 
 
+def _nki_mp2_energy(
+    B: torch.Tensor,
+    eps_occ: torch.Tensor,
+    eps_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch ``mp2_energy_kernel`` and reduce the per-pair partial.
+
+    The kernel returns a ``(nocc, nocc)`` tensor of pair contributions
+    which we sum on the host into a scalar. Host-side reduction of a
+    small matrix (``nocc`` is typically ≤ 100) is cheap compared to
+    the fused contract+reduce that the kernel handles.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+
+    from ._kernels import mp2_energy_kernel
+
+    nocc, nvir, naux = B.shape
+    # Single-tile constraints of the kernel. Caller gets a clear error
+    # rather than a cryptic compile failure.
+    if nvir > 128 or naux > 128:
+        raise NotImplementedError(
+            f"mp2_energy_kernel requires nvir ≤ 128 and naux ≤ 128 "
+            f"(got nvir={nvir}, naux={naux}). K/M tiling not yet implemented."
+        )
+
+    (b, eo, ev), orig_device = _to_xla(
+        B.contiguous(), eps_occ.contiguous(), eps_vir.contiguous()
+    )
+    partial = mp2_energy_kernel(b, eo, ev)
+    return partial.to(orig_device).sum()
+
+
 def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Batched 2D matmul ``A @ B`` over a leading batch dim.
 

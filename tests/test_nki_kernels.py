@@ -137,3 +137,50 @@ class TestNkiBatchedMatmul:
         out = trntensor.einsum("bij,bjk->bik", A, B)
         ref = torch.bmm(A, B)
         torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+
+class TestMp2Energy:
+    """End-to-end DF-MP2 correlation energy via the fully fused kernel.
+
+    Validates that the NKI path (contract + elementwise + reduce in one
+    @nki.jit program) matches the CPU reference within tolerance.
+    """
+
+    def test_demo_shape(self, nki_backend):
+        """5×19×72 — the shape used by examples/df_mp2_einsum.py."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        torch.manual_seed(42)
+        nocc, nvir, naux = 5, 19, 72
+        B = torch.randn(nocc, nvir, naux) * 0.1
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+        e_nki = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        e_ref = _cpu_mp2_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(e_nki, e_ref, atol=1e-3, rtol=1e-4)
+
+    def test_medium_shape(self, nki_backend):
+        """8×32×128 — larger but still within single-tile constraints."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        torch.manual_seed(43)
+        nocc, nvir, naux = 8, 32, 128
+        B = torch.randn(nocc, nvir, naux) * 0.1
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+        e_nki = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        e_ref = _cpu_mp2_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(e_nki, e_ref, atol=1e-3, rtol=1e-4)
+
+    def test_oversize_raises(self, nki_backend):
+        """nvir > 128 or naux > 128 should raise until K/M tiling lands."""
+        import trntensor
+        import pytest
+
+        B = torch.randn(2, 200, 50)
+        with pytest.raises(NotImplementedError, match="nvir.*≤.*128"):
+            trntensor.mp2_energy(B, torch.randn(2), torch.randn(200))
