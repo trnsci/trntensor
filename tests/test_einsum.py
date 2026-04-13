@@ -98,6 +98,29 @@ class TestMultiEinsum:
         np.testing.assert_allclose(results[0].numpy(), (A @ B).numpy(), atol=1e-5)
         np.testing.assert_allclose(results[1].numpy(), (B @ C).numpy(), atol=1e-5)
 
+    def test_three_operand_chain(self):
+        """A single einsum call with three operands (ABC)."""
+        A = torch.randn(3, 4)
+        B = torch.randn(4, 5)
+        C = torch.randn(5, 2)
+        result = trntensor.einsum("ij,jk,kl->il", A, B, C)
+        expected = A @ B @ C
+        np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-4)
+
+    def test_multi_einsum_with_three_operand_chain(self):
+        """multi_einsum entry that is itself a 3-operand chain."""
+        A = torch.randn(3, 4)
+        B = torch.randn(4, 5)
+        C = torch.randn(5, 2)
+        D = torch.randn(3, 2)
+        results = trntensor.multi_einsum(
+            ("ij,jk,kl->il", A, B, C),
+            ("ij,ij->", A, A),
+        )
+        assert len(results) == 2
+        np.testing.assert_allclose(results[0].numpy(), (A @ B @ C).numpy(), atol=1e-4)
+        np.testing.assert_allclose(results[1].item(), (A * A).sum().item(), atol=1e-4)
+
 
 class TestPlan:
 
