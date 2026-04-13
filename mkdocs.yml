@@ -20,7 +20,12 @@ nav:
   - Home: index.md
   - Installation: installation.md
   - Quickstart: quickstart.md
-  - API Reference: api.md
+  - API Reference:
+      - Overview: api/index.md
+      - einsum: api/einsum.md
+      - Planning: api/plan.md
+      - Decompositions: api/decompose.md
+      - NKI dispatch: api/nki.md
   - Architecture: architecture.md
   - Benchmarks: benchmarks.md
   - Deployment:
