@@ -68,11 +68,18 @@ def mp2_energy(
         )
 
     if _use_nki() and HAS_NKI:
+        # NotImplementedError propagates — it signals an unsupported shape,
+        # not a transient kernel failure. Other exceptions fall back to CPU
+        # unless TRNTENSOR_REQUIRE_NKI=1.
+        from .nki.dispatch import _nki_mp2_energy
+        if nvir > 128 or _naux > 128:
+            raise NotImplementedError(
+                f"mp2_energy NKI path requires nvir ≤ 128 and naux ≤ 128 "
+                f"(got nvir={nvir}, naux={_naux}). K/M tiling not yet implemented."
+            )
         try:
-            from .nki.dispatch import _nki_mp2_energy
             return _nki_mp2_energy(B, eps_occ, eps_vir)
         except Exception:
-            # Surface in the validation loop via TRNTENSOR_REQUIRE_NKI=1.
             import os
             if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
                 raise
