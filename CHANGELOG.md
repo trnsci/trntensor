@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `mp2_energy_kernel` compile failure on pre-pinned XLA ε inputs
+  (#38). Reshape `eps_occ` / `eps_vir` to 2D `(N, 1)` at the dispatch
+  boundary; kernel `nl.load` signatures updated to match. Makes
+  partition-dim inference unambiguous regardless of residency state.
+  Unblocks the full DF-MP2 pipeline end-to-end on XLA
+  (`ao_to_mo_transform → mp2_energy` with everything pre-pinned).
+
 ### Added
 
 - **`trntensor.to_xla(tensor)` / `trntensor.from_xla(tensor)`** — explicit

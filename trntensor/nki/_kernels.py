@@ -141,8 +141,8 @@ if HAS_NKI:
         Inputs
         ------
         B       : (nocc, nvir, naux) — DF coefficients.
-        eps_occ : (nocc,)           — occupied orbital energies.
-        eps_vir : (nvir,)           — virtual orbital energies.
+        eps_occ : (nocc, 1)         — occupied orbital energies (2D for NKI load hygiene).
+        eps_vir : (nvir, 1)         — virtual orbital energies (2D for NKI load hygiene).
 
         Returns
         -------
@@ -151,18 +151,21 @@ if HAS_NKI:
         NOCC, NVIR, NAUX = B.shape
         partial = nl.ndarray((NOCC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
 
-        # Pre-load eps_vir once; reused for every (i, j).
-        ev = nl.load(eps_vir[0:NVIR])  # shape (NVIR,)
+        # Pre-load eps_vir once; reused for every (i, j). Loaded as 2D
+        # (NVIR, 1) so partition dim is unambiguous to the NKI compiler
+        # regardless of whether eps_vir arrived fresh-from-CPU or was
+        # pre-pinned on the XLA device. See #38.
+        ev = nl.load(eps_vir[0:NVIR, 0:1])  # shape (NVIR, 1)
 
         for i in nl.affine_range(NOCC):
-            eo_i = nl.load(eps_occ[i : i + 1])  # (1,)
+            eo_i = nl.load(eps_occ[i : i + 1, 0:1])  # (1, 1)
             # Load Bi once per i, transposed so partition dim = NAUX.
             # Shape becomes (NAUX, NVIR) in SBUF.
             Bi_t = nl.load_transpose2d(B[i, 0:NVIR, 0:NAUX])
 
             for j in nl.affine_range(NOCC):
-                eo_j = nl.load(eps_occ[j : j + 1])  # (1,)
-                eo_sum = nl.add(eo_i, eo_j)  # (1,)
+                eo_j = nl.load(eps_occ[j : j + 1, 0:1])  # (1, 1)
+                eo_sum = nl.add(eo_i, eo_j)  # (1, 1)
 
                 # Bj for this (i,j). Load transposed → (NAUX, NVIR).
                 Bj_t = nl.load_transpose2d(B[j, 0:NVIR, 0:NAUX])
@@ -183,7 +186,8 @@ if HAS_NKI:
 
                 # Δ_ab = (ε_i + ε_j) - ε_a - ε_b
                 # Build the (NVIR, NVIR) denominator on the Vector Engine.
-                denom_rows = nl.subtract(eo_sum, ev.reshape((NVIR, 1)))  # (NVIR, 1)
+                # ev is already (NVIR, 1); reshape to (1, NVIR) for the second step.
+                denom_rows = nl.subtract(eo_sum, ev)  # broadcasts (1,1) - (NVIR,1) → (NVIR,1)
                 denom = nl.subtract(denom_rows, ev.reshape((1, NVIR)))  # (NVIR, NVIR)
 
                 # term = T * (2T - T.T) / Δ. NKI 0.3.0 drops tensor-tensor

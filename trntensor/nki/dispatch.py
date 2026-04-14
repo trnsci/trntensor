@@ -215,9 +215,14 @@ def _nki_mp2_energy(
             f"(got nvir={nvir}, naux={naux}). K/M tiling not yet implemented."
         )
 
+    # Reshape ε vectors to 2D at the dispatch boundary. NKI's
+    # partition-dim inference is ambiguous on 1D tensor slices when
+    # the input is pre-pinned on XLA (bites mp2_energy_kernel's
+    # nl.load calls). 2D at entry makes the layout explicit regardless
+    # of residency state. See #38 and the trnblas equivalent pattern.
     B_feed = B.contiguous()
-    eo_feed = eps_occ.contiguous()
-    ev_feed = eps_vir.contiguous()
+    eo_feed = eps_occ.reshape(-1, 1).contiguous()
+    ev_feed = eps_vir.reshape(-1, 1).contiguous()
 
     if _use_simulator():
         out_np = nki.simulate(mp2_energy_kernel)(
