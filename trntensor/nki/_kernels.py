@@ -5,21 +5,24 @@ reuse, K tiled to 128 (partition-dim limit), N tiled to 512 (moving free-dim
 limit). All transpose variants route through the dispatch layer, which
 pre-transposes before entry — the kernel always sees the canonical
 ``C = A @ B`` form.
+
+Targets NKI 0.3.0 Stable (Neuron SDK 2.29). The legacy
+``neuronxcc.nki.*`` shim is not used.
 """
 
 from __future__ import annotations
 
 try:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.isa as nisa
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.isa as nisa
+    import nki.language as nl
 
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
 
 
-# NKI 2.24 systolic-array limits:
+# NKI 0.3.0 systolic-array limits (unchanged vs 2.24):
 # stationary partition dim ≤ 128 (K), free dim ≤ 128 (M).
 # moving free dim ≤ 512 (N).
 TILE_M = 128
@@ -57,9 +60,13 @@ if HAS_NKI:
                     k_off = k * tile_k
                     a_t = nl.load_transpose2d(a[m_off : m_off + tile_m, k_off : k_off + tile_k])
                     b_tile = nl.load(b[k_off : k_off + tile_k, n_off : n_off + tile_n])
-                    psum[...] += nisa.nc_matmul(a_t, b_tile)
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
 
-                c_sbuf = nl.copy(psum, dtype=a.dtype)
+                # NKI 0.3.0: nl.copy(psum, ...) returns a view. Allocate a
+                # fresh SBUF tile and nisa.tensor_copy PSUM into it before
+                # the HBM store.
+                c_sbuf = nl.ndarray((tile_m, tile_n), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
                 nl.store(
                     c[m_off : m_off + tile_m, n_off : n_off + tile_n],
                     value=c_sbuf,
@@ -98,9 +105,10 @@ if HAS_NKI:
                             a[batch, m_off : m_off + tile_m, k_off : k_off + tile_k]
                         )
                         b_tile = nl.load(b[batch, k_off : k_off + tile_k, n_off : n_off + tile_n])
-                        psum[...] += nisa.nc_matmul(a_t, b_tile)
+                        nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
 
-                    c_sbuf = nl.copy(psum, dtype=a.dtype)
+                    c_sbuf = nl.ndarray((tile_m, tile_n), dtype=a.dtype, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=psum, dst=c_sbuf)
                     nl.store(
                         c[batch, m_off : m_off + tile_m, n_off : n_off + tile_n],
                         value=c_sbuf,
@@ -163,21 +171,26 @@ if HAS_NKI:
                 # T.T = Bj @ Bi.T — swap the roles.
                 psum_T = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
                 psum_Tt = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
-                psum_T[...] += nisa.nc_matmul(Bi_t, Bj_t)
-                psum_Tt[...] += nisa.nc_matmul(Bj_t, Bi_t)
+                nisa.nc_matmul(dst=psum_T, stationary=Bi_t, moving=Bj_t, accumulate=True)
+                nisa.nc_matmul(dst=psum_Tt, stationary=Bj_t, moving=Bi_t, accumulate=True)
 
-                t = nl.copy(psum_T, dtype=B.dtype)  # (NVIR, NVIR)
-                t_T = nl.copy(psum_Tt, dtype=B.dtype)
+                # PSUM → SBUF: NKI 0.3.0 requires an explicit tensor_copy
+                # into a fresh SBUF tile for downstream Vector Engine ops.
+                t = nl.ndarray((NVIR, NVIR), dtype=B.dtype, buffer=nl.sbuf)
+                t_T = nl.ndarray((NVIR, NVIR), dtype=B.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum_T, dst=t)
+                nisa.tensor_copy(src=psum_Tt, dst=t_T)
 
                 # Δ_ab = (ε_i + ε_j) - ε_a - ε_b
                 # Build the (NVIR, NVIR) denominator on the Vector Engine.
                 denom_rows = nl.subtract(eo_sum, ev.reshape((NVIR, 1)))  # (NVIR, 1)
                 denom = nl.subtract(denom_rows, ev.reshape((1, NVIR)))  # (NVIR, NVIR)
 
-                # term = T * (2T - T.T) / Δ
+                # term = T * (2T - T.T) / Δ. NKI 0.3.0 drops tensor-tensor
+                # nl.divide; use multiply × reciprocal.
                 two_t_minus_tT = nl.subtract(nl.multiply(t, 2.0), t_T)
                 numerator = nl.multiply(t, two_t_minus_tT)
-                term = nl.divide(numerator, denom)
+                term = nl.multiply(numerator, nl.reciprocal(denom))
 
                 # Reduce to scalar and store.
                 e_ij = nl.sum(term, axis=(0, 1))

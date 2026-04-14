@@ -9,16 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Migrated to NKI 0.3.0 / Neuron SDK 2.29.** Canonical `nki.*`
+  namespace; the legacy `neuronxcc.nki.*` shim is no longer used.
+  Kernels (`matmul_kernel`, `batched_matmul_kernel`,
+  `mp2_energy_kernel`) updated for the NKI 0.3.0 breaking-change
+  surface:
+  - `nisa.nc_matmul(dst=, stationary=, moving=, accumulate=True)`
+    (all kwargs; internal accumulate replaces external
+    `psum[...] += ...`).
+  - `nl.copy(psum, ...)` returns a view; use `nl.ndarray` +
+    `nisa.tensor_copy` to move PSUM → SBUF before `nl.store`.
+  - Tensor-tensor `nl.divide` dropped; use `multiply × reciprocal`
+    in `mp2_energy_kernel`.
 - Dev workflow migrated to [uv](https://github.com/astral-sh/uv).
   `uv sync --extra dev` replaces `pip install -e ".[dev]"`; CI uses
   `astral-sh/setup-uv@v6` and invokes `uv run pytest` / `uvx ruff`.
   `uv.lock` is committed for reproducible installs.
-- Removed the `[neuron]` optional-dependencies extra. `neuronxcc` and
-  the NKI runtime come from the AWS Deep Learning AMI's pre-built venv
-  (`/opt/aws_neuronx_venv_pytorch_*`), not pip — the extra was never
-  resolvable against any index. The DLAMI tracks Neuron SDK 2.29 /
-  NKI 0.3.0 Stable as of 2026-04-09.
+- Removed the `[neuron]` optional-dependencies extra. `nki` (the
+  runtime) is installed separately from the AWS Neuron pip index in
+  CI, or provided by the Deep Learning AMI's pre-built venv on
+  hardware.
 - `CONTRIBUTING.md` updated to reflect the uv-based setup.
+
+### Added
+
+- **NKI CPU simulator dispatch** via `TRNTENSOR_USE_SIMULATOR=1`.
+  Routes kernels through `nki.simulate(kernel)(numpy_args)` on CPU,
+  bypassing `torch_xla` + NEFF compile. Iteration loop drops from
+  ~5 min per SSM round-trip to seconds. All three dispatch wrappers
+  (`nki_matmul`, `nki_batched_matmul`, `_nki_mp2_energy`) carry the
+  simulator branch. Correctness-only — MLIR verifier errors remain
+  hardware-only. See
+  [`docs/developing_kernels.md`](docs/developing_kernels.md).
+- `tests/test_nki_sim.py` — curated simulator-backed correctness
+  suite, marker `nki_simulator`. Skips unless
+  `TRNTENSOR_USE_SIMULATOR=1` + `nki` is importable.
+- `scripts/run_simulator_tests.sh` — SSM runner that runs the
+  simulator suite on the trn1 DLAMI (parity with
+  `run_neuron_tests.sh`; the primary simulator runner is the CI job).
+- **`nki-simulator` CI job on `ubuntu-latest`.** Runs the
+  `nki_simulator`-marked suite against `nki>=0.3.0` from the AWS
+  pip index (`--extra-index-url
+  https://pip.repos.neuron.amazonaws.com`) on every push + PR. Zero
+  AWS cost for the correctness gate; hardware SSM now reserved for
+  perf + MLIR verification.
+- `docs/developing_kernels.md` — thin pointer to the umbrella's
+  canonical NKI how-to plus trntensor-specific env vars and file
+  locations.
 
 ## [0.1.2] — 2026-04-12
 

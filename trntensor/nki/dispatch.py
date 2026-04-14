@@ -15,13 +15,31 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import torch
 
 from ._kernels import HAS_NKI, TILE_K, TILE_M, TILE_N
 
+if HAS_NKI:
+    import nki  # re-imported here so `nki.simulate` is reachable from dispatch
+
 # Re-raise kernel exceptions instead of falling back when set. Used by the
 # validation suite to surface silent kernel breakage during iteration.
 _REQUIRE_NKI = os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+
+# Route dispatch through nki.simulate(kernel)(np_args) on CPU instead of
+# XLA → NEFF → hardware. Catches Python-trace-level errors (bad kwargs,
+# shape mismatches) in seconds. MLIR verifier errors remain hardware-only.
+_USE_SIMULATOR = os.environ.get("TRNTENSOR_USE_SIMULATOR", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _use_simulator() -> bool:
+    return _USE_SIMULATOR and HAS_NKI
+
 
 # Total-FLOP threshold below which we skip NKI and use torch.matmul / torch.bmm
 # directly. The NKI wrapper has ~1 ms of XLA dispatch overhead per call; for
@@ -105,11 +123,19 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             A_p[:M, :K] = A
             B_p = torch.zeros(K_pad, N_pad, dtype=B.dtype, device=B.device)
             B_p[:K, :N] = B
-            (a, b), orig_device = _to_xla(A_p.contiguous(), B_p.contiguous())
+            A_feed = A_p.contiguous()
+            B_feed = B_p.contiguous()
         else:
-            (a, b), orig_device = _to_xla(A.contiguous(), B.contiguous())
-        c = matmul_kernel(a, b)
-        result = c.to(orig_device)
+            A_feed = A.contiguous()
+            B_feed = B.contiguous()
+
+        if _use_simulator():
+            out_np = nki.simulate(matmul_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            result = torch.from_numpy(np.asarray(out_np)).to(A.device)
+        else:
+            (a, b), orig_device = _to_xla(A_feed, B_feed)
+            c = matmul_kernel(a, b)
+            result = c.to(orig_device)
         return result[:M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:
@@ -143,7 +169,17 @@ def _nki_mp2_energy(
             f"(got nvir={nvir}, naux={naux}). K/M tiling not yet implemented."
         )
 
-    (b, eo, ev), orig_device = _to_xla(B.contiguous(), eps_occ.contiguous(), eps_vir.contiguous())
+    B_feed = B.contiguous()
+    eo_feed = eps_occ.contiguous()
+    ev_feed = eps_vir.contiguous()
+
+    if _use_simulator():
+        out_np = nki.simulate(mp2_energy_kernel)(
+            B_feed.cpu().numpy(), eo_feed.cpu().numpy(), ev_feed.cpu().numpy()
+        )
+        return torch.from_numpy(np.asarray(out_np)).to(B.device).sum()
+
+    (b, eo, ev), orig_device = _to_xla(B_feed, eo_feed, ev_feed)
     partial = mp2_energy_kernel(b, eo, ev)
     return partial.to(orig_device).sum()
 
@@ -177,11 +213,19 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             A_p[:, :M, :K] = A
             B_p = torch.zeros(Bsz, K_pad, N_pad, dtype=B.dtype, device=B.device)
             B_p[:, :K, :N] = B
-            (a, b), orig_device = _to_xla(A_p.contiguous(), B_p.contiguous())
+            A_feed = A_p.contiguous()
+            B_feed = B_p.contiguous()
         else:
-            (a, b), orig_device = _to_xla(A.contiguous(), B.contiguous())
-        c = batched_matmul_kernel(a, b)
-        result = c.to(orig_device)
+            A_feed = A.contiguous()
+            B_feed = B.contiguous()
+
+        if _use_simulator():
+            out_np = nki.simulate(batched_matmul_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            result = torch.from_numpy(np.asarray(out_np)).to(A.device)
+        else:
+            (a, b), orig_device = _to_xla(A_feed, B_feed)
+            c = batched_matmul_kernel(a, b)
+            result = c.to(orig_device)
         return result[:, :M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:
