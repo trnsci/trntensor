@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`trntensor.ao_to_mo_transform(eri, C_occ, C_vir)`** — fused 4-index
+  AO→MO integral transform. One NKI program computes
+  `B[i,a,P] = Σ_{μν} C_occ[μ,i] · C_vir[ν,a] · eri[μ,ν,P]` with C_occ
+  and C_vir SBUF-resident across all P iterations. The per-P
+  intermediate `(i, ν)` tile round-trips through kernel-scratch HBM to
+  handle the partition-dim change between the two sequential
+  `nc_matmul` steps. Composes with `mp2_energy` for the full DF-MP2
+  pipeline from AO integrals to correlation energy. Single-tile path
+  this release (`nbasis ≤ 128`); K/N tiling follow-up.
+  Validated on trn1 (hardware) and via the CPU simulator CI job.
+
 ### Changed
 
 - **Migrated to NKI 0.3.0 / Neuron SDK 2.29.** Canonical `nki.*`

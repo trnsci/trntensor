@@ -114,6 +114,31 @@ class TestMp2Bench:
         benchmark(loop)
 
 
+class TestAoToMoTransformBench:
+    """Fused ao_to_mo_transform vs. the two-step decomposed einsum form."""
+
+    @pytest.fixture
+    def transform_inputs(self):
+        nbasis, nocc, nvir, naux = 32, 5, 10, 16
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+        return eri, C_occ, C_vir
+
+    def test_fused(self, benchmark, transform_inputs):
+        eri, C_occ, C_vir = transform_inputs
+        benchmark(trntensor.ao_to_mo_transform, eri, C_occ, C_vir)
+
+    def test_two_step(self, benchmark, transform_inputs):
+        eri, C_occ, C_vir = transform_inputs
+
+        def two_step():
+            intermediate = torch.einsum("mi,mnP->inP", C_occ, eri)
+            return torch.einsum("na,inP->iaP", C_vir, intermediate)
+
+        benchmark(two_step)
+
+
 class TestDecomposeBench:
     def test_cp_rank8(self, benchmark):
         T = torch.randn(16, 16, 16)

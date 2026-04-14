@@ -49,6 +49,8 @@ The fused kernel in `trntensor/nki/_kernels.py::mp2_energy_kernel` does all thre
 
 This pattern — fused contract + elementwise + reduce with SBUF-resident intermediates — is what trntensor extends across the suite. Generic `einsum` dispatch to `matmul` / `bmm` kernels is the foundation; primitives like `mp2_energy` are the architectural flagships.
 
+A second pattern — **fused multi-contraction** with a SBUF-resident shared operand — is demonstrated by `ao_to_mo_transform`. The classical AO→MO integral transform chains two matmuls sharing the MO coefficient tensors; a cuTENSOR equivalent would issue two dispatches with the intermediate four-index tensor materialized to HBM between them. Our NKI kernel loads `C_occ` and `C_vir` once SBUF-resident across every auxiliary index P, does both matmuls in one program, and the per-P intermediate never appears as a user-visible tensor. The general case of "multi-step contraction DAG compiled to one NKI program" is the architectural superset cuTENSOR can't express; `ao_to_mo_transform` is the first concrete instance.
+
 **Performance honest note.** The fused kernel is architecturally correct but currently carries ~15–40 ms of XLA dispatch + compile overhead per call, which means at small chemistry sizes the CPU fallback path still wins. The fusion work pays off once per-call overhead is amortized (tracked in #33/#34). See [Benchmarks](benchmarks.md) for the current numbers.
 
 ## Decompositions for quantum chemistry

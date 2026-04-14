@@ -109,6 +109,22 @@ Inside that single call:
 
 No intermediate `T` tensor is ever materialized to HBM. See [API: quantum](api/quantum.md) and [Architecture](architecture.md) for the full description.
 
+## Starting from AO integrals
+
+If you have AO-basis density-fitted integrals rather than pre-transformed MO coefficients, use `ao_to_mo_transform` to get `B`:
+
+```python
+import trntensor
+
+# eri: (nbasis, nbasis, naux) density-fitted AO ERIs
+# C_occ: (nbasis, nocc) occupied MO coefficients
+# C_vir: (nbasis, nvir) virtual MO coefficients
+B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+E = trntensor.mp2_energy(B, eps_occ, eps_vir)
+```
+
+`ao_to_mo_transform` is another fused NKI kernel — one dispatch, C matrices SBUF-resident across all P. See [api/quantum.md](api/quantum.md).
+
 ## Current limitations
 
 - The energy denominator is a separate element-wise op. A fused kernel that folds the division into the PSUM accumulation — `E = Σ T²/Δ` in one kernel — is tracked in [#13][i13]. Landing it collapses the pair-energy loop into a single tensor-engine invocation per `(i,j)`.
