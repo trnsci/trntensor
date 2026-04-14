@@ -97,7 +97,7 @@ CMD_ID=$(aws ssm send-command \
   --document-name "AWS-RunShellScript" \
   --comment "trntensor neuron tests @ $SHA" \
   --parameters "commands=[
-    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trntensor && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trntensor[dev] --quiet && sudo -u ubuntu $PYTEST_INVOCATION'\"
+    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trntensor && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trntensor[dev] --quiet && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/local/bin:/usr/bin:/bin $PYTEST_INVOCATION'\"
   ]" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
