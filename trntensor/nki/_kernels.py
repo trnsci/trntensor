@@ -196,9 +196,13 @@ if HAS_NKI:
                 numerator = nl.multiply(t, two_t_minus_tT)
                 term = nl.multiply(numerator, nl.reciprocal(denom))
 
-                # Reduce to scalar and store.
-                e_ij = nl.sum(term, axis=(0, 1))
-                nl.store(partial[i : i + 1, j : j + 1], value=e_ij)
+                # Reduce to scalar via a persistent (1, 1) SBUF accumulator.
+                # NKI rejects 0-D SBUF tiles, so we can't allocate one
+                # directly from nl.sum; instead broadcast the 0-D sum into
+                # a (1, 1) tile via nl.add. Matches trnblas's pattern.
+                acc = nl.zeros((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                acc[...] = nl.add(acc, nl.sum(term, axis=(0, 1)))
+                nl.store(partial[i : i + 1, j : j + 1], value=acc)
 
         return partial
 
