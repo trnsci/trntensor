@@ -125,9 +125,11 @@ def to_xla(tensor: torch.Tensor) -> torch.Tensor:
             "to_xla requires the NKI runtime. Install trntensor on a Trainium "
             "instance (AWS Deep Learning AMI) or use the CPU path."
         )
-    import torch_xla.core.xla_model as xm
-
-    return tensor.to(xm.xla_device())
+    # Route through the internal _to_xla helper so residency uses exactly
+    # the same path as per-kernel dispatch — keeps torch_xla initialization
+    # consistent across entry points.
+    xla_tensors, _ = _to_xla(tensor)
+    return xla_tensors[0]
 
 
 def from_xla(tensor: torch.Tensor) -> torch.Tensor:
