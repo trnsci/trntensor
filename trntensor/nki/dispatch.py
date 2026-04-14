@@ -184,6 +184,38 @@ def _nki_mp2_energy(
     return partial.to(orig_device).sum()
 
 
+def _nki_ao_to_mo_transform(
+    eri: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch ``ao_to_mo_transform_kernel``.
+
+    Single-tile path — shape constraints enforced by the caller
+    (``trntensor.quantum.ao_to_mo_transform``).
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+
+    from ._kernels import ao_to_mo_transform_kernel
+
+    eri_feed = eri.contiguous()
+    C_occ_feed = C_occ.contiguous()
+    C_vir_feed = C_vir.contiguous()
+
+    if _use_simulator():
+        out_np = nki.simulate(ao_to_mo_transform_kernel)(
+            eri_feed.cpu().numpy(),
+            C_occ_feed.cpu().numpy(),
+            C_vir_feed.cpu().numpy(),
+        )
+        return torch.from_numpy(np.asarray(out_np)).to(eri.device)
+
+    (e, co, cv), orig_device = _to_xla(eri_feed, C_occ_feed, C_vir_feed)
+    B = ao_to_mo_transform_kernel(e, co, cv)
+    return B.to(orig_device)
+
+
 def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Batched 2D matmul ``A @ B`` over a leading batch dim.
 

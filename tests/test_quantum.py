@@ -54,3 +54,57 @@ class TestMp2EnergyReference:
         e_pub = trntensor.mp2_energy(B, eps_occ, eps_vir)
         e_ref = _cpu_mp2_energy(B, eps_occ, eps_vir)
         torch.testing.assert_close(e_pub, e_ref, atol=1e-6, rtol=1e-6)
+
+
+class TestAoToMoTransformReference:
+    def test_matches_fused_einsum(self):
+        """The CPU reference is the fused einsum by construction —
+        verify it also matches the two-step decomposed form.
+        """
+        torch.manual_seed(0)
+        nbasis, nocc, nvir, naux = 8, 3, 5, 12
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+
+        got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+
+        # Two-step reference (materializes the intermediate).
+        intermediate = torch.einsum("mi,mnP->inP", C_occ, eri)
+        expected = torch.einsum("na,inP->iaP", C_vir, intermediate)
+        torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+    def test_composes_with_mp2_energy(self):
+        """B = ao_to_mo_transform(eri, C_occ, C_vir); mp2_energy(B, ...) is
+        the full DF-MP2 pipeline from AO integrals.
+        """
+        torch.manual_seed(2)
+        nbasis, nocc, nvir, naux = 8, 3, 5, 12
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+        B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        assert B.shape == (nocc, nvir, naux)
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        assert e.shape == ()
+        assert torch.isfinite(e)
+
+    def test_shape_errors(self):
+        eri = torch.randn(6, 6, 8)
+        C_occ = torch.randn(6, 2)
+        C_vir = torch.randn(6, 3)
+
+        with pytest.raises(ValueError, match="must be 3D"):
+            trntensor.ao_to_mo_transform(torch.randn(6, 6), C_occ, C_vir)
+
+        with pytest.raises(ValueError, match="first two dims must match"):
+            trntensor.ao_to_mo_transform(torch.randn(6, 7, 8), C_occ, C_vir)
+
+        with pytest.raises(ValueError, match="C_occ"):
+            trntensor.ao_to_mo_transform(eri, torch.randn(5, 2), C_vir)
+
+        with pytest.raises(ValueError, match="C_vir"):
+            trntensor.ao_to_mo_transform(eri, C_occ, torch.randn(7, 3))

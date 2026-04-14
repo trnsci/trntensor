@@ -11,7 +11,7 @@ from .decompose import cp_decompose, cp_reconstruct, tucker_decompose, tucker_re
 from .einsum import einsum, multi_einsum
 from .nki import HAS_NKI, get_backend, set_backend
 from .plan import ContractionPlan, estimate_flops, plan_contraction
-from .quantum import mp2_energy
+from .quantum import ao_to_mo_transform, mp2_energy
 
 __all__ = [
     "einsum",
@@ -27,4 +27,5 @@ __all__ = [
     "set_backend",
     "get_backend",
     "mp2_energy",
+    "ao_to_mo_transform",
 ]

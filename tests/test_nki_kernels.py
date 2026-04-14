@@ -175,6 +175,26 @@ class TestMp2Energy:
         e_ref = _cpu_mp2_energy(B, eps_occ, eps_vir)
         torch.testing.assert_close(e_nki, e_ref, atol=1e-3, rtol=1e-4)
 
+    def test_ao_to_mo_transform_composes(self, nki_backend):
+        """Full DF-MP2 AO → MO → E pipeline on hardware."""
+        import trntensor
+
+        torch.manual_seed(42)
+        nbasis, nocc, nvir, naux = 32, 5, 10, 16
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+        B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        B_ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+        torch.testing.assert_close(B, B_ref, atol=ATOL, rtol=RTOL)
+
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        e_ref = trntensor.quantum._cpu_mp2_energy(B_ref, eps_occ, eps_vir)
+        torch.testing.assert_close(e, e_ref, atol=1e-3, rtol=1e-4)
+
     def test_oversize_raises(self, nki_backend):
         """nvir > 128 or naux > 128 should raise until K/M tiling lands."""
         import pytest

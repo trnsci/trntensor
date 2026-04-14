@@ -98,3 +98,88 @@ def _cpu_mp2_energy(
             denom = eps_occ[i] + eps_occ[j] - eps_vir.unsqueeze(1) - eps_vir.unsqueeze(0)
             e = e + (T * (2 * T - T.T) / denom).sum()
     return e
+
+
+def ao_to_mo_transform(
+    eri: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Fused 4-index AO→MO integral transform.
+
+    Computes
+
+        B[i, a, P] = Σ_{μ, ν} C_occ[μ, i] · C_vir[ν, a] · eri[μ, ν, P]
+
+    as the canonical chemistry primitive. On Trainium, this is one NKI
+    program: the first matmul's result lives in SBUF as an intermediate
+    ``(i, ν)`` tile that feeds the second matmul directly — no
+    intermediate four-index tensor is materialized to HBM. On CPU the
+    fallback is ``torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)``.
+
+    Composes with :func:`mp2_energy`: ``B = ao_to_mo_transform(eri, C_occ,
+    C_vir)`` then ``E = mp2_energy(B, eps_occ, eps_vir)`` is the full
+    DF-MP2 pipeline from AO integrals to correlation energy.
+
+    Parameters
+    ----------
+    eri : (nbasis, nbasis, naux) tensor
+        Density-fitted two-electron integrals in the AO basis.
+    C_occ : (nbasis, nocc) tensor
+        Occupied molecular orbital coefficients.
+    C_vir : (nbasis, nvir) tensor
+        Virtual molecular orbital coefficients.
+
+    Returns
+    -------
+    (nocc, nvir, naux) tensor
+        The transformed DF coefficients ``B_ia^P``.
+    """
+    if eri.dim() != 3:
+        raise ValueError(f"eri must be 3D (nbasis, nbasis, naux); got shape {tuple(eri.shape)}")
+    nbasis_mu, nbasis_nu, _naux = eri.shape
+    if nbasis_mu != nbasis_nu:
+        raise ValueError(
+            f"eri first two dims must match (nbasis, nbasis); got ({nbasis_mu}, {nbasis_nu})"
+        )
+    nbasis = nbasis_mu
+    if C_occ.dim() != 2 or C_occ.shape[0] != nbasis:
+        raise ValueError(f"C_occ must have shape ({nbasis}, nocc); got {tuple(C_occ.shape)}")
+    if C_vir.dim() != 2 or C_vir.shape[0] != nbasis:
+        raise ValueError(f"C_vir must have shape ({nbasis}, nvir); got {tuple(C_vir.shape)}")
+    _, nocc = C_occ.shape
+    _, nvir = C_vir.shape
+
+    if _use_nki() and HAS_NKI:
+        from .nki.dispatch import _nki_ao_to_mo_transform
+
+        # Single-tile path: partition dim ≤ 128 for both nc_matmul steps,
+        # moving free dim ≤ 512 for step-1 and step-2 outputs.
+        if nbasis > 128:
+            raise NotImplementedError(
+                f"ao_to_mo_transform NKI path requires nbasis ≤ 128 "
+                f"(got nbasis={nbasis}); K-tiling not yet implemented."
+            )
+        if nocc * _naux > 512 or nvir * _naux > 512:
+            raise NotImplementedError(
+                f"ao_to_mo_transform NKI path requires nocc*naux ≤ 512 and "
+                f"nvir*naux ≤ 512 (got nocc={nocc}, nvir={nvir}, naux={_naux}); "
+                f"N-tiling not yet implemented."
+            )
+        try:
+            return _nki_ao_to_mo_transform(eri, C_occ, C_vir)
+        except Exception:
+            import os
+
+            if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
+                raise
+    return _cpu_ao_to_mo_transform(eri, C_occ, C_vir)
+
+
+def _cpu_ao_to_mo_transform(
+    eri: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Reference: the fused 3-operand einsum form."""
+    return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)

@@ -78,6 +78,24 @@ class TestBatchedMatmulSimulator:
             trntensor.set_backend("auto")
 
 
+class TestAoToMoTransformSimulator:
+    def test_small(self):
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(0)
+            nbasis, nocc, nvir, naux = 32, 5, 10, 16
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+
 class TestMp2EnergySimulator:
     def test_demo_shape(self):
         import trntensor

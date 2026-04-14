@@ -197,3 +197,81 @@ if HAS_NKI:
                 nl.store(partial[i : i + 1, j : j + 1], value=e_ij)
 
         return partial
+
+    @nki.jit
+    def ao_to_mo_transform_kernel(eri, C_occ, C_vir):
+        """Fused 4-index AO→MO integral transform.
+
+        Computes ``B[i, a, P] = Σ_{μ,ν} C_occ[μ, i] · C_vir[ν, a] · eri[μ, ν, P]``
+        as one NKI program. Per auxiliary index P:
+
+        1. **Step 1 matmul**: ``intermediate(i, ν) = Σ_μ C_occ(μ,i) · eri(μ,ν)``
+           — C_occ stationary, eri slice moving, result in PSUM.
+        2. **PSUM → kernel scratch HBM** via SBUF — the intermediate is
+           reloadable with ν as partition dim for the next step. This is
+           scratch that never leaves the kernel; the user never sees it.
+        3. **Step 2 matmul**: ``B(i, a) = Σ_ν intermediate(ν,i) · C_vir(ν,a)``
+           — intermediate loaded transposed (partition=ν), C_vir moving.
+        4. **PSUM → SBUF → HBM** — write the final B slice for this P.
+
+        C_occ and C_vir are loaded once and kept SBUF-resident across all
+        P iterations. Only the per-P intermediate round-trips through HBM
+        (scratch) to handle the partition-dim change between the two
+        matmul steps. Assumes single-tile: nbasis ≤ 128,
+        ``nocc * naux ≤ 512`` and ``nvir * naux ≤ 512``. Larger shapes
+        need K and N tiling (follow-up).
+
+        Inputs
+        ------
+        eri   : (nbasis, nbasis, naux) — AO-basis density-fitted ERIs.
+        C_occ : (nbasis, nocc)         — occupied MO coefficients.
+        C_vir : (nbasis, nvir)         — virtual MO coefficients.
+
+        Returns
+        -------
+        (nocc, nvir, naux) tensor of transformed coefficients B_ia^P.
+        """
+        NBASIS, _, NAUX = eri.shape
+        _, NOCC = C_occ.shape
+        _, NVIR = C_vir.shape
+
+        B_out = nl.ndarray((NOCC, NVIR, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
+        # Scratch: holds the post-step-1 intermediate per P in (NOCC, NBASIS)
+        # layout. Reloaded via nl.load_transpose2d in step 2 to get partition=ν.
+        inter_hbm = nl.ndarray((NOCC, NBASIS, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
+
+        # Load C tensors once; reused for every P.
+        # C_occ shape (NBASIS, NOCC): nl.load gives partition=NBASIS=μ, free=NOCC=i.
+        C_occ_sbuf = nl.load(C_occ[0:NBASIS, 0:NOCC])
+        # C_vir shape (NBASIS, NVIR): partition=ν, free=a.
+        C_vir_sbuf = nl.load(C_vir[0:NBASIS, 0:NVIR])
+
+        for p in nl.affine_range(NAUX):
+            # Step 1: intermediate(i, ν) = C_occ^T · eri[:,:,p]
+            #   stationary = C_occ_sbuf (μ, i)  partition=μ, free=i
+            #   moving     = eri slice  (μ, ν)  partition=μ, free=ν
+            # eri slice for this P — 2D (NBASIS, NBASIS), partition=μ.
+            eri_slice = nl.load(eri[0:NBASIS, 0:NBASIS, p])
+            psum_1 = nl.zeros((NOCC, NBASIS), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=psum_1, stationary=C_occ_sbuf, moving=eri_slice, accumulate=True)
+            # PSUM → SBUF (i, ν) → HBM scratch. Writing as (ν, i) layout
+            # so the next step can reload with ν as partition.
+            inter_sbuf = nl.ndarray((NOCC, NBASIS), dtype=eri.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(src=psum_1, dst=inter_sbuf)
+            # Store as (NOCC, NBASIS) — natural layout from PSUM.
+            nl.store(inter_hbm[0:NOCC, 0:NBASIS, p], value=inter_sbuf)
+
+            # Step 2: B(i, a) = intermediate(ν,i) · C_vir(ν,a)
+            #   stationary = intermediate (ν, i)  partition=ν, free=i
+            #   moving     = C_vir_sbuf   (ν, a)  partition=ν, free=a
+            # Reload intermediate transposed so partition=ν (NBASIS) and free=i.
+            inter_stationary = nl.load_transpose2d(inter_hbm[0:NOCC, 0:NBASIS, p])
+            psum_2 = nl.zeros((NOCC, NVIR), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(
+                dst=psum_2, stationary=inter_stationary, moving=C_vir_sbuf, accumulate=True
+            )
+            out_sbuf = nl.ndarray((NOCC, NVIR), dtype=eri.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(src=psum_2, dst=out_sbuf)
+            nl.store(B_out[0:NOCC, 0:NVIR, p], value=out_sbuf)
+
+        return B_out
