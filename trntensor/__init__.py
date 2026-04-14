@@ -10,6 +10,7 @@ __version__ = "0.1.2"
 from .decompose import cp_decompose, cp_reconstruct, tucker_decompose, tucker_reconstruct
 from .einsum import einsum, multi_einsum
 from .nki import HAS_NKI, get_backend, set_backend
+from .nki.dispatch import from_xla, to_xla
 from .plan import ContractionPlan, estimate_flops, plan_contraction
 from .quantum import ao_to_mo_transform, mp2_energy
 
@@ -26,6 +27,8 @@ __all__ = [
     "HAS_NKI",
     "set_backend",
     "get_backend",
+    "to_xla",
+    "from_xla",
     "mp2_energy",
     "ao_to_mo_transform",
 ]

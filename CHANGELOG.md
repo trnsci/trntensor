@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`trntensor.to_xla(tensor)` / `trntensor.from_xla(tensor)`** — explicit
+  operand residency on the Trainium XLA device. Pre-pinning operands
+  lets repeated trntensor calls skip per-dispatch host↔device
+  transfer, which otherwise dominates at current kernel sizes. The
+  full DF-MP2 pipeline (`ao_to_mo_transform` → `mp2_energy`) with all
+  operands pre-pinned pays transfer cost once instead of once per
+  call. The dispatch layer's `_to_xla` helper takes a fast path when
+  every operand is already on XLA, returning the result on XLA — the
+  caller decides when to pull back via `from_xla`. Third architectural
+  pattern after fused-reduce and fused multi-contraction; see
+  `docs/architecture.md`. Closes #34.
 - **`trntensor.ao_to_mo_transform(eri, C_occ, C_vir)`** — fused 4-index
   AO→MO integral transform. One NKI program computes
   `B[i,a,P] = Σ_{μν} C_occ[μ,i] · C_vir[ν,a] · eri[μ,ν,P]` with C_occ

@@ -204,3 +204,106 @@ class TestMp2Energy:
         B = torch.randn(2, 200, 50)
         with pytest.raises(NotImplementedError, match="nvir.*≤.*128"):
             trntensor.mp2_energy(B, torch.randn(2), torch.randn(200))
+
+
+class TestXlaResidency:
+    """Expose Trainium's data-locality architecture at the user level.
+
+    ``to_xla`` / ``from_xla`` let callers pre-pin operands so repeated
+    trntensor calls skip the host↔device transfer that otherwise
+    dominates dispatch overhead.
+    """
+
+    def test_matmul_stays_on_xla(self, nki_backend):
+        """With operands on XLA, the result is also on XLA — caller
+        decides when to pull back."""
+        import trntensor
+        from trntensor.nki import dispatch
+
+        prev = dispatch._MIN_NKI_FLOPS
+        dispatch._MIN_NKI_FLOPS = 0
+        try:
+            torch.manual_seed(0)
+            A = trntensor.to_xla(torch.randn(128, 128))
+            B = trntensor.to_xla(torch.randn(128, 256))
+            out = trntensor.einsum("ij,jk->ik", A, B)
+            assert out.device.type == "xla", f"expected xla, got {out.device}"
+
+            # from_xla brings it back; content matches a CPU-only run.
+            out_cpu = trntensor.from_xla(out)
+            ref = trntensor.from_xla(A) @ trntensor.from_xla(B)
+            torch.testing.assert_close(out_cpu, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            dispatch._MIN_NKI_FLOPS = prev
+
+    def test_pipeline_composition(self, nki_backend):
+        """Full DF-MP2 with every operand pre-pinned; intermediate B
+        never leaves the device."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        torch.manual_seed(7)
+        nbasis, nocc, nvir, naux = 32, 5, 10, 16
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+        eri_x = trntensor.to_xla(eri)
+        C_occ_x = trntensor.to_xla(C_occ)
+        C_vir_x = trntensor.to_xla(C_vir)
+        eps_occ_x = trntensor.to_xla(eps_occ)
+        eps_vir_x = trntensor.to_xla(eps_vir)
+
+        B_x = trntensor.ao_to_mo_transform(eri_x, C_occ_x, C_vir_x)
+        assert B_x.device.type == "xla"
+        E_x = trntensor.mp2_energy(B_x, eps_occ_x, eps_vir_x)
+        E = trntensor.from_xla(E_x)
+
+        # Reference path, all on CPU.
+        B_ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+        E_ref = _cpu_mp2_energy(B_ref, eps_occ, eps_vir)
+        torch.testing.assert_close(E, E_ref, atol=1e-3, rtol=1e-4)
+
+    def test_residency_speedup(self, nki_backend):
+        """A loop that reuses the same operands is faster when they're
+        pinned on XLA than when they're transferred every iteration.
+        """
+        import time
+
+        import trntensor
+        from trntensor.nki import dispatch
+
+        torch.manual_seed(0)
+        A = torch.randn(2048, 2048)
+        B = torch.randn(2048, 2048)
+        N_ITERS = 5
+
+        prev = dispatch._MIN_NKI_FLOPS
+        dispatch._MIN_NKI_FLOPS = 0
+        try:
+            # Cold path: transfer per iteration.
+            trntensor.einsum("ij,jk->ik", A, B)  # warmup
+            t0 = time.perf_counter()
+            for _ in range(N_ITERS):
+                _ = trntensor.einsum("ij,jk->ik", A, B)
+            t_cold = time.perf_counter() - t0
+
+            # Residency: transfer once.
+            A_x = trntensor.to_xla(A)
+            B_x = trntensor.to_xla(B)
+            trntensor.einsum("ij,jk->ik", A_x, B_x)  # warmup
+            t0 = time.perf_counter()
+            for _ in range(N_ITERS):
+                _ = trntensor.einsum("ij,jk->ik", A_x, B_x)
+            t_hot = time.perf_counter() - t0
+        finally:
+            dispatch._MIN_NKI_FLOPS = prev
+
+        speedup = t_cold / t_hot
+        # Loose bar — profile suggests ~10x. Allow 3x for HW variance.
+        assert speedup >= 3.0, (
+            f"residency speedup {speedup:.2f}× below 3× floor "
+            f"(cold={t_cold * 1e3:.1f}ms, hot={t_hot * 1e3:.1f}ms)"
+        )

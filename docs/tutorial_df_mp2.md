@@ -125,6 +125,31 @@ E = trntensor.mp2_energy(B, eps_occ, eps_vir)
 
 `ao_to_mo_transform` is another fused NKI kernel — one dispatch, C matrices SBUF-resident across all P. See [api/quantum.md](api/quantum.md).
 
+## Keeping tensors on the accelerator
+
+In the above the Python runtime sees `B` as an intermediate tensor and
+could try to move it back to the CPU between the two calls — paying
+for a large HBM → host transfer just to send it right back to the
+device for `mp2_energy`. `trntensor.to_xla` and `trntensor.from_xla`
+let you opt into explicit residency:
+
+```python
+eri_xla = trntensor.to_xla(eri)
+C_occ_xla = trntensor.to_xla(C_occ)
+C_vir_xla = trntensor.to_xla(C_vir)
+eps_occ_xla = trntensor.to_xla(eps_occ)
+eps_vir_xla = trntensor.to_xla(eps_vir)
+
+B_xla = trntensor.ao_to_mo_transform(eri_xla, C_occ_xla, C_vir_xla)
+E_xla = trntensor.mp2_energy(B_xla, eps_occ_xla, eps_vir_xla)
+E = trntensor.from_xla(E_xla)
+```
+
+When every operand passed to a trntensor call is already on XLA, the
+dispatch layer skips the host↔device transfer and returns the result
+on XLA. Only the final `from_xla(E)` pays the round-trip, and it's
+pulling a 0-D scalar.
+
 ## Current limitations
 
 - The energy denominator is a separate element-wise op. A fused kernel that folds the division into the PSUM accumulation — `E = Σ T²/Δ` in one kernel — is tracked in [#13][i13]. Landing it collapses the pair-energy loop into a single tensor-engine invocation per `(i,j)`.

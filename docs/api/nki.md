@@ -19,6 +19,38 @@ Return the current backend selection.
 Module-level flag set at import time. `True` when `nki` (0.3.0+) is
 importable, otherwise `False`.
 
+## `to_xla(tensor) -> Tensor` / `from_xla(tensor) -> Tensor`
+
+Pin an operand on the Trainium XLA device so repeated trntensor calls
+skip the host↔device transfer that otherwise dominates dispatch
+overhead.
+
+```python
+import trntensor
+
+# One-time transfer onto the accelerator.
+eri_xla = trntensor.to_xla(eri)
+C_occ_xla = trntensor.to_xla(C_occ)
+C_vir_xla = trntensor.to_xla(C_vir)
+eps_occ_xla = trntensor.to_xla(eps_occ)
+eps_vir_xla = trntensor.to_xla(eps_vir)
+
+# Full DF-MP2 pipeline — B_xla never leaves the device.
+B_xla = trntensor.ao_to_mo_transform(eri_xla, C_occ_xla, C_vir_xla)
+E_xla = trntensor.mp2_energy(B_xla, eps_occ_xla, eps_vir_xla)
+
+# Pull the scalar back when we actually need it in Python.
+E = trntensor.from_xla(E_xla)
+```
+
+- `to_xla`: no-op when the tensor is already on XLA. Raises
+  `RuntimeError` on hosts without the NKI runtime.
+- `from_xla`: no-op when the tensor is already on CPU.
+
+When dispatch sees that every operand is already on XLA, it skips the
+per-call transfer and returns the result on XLA — the caller controls
+when to pull back.
+
 ## Environment variables
 
 | Variable | Effect |

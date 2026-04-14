@@ -139,6 +139,47 @@ class TestAoToMoTransformBench:
         benchmark(two_step)
 
 
+class TestResidencyBench:
+    """Full DF-MP2 pipeline with and without operand residency."""
+
+    @pytest.fixture
+    def pipeline_inputs(self):
+        nbasis, nocc, nvir, naux = 32, 5, 10, 16
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+        return eri, C_occ, C_vir, eps_occ, eps_vir
+
+    def test_pipeline_cpu(self, benchmark, pipeline_inputs):
+        eri, C_occ, C_vir, eps_occ, eps_vir = pipeline_inputs
+
+        def pipeline():
+            B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            return trntensor.mp2_energy(B, eps_occ, eps_vir)
+
+        benchmark(pipeline)
+
+    def test_pipeline_xla_resident(self, benchmark, pipeline_inputs):
+        eri, C_occ, C_vir, eps_occ, eps_vir = pipeline_inputs
+        # Pre-pin — benchmark only the dispatch loop, not the one-shot
+        # transfer. This is the apples-to-apples comparison against the
+        # CPU-path variant which pays transfer per-dispatch.
+        eri_x = trntensor.to_xla(eri)
+        C_occ_x = trntensor.to_xla(C_occ)
+        C_vir_x = trntensor.to_xla(C_vir)
+        eps_occ_x = trntensor.to_xla(eps_occ)
+        eps_vir_x = trntensor.to_xla(eps_vir)
+
+        def pipeline():
+            B = trntensor.ao_to_mo_transform(eri_x, C_occ_x, C_vir_x)
+            E = trntensor.mp2_energy(B, eps_occ_x, eps_vir_x)
+            return trntensor.from_xla(E)
+
+        benchmark(pipeline)
+
+
 class TestDecomposeBench:
     def test_cp_rank8(self, benchmark):
         T = torch.randn(16, 16, 16)

@@ -86,11 +86,55 @@ def _round_up(n: int, multiple: int) -> int:
 
 
 def _to_xla(*tensors):
+    """Move tensors to the XLA device for NKI dispatch.
+
+    Fast path: if every tensor is already on an XLA device, return them
+    unchanged and report the XLA device as ``orig``. That means
+    pre-pinned tensors pay no transfer cost per dispatch, and results
+    stay on XLA when inputs were on XLA — the caller decides when to
+    pull back with ``from_xla``.
+    """
+    if all(t.device.type == "xla" for t in tensors):
+        return list(tensors), tensors[0].device
+
     import torch_xla.core.xla_model as xm
 
     device = xm.xla_device()
     orig = tensors[0].device
     return [t.to(device) for t in tensors], orig
+
+
+def to_xla(tensor: torch.Tensor) -> torch.Tensor:
+    """Move a tensor to the XLA (Trainium) device.
+
+    Pre-pinning operands via ``to_xla`` and only pulling results back
+    with ``from_xla`` when needed eliminates host↔device transfer cost
+    from per-dispatch overhead. For pipelines where the same operand
+    is consumed by multiple trntensor calls — DF-MP2 (same ``B`` into
+    ``ao_to_mo_transform`` and ``mp2_energy``), ``(i,j)`` loops reusing
+    ``B_i``, any multi-step workflow — residency is the practical fix
+    for dispatch overhead.
+
+    Raises ``RuntimeError`` on hosts where ``nki`` isn't importable;
+    no-op when the tensor is already on an XLA device.
+    """
+    if tensor.device.type == "xla":
+        return tensor
+    if not HAS_NKI:
+        raise RuntimeError(
+            "to_xla requires the NKI runtime. Install trntensor on a Trainium "
+            "instance (AWS Deep Learning AMI) or use the CPU path."
+        )
+    import torch_xla.core.xla_model as xm
+
+    return tensor.to(xm.xla_device())
+
+
+def from_xla(tensor: torch.Tensor) -> torch.Tensor:
+    """Move a tensor back to CPU. No-op if already on CPU."""
+    if tensor.device.type == "cpu":
+        return tensor
+    return tensor.to("cpu")
 
 
 def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
