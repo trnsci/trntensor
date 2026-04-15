@@ -9,12 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `mp2_energy_kernel` compile failure on pre-pinned XLA ε inputs
+- `mp2_energy_kernel` 1D-load ambiguity on pre-pinned XLA ε inputs
   (#38). Reshape `eps_occ` / `eps_vir` to 2D `(N, 1)` at the dispatch
   boundary; kernel `nl.load` signatures updated to match. Makes
   partition-dim inference unambiguous regardless of residency state.
-  Unblocks the full DF-MP2 pipeline end-to-end on XLA
-  (`ao_to_mo_transform → mp2_energy` with everything pre-pinned).
+  Also switched `mp2_energy_kernel`'s per-(i,j) reduction to trnblas's
+  accumulator pattern (persistent `(1, 1)` SBUF tile) so the `nl.sum`
+  result doesn't need a 0-D SBUF allocation.
+- `_to_xla` fast-path now calls `xm.mark_step()` when operands are
+  already on XLA, forcing pending lazy computations to materialize
+  before the next kernel dispatch.
+
+### Known limitation
+
+- The full DF-MP2 pipeline (`ao_to_mo_transform` → `mp2_energy`) with
+  every operand pre-pinned exposes an NKI compiler bug on trn1: the
+  combined XLA lazy graph provokes `trn2-only shared memory`
+  instructions that fail verification on trn1. Workaround: `from_xla`
+  the intermediate `B` between the two calls. Tracked in #39 for
+  upstream AWS escalation.
 
 ### Added
 
