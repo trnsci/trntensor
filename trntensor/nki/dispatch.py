@@ -88,13 +88,19 @@ def _round_up(n: int, multiple: int) -> int:
 def _to_xla(*tensors):
     """Move tensors to the XLA device for NKI dispatch.
 
-    Fast path: if every tensor is already on an XLA device, return them
-    unchanged and report the XLA device as ``orig``. That means
-    pre-pinned tensors pay no transfer cost per dispatch, and results
-    stay on XLA when inputs were on XLA — the caller decides when to
-    pull back with ``from_xla``.
+    Fast path: if every tensor is already on an XLA device, call
+    ``xm.mark_step()`` to force any pending lazy XLA computations to
+    materialize before the next kernel invocation. Without this, the
+    XLA lazy evaluator can try to fuse consecutive trntensor kernels
+    into one graph, which the NKI compiler cannot lower (it produces
+    shape ambiguities or trn2-only instructions on trn1).
+
+    Otherwise this is a regular host→XLA transfer.
     """
     if all(t.device.type == "xla" for t in tensors):
+        import torch_xla.core.xla_model as xm
+
+        xm.mark_step()
         return list(tensors), tensors[0].device
 
     import torch_xla.core.xla_model as xm
