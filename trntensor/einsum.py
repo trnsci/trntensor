@@ -23,6 +23,30 @@ import torch
 
 from .plan import ContractionPlan, _parse_subscripts, plan_contraction
 
+# Mapping of user-friendly dtype strings to torch.dtype
+_DTYPE_MAP: dict[str, torch.dtype] = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "f32": torch.float32,
+    "float32": torch.float32,
+    "f64": torch.float64,
+    "float64": torch.float64,
+}
+
+
+def _resolve_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
+    """Resolve a dtype argument to a ``torch.dtype`` or ``None``."""
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    try:
+        return _DTYPE_MAP[dtype.lower()]
+    except KeyError:
+        raise ValueError(f"unknown dtype {dtype!r}; valid strings: {sorted(_DTYPE_MAP)}") from None
+
 
 def einsum(
     subscripts: str,
@@ -30,6 +54,7 @@ def einsum(
     alpha: float = 1.0,
     beta: float = 0.0,
     out: torch.Tensor | None = None,
+    dtype: str | torch.dtype | None = None,
 ) -> torch.Tensor:
     """Einstein summation with contraction planning.
 
@@ -43,20 +68,28 @@ def einsum(
         out: Optional accumulation tensor. When provided the return value is
             ``alpha * contract(operands) + beta * out``. Must have the same
             shape as the contraction result.
+        dtype: Optional compute dtype. When set, all operands are cast to this
+            dtype before contracting and the result is returned in that dtype.
+            Accepts ``torch.dtype`` instances or strings: ``"bf16"``,
+            ``"bfloat16"``, ``"fp16"``, ``"float16"``, ``"f32"``, ``"float32"``.
+            Matches Neuron SDK autocast recommendations for Trainium.
 
     Examples:
         # Matrix multiply
         einsum("ij,jk->ik", A, B)
 
+        # Force bf16 compute (e.g. to hit NKI bf16 matmul kernel)
+        einsum("ij,jk->ik", A, B, dtype="bf16")
+
         # Scaled GEMM: 2*A@B + 0.5*C  (cuTENSOR-style alpha/beta)
         einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
-
-        # Batched matrix multiply
-        einsum("bij,bjk->bik", A, B)
 
         # DF-MP2 energy contraction
         einsum("iap,jbp->ijab", B, B)
     """
+    target = _resolve_dtype(dtype)
+    if target is not None:
+        operands = tuple(op.to(target) for op in operands)
     plan = plan_contraction(subscripts, *operands)
     result = _execute_contraction(subscripts, operands, plan)
     if alpha != 1.0:

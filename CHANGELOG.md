@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`dtype` mixed-precision override for `einsum`** (#22) — accepts string
+  aliases (`"bf16"`, `"fp16"`, `"f32"`) or `torch.dtype` instances. When set,
+  all operands are cast to the requested dtype before contracting and the
+  result is returned in that dtype. Matches Neuron SDK autocast recommendations;
+  use `dtype="bf16"` to route fp32 models through the NKI bf16 matmul path
+  without changing the model's weight dtype.
+
 ## [0.3.0] — 2026-04-16
 
 ### Added

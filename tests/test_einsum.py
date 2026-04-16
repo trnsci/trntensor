@@ -246,3 +246,48 @@ class TestAlphaBeta:
         result = trntensor.einsum("ij,jk->ik", A, B, alpha=1.0, beta=0.0, out=None)
         expected = A @ B
         np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-5)
+
+
+class TestDtype:
+    """Tests for the dtype= mixed-precision override (#22)."""
+
+    def test_dtype_bf16_result(self):
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, dtype="bf16")
+        assert result.dtype == torch.bfloat16
+
+    def test_dtype_fp16_result(self):
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, dtype="fp16")
+        assert result.dtype == torch.float16
+
+    def test_dtype_torch_type(self):
+        """Passing a torch.dtype directly is equivalent to the string alias."""
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, dtype=torch.bfloat16)
+        assert result.dtype == torch.bfloat16
+
+    def test_dtype_none_unchanged(self):
+        """dtype=None leaves input dtypes unmodified."""
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, dtype=None)
+        assert result.dtype == torch.float32
+
+    def test_dtype_invalid_raises(self):
+        with pytest.raises(ValueError, match="unknown dtype"):
+            trntensor.einsum("ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5), dtype="foo")
+
+    def test_dtype_correctness_bf16(self):
+        """bf16 matmul result is numerically close to fp32 reference."""
+        import numpy as np
+
+        torch.manual_seed(0)
+        A = torch.randn(8, 6)
+        B = torch.randn(6, 10)
+        result_bf16 = trntensor.einsum("ij,jk->ik", A, B, dtype="bf16").float()
+        result_fp32 = trntensor.einsum("ij,jk->ik", A, B)
+        np.testing.assert_allclose(result_bf16.numpy(), result_fp32.numpy(), atol=0.05)
