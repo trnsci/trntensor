@@ -208,3 +208,40 @@ class TestValidation:
         """plan_contraction integrates validation — shape error surfaces from there."""
         with pytest.raises(ValueError, match="index 'j'"):
             trntensor.plan_contraction("ij,jk->ik", torch.randn(4, 3), torch.randn(5, 6))
+
+
+class TestPlanCache:
+    """Tests for the contraction plan cache (#29)."""
+
+    def setup_method(self):
+        """Clear the cache before each test for isolation."""
+        trntensor.clear_plan_cache()
+
+    def test_cache_hit_on_repeat_call(self):
+        """Second call with identical subscript+shapes returns the cached plan."""
+        A, B = torch.randn(4, 3), torch.randn(3, 5)
+        plan1 = trntensor.plan_contraction("ij,jk->ik", A, B)
+        plan2 = trntensor.plan_contraction("ij,jk->ik", A, B)
+        assert trntensor.plan_cache_info()["size"] == 1
+        assert plan1 is plan2  # same object returned
+
+    def test_cache_miss_on_different_shapes(self):
+        """Different shape pairs each get their own cache entry."""
+        trntensor.plan_contraction("ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5))
+        trntensor.plan_contraction("ij,jk->ik", torch.randn(6, 3), torch.randn(3, 5))
+        assert trntensor.plan_cache_info()["size"] == 2
+
+    def test_clear_cache(self):
+        """clear_plan_cache() resets the cache to empty."""
+        trntensor.plan_contraction("ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5))
+        trntensor.clear_plan_cache()
+        assert trntensor.plan_cache_info()["size"] == 0
+
+    def test_cached_plan_produces_correct_result(self):
+        """einsum result is identical before and after a cache hit."""
+        import numpy as np
+
+        A, B = torch.randn(4, 3), torch.randn(3, 5)
+        r1 = trntensor.einsum("ij,jk->ik", A, B)
+        r2 = trntensor.einsum("ij,jk->ik", A, B)  # cache hit
+        np.testing.assert_allclose(r1.numpy(), r2.numpy(), atol=1e-6)

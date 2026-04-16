@@ -111,9 +111,41 @@ def _validate_subscripts(subscripts: str, operands: tuple[torch.Tensor, ...]) ->
                 index_sizes[char] = (size, op_idx)
 
 
+# Module-level cache: (subscripts, shape_signature) → ContractionPlan
+_PLAN_CACHE: dict[tuple, ContractionPlan] = {}
+
+
+def _shape_key(subscripts: str, operands: tuple[torch.Tensor, ...]) -> tuple:
+    """Build a hashable cache key from subscripts and operand shapes."""
+    return (subscripts, tuple(tuple(op.shape) for op in operands))
+
+
+def clear_plan_cache() -> None:
+    """Discard all cached contraction plans."""
+    _PLAN_CACHE.clear()
+
+
+def plan_cache_info() -> dict[str, int]:
+    """Return cache statistics.
+
+    Returns:
+        dict with key ``"size"`` — the number of cached plans.
+    """
+    return {"size": len(_PLAN_CACHE)}
+
+
 def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPlan:
-    """Analyze contraction and select execution strategy."""
+    """Analyze contraction and select execution strategy.
+
+    Results are cached by ``(subscripts, operand shapes)``. Repeated calls
+    with the same subscript and shapes skip replanning entirely. Call
+    ``clear_plan_cache()`` to invalidate the cache (e.g. after a backend change).
+    """
     _validate_subscripts(subscripts, operands)
+    key = _shape_key(subscripts, operands)
+    if key in _PLAN_CACHE:
+        return _PLAN_CACHE[key]
+
     input_str, output_str = _parse_subscripts(subscripts)
     input_indices = input_str.split(",")
 
@@ -133,6 +165,7 @@ def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPla
     else:
         plan = ContractionPlan(subscripts=subscripts, strategy="torch")
     plan.backend = _backend_for(plan.strategy, operands)
+    _PLAN_CACHE[key] = plan
     return plan
 
 
