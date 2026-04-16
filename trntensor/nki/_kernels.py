@@ -208,30 +208,33 @@ if HAS_NKI:
 
     @nki.jit
     def ao_to_mo_transform_kernel(eri, C_occ, C_vir):
-        """Fused 4-index AO→MO integral transform.
+        """Fused 4-index AO→MO integral transform with K-tiling over the basis index.
 
         Computes ``B[i, a, P] = Σ_{μ,ν} C_occ[μ, i] · C_vir[ν, a] · eri[μ, ν, P]``
         as one NKI program. Per auxiliary index P:
 
-        1. **Step 1 matmul**: ``intermediate(i, ν) = Σ_μ C_occ(μ,i) · eri(μ,ν)``
-           — C_occ stationary, eri slice moving, result in PSUM.
-        2. **PSUM → kernel scratch HBM** via SBUF — the intermediate is
-           reloadable with ν as partition dim for the next step. This is
-           scratch that never leaves the kernel; the user never sees it.
-        3. **Step 2 matmul**: ``B(i, a) = Σ_ν intermediate(ν,i) · C_vir(ν,a)``
-           — intermediate loaded transposed (partition=ν), C_vir moving.
-        4. **PSUM → SBUF → HBM** — write the final B slice for this P.
+        1. **Step 1 matmul** (K-tiled over μ): ``intermediate(i, ν) = Σ_μ C_occ(μ,i) · eri(μ,ν)``
+           — tiles over μ in chunks of ``TILE_K=128`` (the NKI partition-dim limit);
+           PSUM accumulates the partial sums across tiles; result (NOCC, NBASIS) written
+           to kernel-scratch HBM.
+        2. **Step 2 matmul** (K-tiled over ν): ``B(i, a) = Σ_ν intermediate(ν,i) · C_vir(ν,a)``
+           — tiles over ν in the same way; intermediate reloaded transposed so the
+           ν chunk is the partition dim; result (NOCC, NVIR) written to B_out.
 
-        C_occ and C_vir are loaded once and kept SBUF-resident across all
-        P iterations. Only the per-P intermediate round-trips through HBM
-        (scratch) to handle the partition-dim change between the two
-        matmul steps. Assumes single-tile: nbasis ≤ 128,
-        ``nocc * naux ≤ 512`` and ``nvir * naux ≤ 512``. Larger shapes
-        need K and N tiling (follow-up).
+        The two-step fused structure means the per-P intermediate ``(i, ν)`` never
+        appears as a user-visible tensor — it lives in kernel-scratch HBM between the
+        two matmul steps.
+
+        Constraints (enforced at the dispatch boundary, not here):
+        - NBASIS must be a multiple of ``TILE_K``; dispatch pads if necessary.
+        - NBASIS ≤ 512 (moving free dim of step-1 eri tile, the ν side).
+        - NOCC ≤ 128 (stationary free dim = M dimension of both nc_matmul calls).
+        - NVIR ≤ 512 (moving free dim of step-2 C_vir tile).
 
         Inputs
         ------
-        eri   : (nbasis, nbasis, naux) — AO-basis density-fitted ERIs.
+        eri   : (nbasis, nbasis, naux) — AO-basis density-fitted ERIs; nbasis is a
+                multiple of TILE_K (dispatcher pads).
         C_occ : (nbasis, nocc)         — occupied MO coefficients.
         C_vir : (nbasis, nvir)         — virtual MO coefficients.
 
@@ -244,40 +247,48 @@ if HAS_NKI:
         _, NVIR = C_vir.shape
 
         B_out = nl.ndarray((NOCC, NVIR, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
-        # Scratch: holds the post-step-1 intermediate per P in (NOCC, NBASIS)
-        # layout. Reloaded via nl.load_transpose2d in step 2 to get partition=ν.
+        # Kernel-scratch HBM: holds the post-step-1 intermediate (NOCC, NBASIS) for
+        # each P. Reloaded in TILE_K-wide ν slices (transposed) in step 2.
         inter_hbm = nl.ndarray((NOCC, NBASIS, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
 
-        # Load C tensors once; reused for every P.
-        # C_occ shape (NBASIS, NOCC): nl.load gives partition=NBASIS=μ, free=NOCC=i.
-        C_occ_sbuf = nl.load(C_occ[0:NBASIS, 0:NOCC])
-        # C_vir shape (NBASIS, NVIR): partition=ν, free=a.
-        C_vir_sbuf = nl.load(C_vir[0:NBASIS, 0:NVIR])
-
         for p in nl.affine_range(NAUX):
-            # Step 1: intermediate(i, ν) = C_occ^T · eri[:,:,p]
-            #   stationary = C_occ_sbuf (μ, i)  partition=μ, free=i
-            #   moving     = eri slice  (μ, ν)  partition=μ, free=ν
-            # eri slice for this P — 2D (NBASIS, NBASIS), partition=μ.
-            eri_slice = nl.load(eri[0:NBASIS, 0:NBASIS, p])
+            # ------------------------------------------------------------------
+            # Step 1: intermediate(i, ν) = Σ_μ C_occ(μ,i) · eri(μ,ν,P)
+            # K-tile over μ (partition dim ≤ TILE_K per nc_matmul call).
+            # psum_1 accumulates the (NOCC, NBASIS) partial sums across μ-tiles.
+            # ------------------------------------------------------------------
             psum_1 = nl.zeros((NOCC, NBASIS), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=psum_1, stationary=C_occ_sbuf, moving=eri_slice, accumulate=True)
-            # PSUM → SBUF (i, ν) → HBM scratch. Writing as (ν, i) layout
-            # so the next step can reload with ν as partition.
+            for k_mu in nl.affine_range(NBASIS // TILE_K):
+                k_off = k_mu * TILE_K
+                # C_occ tile: (TILE_K, NOCC) — partition=μ_chunk, free=i
+                C_occ_tile = nl.load(C_occ[k_off : k_off + TILE_K, 0:NOCC])
+                # eri tile: (TILE_K, NBASIS) — partition=μ_chunk, free=ν
+                eri_tile = nl.load(eri[k_off : k_off + TILE_K, 0:NBASIS, p])
+                nisa.nc_matmul(dst=psum_1, stationary=C_occ_tile, moving=eri_tile, accumulate=True)
+
+            # PSUM → SBUF → kernel-scratch HBM. Stored as (NOCC, NBASIS) so step 2
+            # can reload ν-slices transposed to get partition=ν_chunk.
             inter_sbuf = nl.ndarray((NOCC, NBASIS), dtype=eri.dtype, buffer=nl.sbuf)
             nisa.tensor_copy(src=psum_1, dst=inter_sbuf)
-            # Store as (NOCC, NBASIS) — natural layout from PSUM.
             nl.store(inter_hbm[0:NOCC, 0:NBASIS, p], value=inter_sbuf)
 
-            # Step 2: B(i, a) = intermediate(ν,i) · C_vir(ν,a)
-            #   stationary = intermediate (ν, i)  partition=ν, free=i
-            #   moving     = C_vir_sbuf   (ν, a)  partition=ν, free=a
-            # Reload intermediate transposed so partition=ν (NBASIS) and free=i.
-            inter_stationary = nl.load_transpose2d(inter_hbm[0:NOCC, 0:NBASIS, p])
+            # ------------------------------------------------------------------
+            # Step 2: B(i, a) = Σ_ν intermediate(ν,i) · C_vir(ν,a)
+            # K-tile over ν. Reload TILE_K-wide slices of the intermediate
+            # transposed so partition=ν_chunk, free=i.
+            # ------------------------------------------------------------------
             psum_2 = nl.zeros((NOCC, NVIR), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(
-                dst=psum_2, stationary=inter_stationary, moving=C_vir_sbuf, accumulate=True
-            )
+            for k_nu in nl.affine_range(NBASIS // TILE_K):
+                k_off = k_nu * TILE_K
+                # Load (NOCC, TILE_K) slice and transpose → (TILE_K, NOCC)
+                # so partition=ν_chunk, free=i.
+                inter_tile = nl.load_transpose2d(inter_hbm[0:NOCC, k_off : k_off + TILE_K, p])
+                # C_vir tile: (TILE_K, NVIR) — partition=ν_chunk, free=a
+                C_vir_tile = nl.load(C_vir[k_off : k_off + TILE_K, 0:NVIR])
+                nisa.nc_matmul(
+                    dst=psum_2, stationary=inter_tile, moving=C_vir_tile, accumulate=True
+                )
+
             out_sbuf = nl.ndarray((NOCC, NVIR), dtype=eri.dtype, buffer=nl.sbuf)
             nisa.tensor_copy(src=psum_2, dst=out_sbuf)
             nl.store(B_out[0:NOCC, 0:NVIR, p], value=out_sbuf)

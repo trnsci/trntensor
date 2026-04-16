@@ -248,7 +248,10 @@ def _nki_ao_to_mo_transform(
 ) -> torch.Tensor:
     """Dispatch ``ao_to_mo_transform_kernel``.
 
-    Single-tile path — shape constraints enforced by the caller
+    Pads nbasis to the nearest multiple of TILE_K (128) so the kernel's
+    K-tile loops always see clean tile boundaries. Padding is zero-filled,
+    so the extra rows/cols contribute nothing to the contraction result.
+    Shape constraints are enforced by the caller
     (``trntensor.quantum.ao_to_mo_transform``).
     """
     if not HAS_NKI:
@@ -256,9 +259,27 @@ def _nki_ao_to_mo_transform(
 
     from ._kernels import ao_to_mo_transform_kernel
 
-    eri_feed = eri.contiguous()
-    C_occ_feed = C_occ.contiguous()
-    C_vir_feed = C_vir.contiguous()
+    nbasis = eri.shape[0]
+    nbasis_pad = _round_up(nbasis, TILE_K)
+    needs_nbasis_pad = nbasis_pad != nbasis
+
+    if needs_nbasis_pad:
+        naux = eri.shape[2]
+        nocc = C_occ.shape[1]
+        nvir = C_vir.shape[1]
+        eri_p = torch.zeros(nbasis_pad, nbasis_pad, naux, dtype=eri.dtype, device=eri.device)
+        eri_p[:nbasis, :nbasis, :] = eri
+        C_occ_p = torch.zeros(nbasis_pad, nocc, dtype=C_occ.dtype, device=C_occ.device)
+        C_occ_p[:nbasis, :] = C_occ
+        C_vir_p = torch.zeros(nbasis_pad, nvir, dtype=C_vir.dtype, device=C_vir.device)
+        C_vir_p[:nbasis, :] = C_vir
+        eri_feed = eri_p.contiguous()
+        C_occ_feed = C_occ_p.contiguous()
+        C_vir_feed = C_vir_p.contiguous()
+    else:
+        eri_feed = eri.contiguous()
+        C_occ_feed = C_occ.contiguous()
+        C_vir_feed = C_vir.contiguous()
 
     if _use_simulator():
         out_np = nki.simulate(ao_to_mo_transform_kernel)(

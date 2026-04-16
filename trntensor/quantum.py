@@ -153,18 +153,27 @@ def ao_to_mo_transform(
     if _use_nki() and HAS_NKI:
         from .nki.dispatch import _nki_ao_to_mo_transform
 
-        # Single-tile path: partition dim ≤ 128 for both nc_matmul steps,
-        # moving free dim ≤ 512 for step-1 and step-2 outputs.
-        if nbasis > 128:
+        # K-tiled path: nbasis is tiled in chunks of 128 (TILE_K), so
+        # nbasis itself is no longer bounded by 128 — only by the moving
+        # free dim (ν side of the step-1 eri tile): nbasis ≤ 512.
+        # NOCC ≤ 128: stationary free dim (M) of both nc_matmul steps.
+        # NVIR ≤ 512: moving free dim (N) of the step-2 C_vir tile.
+        if nbasis > 512:
             raise NotImplementedError(
-                f"ao_to_mo_transform NKI path requires nbasis ≤ 128 "
-                f"(got nbasis={nbasis}); K-tiling not yet implemented."
+                f"ao_to_mo_transform NKI path requires nbasis ≤ 512 "
+                f"(got nbasis={nbasis}); N-tiling for the ν (moving) dim "
+                f"not yet implemented."
             )
-        if nocc * _naux > 512 or nvir * _naux > 512:
+        if nocc > 128:
             raise NotImplementedError(
-                f"ao_to_mo_transform NKI path requires nocc*naux ≤ 512 and "
-                f"nvir*naux ≤ 512 (got nocc={nocc}, nvir={nvir}, naux={_naux}); "
-                f"N-tiling not yet implemented."
+                f"ao_to_mo_transform NKI path requires nocc ≤ 128 "
+                f"(got nocc={nocc}); M-tiling not yet implemented."
+            )
+        if nvir > 512:
+            raise NotImplementedError(
+                f"ao_to_mo_transform NKI path requires nvir ≤ 512 "
+                f"(got nvir={nvir}); N-tiling for the virtual dim "
+                f"not yet implemented."
             )
         try:
             return _nki_ao_to_mo_transform(eri, C_occ, C_vir)

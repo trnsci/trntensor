@@ -95,6 +95,44 @@ class TestAoToMoTransformSimulator:
         finally:
             trntensor.set_backend("auto")
 
+    def test_k_tiled_nbasis_256(self):
+        """K-tiling path: nbasis=256 = 2 × TILE_K. Verifies the multi-tile
+        K loop against the CPU einsum reference via the simulator.
+        """
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(10)
+            nbasis, nocc, nvir, naux = 256, 8, 16, 16
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_k_tiled_nbasis_non_multiple(self):
+        """nbasis=200 is not a multiple of TILE_K; dispatch pads to 256.
+        Padded zeros must not corrupt the result.
+        """
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(11)
+            nbasis, nocc, nvir, naux = 200, 6, 12, 12
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
 
 class TestMp2EnergySimulator:
     def test_demo_shape(self):

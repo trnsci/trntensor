@@ -195,6 +195,68 @@ class TestMp2Energy:
         e_ref = trntensor.quantum._cpu_mp2_energy(B_ref, eps_occ, eps_vir)
         torch.testing.assert_close(e, e_ref, atol=1e-3, rtol=1e-4)
 
+
+class TestAoToMoTransformKTiling:
+    """K-tiling path: nbasis > TILE_K (128) — exercises the multi-tile loop
+    added in issue #37. cc-pVTZ representative shapes (nbasis ~ 200-300).
+    """
+
+    def test_nbasis_256_single_tile_k(self, nki_backend):
+        """nbasis=256 = 2 × TILE_K. Exercises the 2-tile K loop for both
+        step-1 (μ tiles) and step-2 (ν tiles). Verifies result against CPU
+        einsum reference.
+        """
+        import trntensor
+
+        torch.manual_seed(50)
+        nbasis, nocc, nvir, naux = 256, 16, 32, 32
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+
+        B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        B_ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+        torch.testing.assert_close(B, B_ref, atol=ATOL, rtol=RTOL)
+
+    def test_nbasis_non_multiple_pads_correctly(self, nki_backend):
+        """nbasis=200 is not a multiple of TILE_K=128; dispatch pads to 256.
+        The padded zeros must not corrupt the result.
+        """
+        import trntensor
+
+        torch.manual_seed(51)
+        nbasis, nocc, nvir, naux = 200, 10, 20, 24
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+
+        B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        B_ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+        torch.testing.assert_close(B, B_ref, atol=ATOL, rtol=RTOL)
+
+    def test_df_mp2_pipeline_cc_pvtz_shape(self, nki_backend):
+        """End-to-end DF-MP2 at a cc-pVTZ-representative shape (H₂O / cc-pVTZ
+        has nbasis~24 per heavy atom; 256 is a medium molecular system).
+        """
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        torch.manual_seed(52)
+        nbasis, nocc, nvir, naux = 256, 10, 30, 32
+        eri = torch.randn(nbasis, nbasis, naux) * 0.1
+        C_occ = torch.randn(nbasis, nocc)
+        C_vir = torch.randn(nbasis, nvir)
+        eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+        B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        B_ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+        torch.testing.assert_close(B, B_ref, atol=ATOL, rtol=RTOL)
+
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        e_ref = _cpu_mp2_energy(B_ref, eps_occ, eps_vir)
+        torch.testing.assert_close(e, e_ref, atol=1e-3, rtol=1e-4)
+
     def test_oversize_raises(self, nki_backend):
         """nvir > 128 or naux > 128 should raise until K/M tiling lands."""
         import pytest
