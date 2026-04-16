@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-16
+
 ### Added
 
 - **`precision=` kwarg for `einsum` and `plan_contraction`** (#28 partial) —
@@ -24,6 +26,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result is returned in that dtype. Matches Neuron SDK autocast recommendations;
   use `dtype="bf16"` to route fp32 models through the NKI bf16 matmul path
   without changing the model's weight dtype.
+
+- **Neuron profiler script** (`scripts/run_neuron_profile.sh`) — captures a
+  Neuron Profiler 2.0 trace of `matmul_kernel` or `batched_matmul_kernel` via
+  SSM on the `trntensor-ci-trn1` instance. Supports `--probe` (API discovery),
+  `--kernel matmul|bmm`, and `--shape small|medium|large`. Adapted from the
+  trnblas profiler pattern (double-base64 encoding, auto start/stop).
+
+- **Dispatch autotune script** (`scripts/autotune_dispatch.py`) (#33 partial)
+  — sweeps `(M, K, N)` shapes and measures NKI vs PyTorch wall-clock time to
+  find the empirical FLOP crossover on the current hardware. Reports the
+  recommended `TRNTENSOR_MIN_NKI_FLOPS` value; `--write-cache` persists the
+  result to `/var/tmp/trntensor-autotune/threshold.json`. The dispatch layer
+  reads this cache at startup (env var `TRNTENSOR_AUTOTUNE_CACHE` overrides
+  path; explicit `TRNTENSOR_MIN_NKI_FLOPS` always wins).
 
 ## [0.3.0] — 2026-04-16
 

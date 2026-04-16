@@ -46,8 +46,32 @@ def _use_simulator() -> bool:
 # small contractions the PyTorch path finishes in less time than the overhead
 # alone. Calibrated on trn1.2xlarge: matmul_2048 (8.6 GFLOPs) wins with NKI,
 # matmul_1024 (1.07 GFLOPs) loses. Set the threshold at 2 GFLOPs conservatively;
-# override with TRNTENSOR_MIN_NKI_FLOPS.
-_MIN_NKI_FLOPS = int(os.environ.get("TRNTENSOR_MIN_NKI_FLOPS", "2000000000"))
+# override with TRNTENSOR_MIN_NKI_FLOPS or scripts/autotune_dispatch.py.
+#
+# Autotune cache: if scripts/autotune_dispatch.py --write-cache has been run,
+# its calibrated threshold is read from the cache file (default path
+# /var/tmp/trntensor-autotune/threshold.json; override with
+# TRNTENSOR_AUTOTUNE_CACHE). Explicit TRNTENSOR_MIN_NKI_FLOPS env var always
+# takes priority over the cache.
+def _load_min_nki_flops() -> int:
+    env_val = os.environ.get("TRNTENSOR_MIN_NKI_FLOPS", "")
+    if env_val:
+        return int(env_val)
+    cache_path = os.environ.get(
+        "TRNTENSOR_AUTOTUNE_CACHE", "/var/tmp/trntensor-autotune/threshold.json"
+    )
+    try:
+        import json
+
+        with open(cache_path) as f:
+            data = json.load(f)
+        return int(data["trntensor_min_nki_flops"])
+    except (FileNotFoundError, KeyError, ValueError, OSError):
+        pass
+    return 2_000_000_000  # 2 GFLOPs conservative default
+
+
+_MIN_NKI_FLOPS = _load_min_nki_flops()
 
 _backend = "auto"
 
