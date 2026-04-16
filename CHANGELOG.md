@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Greedy contraction-path search for 3+ operand `einsum`** (#18) —
+  `plan_contraction()` now returns `strategy="path"` for three or more
+  operands. `_greedy_path_search` selects the cheapest binary contraction
+  order by minimizing per-step FLOP cost; the resulting
+  `ContractionPlan.contraction_path` drives `_execute_path`, which
+  routes each binary step through the full backend selection stack so
+  large sub-contractions still dispatch to NKI.
+
+- **`multi_einsum` shared-operand XLA residency** (#19) — When NKI
+  dispatch is active, `multi_einsum` detects operand tensors that
+  appear in more than one contraction (by object identity) and
+  pre-pins them to the XLA device once before executing the loop.
+  Eliminates redundant host↔device transfers for workloads like DF-MP2
+  where the three-center integral tensor `B` feeds many pair
+  contractions. Falls back to the existing per-contraction loop on CPU.
+
 ## [0.2.0] — 2026-04-15
 
 ### Added

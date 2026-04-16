@@ -119,6 +119,73 @@ class TestMultiEinsum:
         np.testing.assert_allclose(results[0].numpy(), (A @ B @ C).numpy(), atol=1e-4)
         np.testing.assert_allclose(results[1].item(), (A * A).sum().item(), atol=1e-4)
 
+    def test_shared_operand_result_correct(self):
+        """Two contractions sharing an operand produce the same results as independent einsum calls."""
+        nocc, nvir, naux = 3, 5, 8
+        B = torch.randn(nocc, nvir, naux)
+        i, j = 0, 1
+        results = trntensor.multi_einsum(
+            ("ap,bp->ab", B[i], B[j]),
+            ("ap,bp->ab", B[j], B[i]),
+        )
+        assert len(results) == 2
+        np.testing.assert_allclose(
+            results[0].numpy(), trntensor.einsum("ap,bp->ab", B[i], B[j]).numpy(), atol=1e-5
+        )
+        np.testing.assert_allclose(
+            results[1].numpy(), trntensor.einsum("ap,bp->ab", B[j], B[i]).numpy(), atol=1e-5
+        )
+
+    def test_non_shared_operands_unchanged(self):
+        """multi_einsum with no shared tensors behaves identically to independent einsum calls."""
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        C = torch.randn(5, 2)
+        D = torch.randn(2, 6)
+        results = trntensor.multi_einsum(
+            ("ij,jk->ik", A, B),
+            ("ij,jk->ik", C, D),
+        )
+        np.testing.assert_allclose(results[0].numpy(), (A @ B).numpy(), atol=1e-5)
+        np.testing.assert_allclose(results[1].numpy(), (C @ D).numpy(), atol=1e-5)
+
+
+class TestPathExecution:
+    """Tests for the greedy-path execution of 3+ operand einsums."""
+
+    def test_three_operand_correctness(self):
+        """einsum path result matches torch.einsum reference."""
+        torch.manual_seed(0)
+        A, B, C = torch.randn(5, 8), torch.randn(8, 6), torch.randn(6, 4)
+        result = trntensor.einsum("ij,jk,kl->il", A, B, C)
+        expected = torch.einsum("ij,jk,kl->il", A, B, C)
+        np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-4)
+
+    def test_four_operand_correctness(self):
+        """Chain of four operands produces correct result."""
+        torch.manual_seed(1)
+        A, B, C, D = torch.randn(3, 5), torch.randn(5, 4), torch.randn(4, 6), torch.randn(6, 2)
+        result = trntensor.einsum("ij,jk,kl,lm->im", A, B, C, D)
+        expected = torch.einsum("ij,jk,kl,lm->im", A, B, C, D)
+        np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-4)
+
+    def test_three_operand_non_chain(self):
+        """Non-chain 3-operand contraction (shared index in all three)."""
+        torch.manual_seed(2)
+        # "ij,ik,il->jkl" — outer product-like, all share index i
+        A = torch.randn(4, 3)
+        B = torch.randn(4, 5)
+        C = torch.randn(4, 2)
+        result = trntensor.einsum("ij,ik,il->jkl", A, B, C)
+        expected = torch.einsum("ij,ik,il->jkl", A, B, C)
+        np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-4)
+
+    def test_three_operand_output_shape(self):
+        """Output shape is correct for a 3-operand contraction."""
+        A, B, C = torch.randn(7, 3), torch.randn(3, 5), torch.randn(5, 11)
+        result = trntensor.einsum("ij,jk,kl->il", A, B, C)
+        assert result.shape == (7, 11)
+
 
 class TestPlan:
     def test_matmul_detected(self):

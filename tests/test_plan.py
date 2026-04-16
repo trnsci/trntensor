@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import trntensor
-from trntensor.plan import _parse_subscripts
+from trntensor.plan import _greedy_path_search, _parse_subscripts
 
 
 class TestParseSubscripts:
@@ -43,12 +43,14 @@ class TestPlanStrategy:
         assert plan.transA is False
         assert plan.transB is False
 
-    def test_three_operands_falls_to_torch(self):
+    def test_three_operands_uses_path_strategy(self):
+        """3+ operand einsums now use greedy path search."""
         A = torch.randn(3, 4)
         B = torch.randn(4, 5)
         C = torch.randn(5, 2)
         plan = trntensor.plan_contraction("ij,jk,kl->il", A, B, C)
-        assert plan.strategy == "torch"
+        assert plan.strategy == "path"
+        assert len(plan.contraction_path) == 2  # two binary steps for 3 operands
 
     def test_batched_matmul_metadata(self):
         plan = trntensor.plan_contraction(
@@ -73,13 +75,14 @@ class TestPlanStrategy:
         )
         # Small matmul — below threshold, falls back to PyTorch even on Neuron.
         plan_small = trntensor.plan_contraction("ij,jk->ik", torch.randn(4, 3), torch.randn(3, 5))
-        # 3-operand contraction — never a NKI strategy.
-        plan_torch = trntensor.plan_contraction(
+        # 3-operand contraction — "path" strategy; individual binary steps pick
+        # their own backends, but the top-level plan.backend is "pytorch".
+        plan_path = trntensor.plan_contraction(
             "ij,jk,kl->il", torch.randn(3, 4), torch.randn(4, 5), torch.randn(5, 2)
         )
         assert plan_big.backend == ("nki" if HAS_NKI else "pytorch")
         assert plan_small.backend == "pytorch"
-        assert plan_torch.backend == "pytorch"
+        assert plan_path.backend == "pytorch"
 
 
 class TestEstimateFlops:
@@ -121,3 +124,52 @@ class TestExecute:
         expected = A @ B
         assert result.shape == (4, 5)
         np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-5)
+
+
+class TestGreedyPathSearch:
+    """Unit tests for _greedy_path_search and 3+ operand plan_contraction."""
+
+    def test_three_operand_plan_has_path_strategy(self):
+        A, B, C = torch.randn(3, 4), torch.randn(4, 5), torch.randn(5, 2)
+        plan = trntensor.plan_contraction("ij,jk,kl->il", A, B, C)
+        assert plan.strategy == "path"
+        # Three operands → two binary steps
+        assert len(plan.contraction_path) == 2
+
+    def test_four_operand_plan_has_three_steps(self):
+        A, B, C, D = (torch.randn(3, 4), torch.randn(4, 5), torch.randn(5, 6), torch.randn(6, 2))
+        plan = trntensor.plan_contraction("ij,jk,kl,lm->im", A, B, C, D)
+        assert plan.strategy == "path"
+        assert len(plan.contraction_path) == 3
+
+    def test_greedy_picks_cheaper_pair(self):
+        """A(100,200) × B(200,5) × C(5,50):
+        - Contract B@C first: 200*5*50 = 50k FLOPs → intermediate (200,50)
+          then A@(BC): 100*200*50 = 1M → total 1.05M
+        - Contract A@B first: 100*200*5 = 100k FLOPs → intermediate (100,5)
+          then (100,5)@C: 100*5*50 = 25k → total 125k
+        Per-step greedy compares: pair(0,1)=100k vs pair(1,2)=50k → picks (1,2) = B@C.
+        """
+        size_map = {"i": 100, "j": 200, "k": 5, "l": 50}
+        path = _greedy_path_search(["ij", "jk", "kl"], "il", size_map)
+        # Cheapest first step is (1,2) = B@C (50k FLOPs vs A@B's 100k)
+        assert path[0] == (1, 2), f"expected (1,2) got {path[0]}"
+
+    def test_greedy_picks_cheapest_when_rightmost_cheaper(self):
+        """C(5,50) × D(50,3) is the cheapest pair in A(100,200)B(200,5)C(5,50)D(50,3).
+        A@B = 100*200*5 = 100k, B@C = 200*5*50 = 50k, C@D = 5*50*3 = 750.
+        Greedy should contract C@D first.
+        """
+        size_map = {"i": 100, "j": 200, "k": 5, "l": 50, "m": 3}
+        path = _greedy_path_search(["ij", "jk", "kl", "lm"], "im", size_map)
+        # Cheapest first pair should be (2,3) = C@D
+        assert path[0] == (2, 3), f"expected (2,3) got {path[0]}"
+
+    def test_path_length_matches_operand_count(self):
+        """N operands → N-1 binary steps."""
+        for n in range(3, 7):
+            inputs = [f"i{k}i{k+1}" for k in range(n)]
+            size_map = {f"i{k}": 4 for k in range(n + 1)}
+            output = f"i0i{n}"
+            path = _greedy_path_search(inputs, output, size_map)
+            assert len(path) == n - 1

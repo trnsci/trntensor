@@ -24,7 +24,7 @@ class ContractionPlan:
     """Execution plan for a tensor contraction."""
 
     subscripts: str
-    strategy: str  # algorithm: "matmul" | "bmm" | "torch"
+    strategy: str  # algorithm: "matmul" | "bmm" | "torch" | "path"
     backend: str = "pytorch"  # executor: "nki" | "pytorch"
     transA: bool = False
     transB: bool = False
@@ -32,6 +32,10 @@ class ContractionPlan:
     batch_indices: list[str] = field(default_factory=list)
     output_indices: list[str] = field(default_factory=list)
     estimated_flops: int = 0
+    contraction_path: list[tuple[int, int]] = field(default_factory=list)
+    # Greedy-optimal order for 3+ operand einsums. Each (i, j) pair refers to
+    # indices in the CURRENT operand list at that step (opt_einsum convention):
+    # contract ops[i] and ops[j], remove both, append the result.
 
 
 def _backend_for(strategy: str, operands: tuple) -> str:
@@ -67,10 +71,79 @@ def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPla
 
     if len(operands) == 2:
         plan = _plan_binary(subscripts, input_indices, output_str, operands)
+    elif len(operands) >= 3:
+        size_map: dict[str, int] = {}
+        for op_str, op in zip(input_indices, operands, strict=False):
+            for idx, sz in zip(op_str, op.shape, strict=False):
+                size_map[idx] = int(sz)
+        path = _greedy_path_search(input_indices, output_str, size_map)
+        plan = ContractionPlan(
+            subscripts=subscripts,
+            strategy="path",
+            contraction_path=path,
+        )
     else:
         plan = ContractionPlan(subscripts=subscripts, strategy="torch")
     plan.backend = _backend_for(plan.strategy, operands)
     return plan
+
+
+def _greedy_path_search(
+    input_list: list[str],
+    output_str: str,
+    size_map: dict[str, int],
+) -> list[tuple[int, int]]:
+    """Greedy contraction-path search over 3+ operands.
+
+    At each step, considers every pair of current operands and contracts
+    the pair with the minimum multiply-add count (product of all index
+    sizes in the pair's union, contracted and output alike). Returns a
+    list of ``(i, j)`` pairs in the opt_einsum convention: indices refer
+    to the CURRENT list at that step; after each step the two operands
+    are removed and the intermediate is appended.
+
+    The ``size_map`` (built once from the original operand shapes) is
+    sufficient throughout: intermediate indices are always a subset of the
+    original index set, so their sizes are already known.
+    """
+    inputs = list(input_list)
+    path: list[tuple[int, int]] = []
+
+    while len(inputs) > 2:
+        best_pair: tuple[int, int] = (0, 1)
+        best_cost = float("inf")
+        best_inter: set[str] = set()
+
+        for i in range(len(inputs)):
+            for j in range(i + 1, len(inputs)):
+                # Indices that must survive this step: output ∪ all other inputs
+                surviving = set(output_str)
+                for k, inp in enumerate(inputs):
+                    if k != i and k != j:
+                        surviving |= set(inp)
+
+                pair_union = set(inputs[i]) | set(inputs[j])
+                contracted = pair_union - surviving
+                intermediate = pair_union - contracted
+
+                # FLOPs ≈ product of all index sizes in the pair union
+                cost = 1
+                for idx in pair_union:
+                    cost *= size_map.get(idx, 1)
+
+                if cost < best_cost:
+                    best_cost = cost
+                    best_pair = (i, j)
+                    best_inter = intermediate
+
+        i, j = best_pair
+        path.append((i, j))
+        # Replace pair with intermediate; use sorted order for stable subscript strings
+        new_input = "".join(sorted(best_inter))
+        inputs = [inp for k, inp in enumerate(inputs) if k not in (i, j)] + [new_input]
+
+    path.append((0, 1))
+    return path
 
 
 def _parse_subscripts(subscripts: str) -> tuple[str, str]:
