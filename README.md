@@ -74,8 +74,15 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 - [x] NKI fused contraction kernels (`mp2_energy`, `ao_to_mo_transform`)
 - [x] XLA operand residency (`to_xla` / `from_xla`)
 - [x] NKI CPU simulator + `nki-simulator` CI gate
-- [ ] Optimal contraction ordering (like opt_einsum)
-- [ ] Multi-contraction shared-operand fusion
+- [x] Optimal contraction ordering — greedy path search for 3+ operands
+- [x] Multi-contraction shared-operand XLA pre-pinning
+- [x] Contraction plan cache (`clear_plan_cache` / `plan_cache_info`)
+- [x] Alpha/beta scaling for `einsum` (cuTENSOR GEMM-style)
+- [x] Input validation with descriptive errors
+- [x] Tensor Train (TT) decomposition (TT-SVD)
+- [x] Non-negative CP + warm-start CP
+- [x] PEP 561 `py.typed` marker
+- [ ] Mixed precision / `dtype` override for bf16/fp16
 
 ## Related Projects
 
