@@ -1,11 +1,12 @@
 """
 Tensor decompositions for Trainium.
 
-CP (CANDECOMP/PARAFAC) and Tucker decompositions for compressing
-high-order tensors. Used in quantum chemistry for:
+CP (CANDECOMP/PARAFAC), Tucker, and Tensor Train (TT) decompositions for
+compressing high-order tensors. Used in quantum chemistry for:
 - Tensor hypercontraction (THC) of two-electron integrals
 - Reduced-rank approximation of the DF coefficient tensor B_ia^P
 - Low-rank factorization of response tensors
+- DMRG-style high-dimensional compression (TT)
 
 All inner operations are matmuls → map to Tensor Engine via trnblas.
 """
@@ -20,54 +21,78 @@ def cp_decompose(
     rank: int,
     max_iter: int = 100,
     tol: float = 1e-6,
+    nonneg: bool = False,
+    factors: list[torch.Tensor] | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """CP decomposition via alternating least squares (ALS).
+    """CP decomposition via alternating least squares (ALS) or multiplicative updates.
 
     Approximates tensor T ≈ Σ_r λ_r * a_r ⊗ b_r ⊗ c_r ⊗ ...
 
     Args:
-        tensor: Input tensor of arbitrary order
-        rank: Number of components
-        max_iter: Maximum ALS iterations
-        tol: Convergence tolerance (relative reconstruction error)
+        tensor: Input tensor of arbitrary order.
+        rank: Number of components.
+        max_iter: Maximum iterations.
+        tol: Convergence tolerance (relative reconstruction error).
+        nonneg: If True, use multiplicative updates to enforce non-negative factors.
+            Initialization uses ``torch.rand`` (positive) unless ``factors`` is given.
+        factors: Optional warm-start factor matrices, one per mode, each of shape
+            ``(tensor.shape[k], rank)``. When provided the random initialization
+            step is skipped. Works with or without ``nonneg``.
 
     Returns:
-        factors: List of factor matrices, one per mode [(I_0, R), (I_1, R), ...]
-        weights: Component weights (R,)
+        factors: List of factor matrices [(I_0, R), (I_1, R), ...]
+        weights: Component weights (R,). For ``nonneg=True`` weights are all 1.
     """
     ndim = tensor.dim()
     shape = tensor.shape
 
-    # Initialize factors randomly
-    factors = [torch.randn(s, rank) for s in shape]
-
-    # Normalize
-    for k in range(ndim):
-        norms = torch.linalg.norm(factors[k], dim=0, keepdim=True)
-        factors[k] = factors[k] / (norms + 1e-10)
+    if factors is not None:
+        # Warm-start: validate and clone so we don't mutate caller's tensors
+        if len(factors) != ndim:
+            raise ValueError(
+                f"warm-start factors has {len(factors)} matrices but tensor has {ndim} modes"
+            )
+        for k, f in enumerate(factors):
+            if f.shape != (shape[k], rank):
+                raise ValueError(
+                    f"warm-start factors[{k}] has shape {tuple(f.shape)}, "
+                    f"expected ({shape[k]}, {rank})"
+                )
+        factors = [f.clone() for f in factors]
+        if nonneg:
+            factors = [f.clamp(min=1e-10) for f in factors]
+    elif nonneg:
+        factors = [torch.rand(s, rank).clamp(min=1e-10) for s in shape]
+    else:
+        factors = [torch.randn(s, rank) for s in shape]
+        for k in range(ndim):
+            norms = torch.linalg.norm(factors[k], dim=0, keepdim=True)
+            factors[k] = factors[k] / (norms + 1e-10)
 
     weights = torch.ones(rank)
 
     for _ in range(max_iter):
         for mode in range(ndim):
-            # Compute the Khatri-Rao product of all factors except current mode
             V = _khatri_rao_except(factors, mode)
-
-            # Unfold tensor along current mode
             T_mode = _unfold(tensor, mode)
-
-            # Solve least squares: factors[mode] = T_mode @ V @ (V^T V)^{-1}
             VtV = V.T @ V
-            rhs = T_mode @ V
-            try:
-                factors[mode] = torch.linalg.solve(VtV, rhs.T).T
-            except RuntimeError:
-                factors[mode] = rhs @ torch.linalg.pinv(VtV)
 
-            # Extract norms as weights
-            norms = torch.linalg.norm(factors[mode], dim=0)
-            weights = norms
-            factors[mode] = factors[mode] / (norms.unsqueeze(0) + 1e-10)
+            if nonneg:
+                # Multiplicative update: ensures non-negativity
+                numer = (T_mode @ V).clamp(min=0)
+                denom = (factors[mode] @ VtV).clamp(min=1e-10)
+                factors[mode] = (factors[mode] * numer / denom).clamp(min=1e-10)
+            else:
+                # ALS: solve normal equations
+                rhs = T_mode @ V
+                try:
+                    factors[mode] = torch.linalg.solve(VtV, rhs.T).T
+                except RuntimeError:
+                    factors[mode] = rhs @ torch.linalg.pinv(VtV)
+                # Extract norms as weights
+                norms = torch.linalg.norm(factors[mode], dim=0)
+                weights = norms
+                factors[mode] = factors[mode] / (norms.unsqueeze(0) + 1e-10)
 
         # Check convergence
         reconstructed = cp_reconstruct(factors, weights)
@@ -136,6 +161,77 @@ def tucker_reconstruct(core: torch.Tensor, factors: list[torch.Tensor]) -> torch
     for mode in range(len(factors)):
         result = _mode_product(result, factors[mode], mode)
     return result
+
+
+def tt_decompose(
+    tensor: torch.Tensor,
+    max_rank: int,
+) -> list[torch.Tensor]:
+    """Tensor Train (TT) decomposition via TT-SVD (Oseledets 2011).
+
+    Decomposes a d-dimensional tensor into a chain of 3-tensors (cores):
+
+        T[i_1, i_2, ..., i_d] ≈ G_1[:, i_1, :] @ G_2[:, i_2, :] @ ... @ G_d[:, i_d, :]
+
+    where G_k has shape ``(r_{k-1}, n_k, r_k)`` and boundary bond dimensions
+    ``r_0 = r_d = 1``.  Bond dimensions are capped at ``max_rank``.
+
+    Args:
+        tensor: Input tensor of shape ``(n_1, n_2, ..., n_d)``.
+        max_rank: Maximum bond dimension (rank) between adjacent cores.
+
+    Returns:
+        List of ``d`` core tensors, each of shape ``(r_{k-1}, n_k, r_k)``.
+    """
+    shape = tensor.shape
+    ndim = tensor.dim()
+    if ndim < 2:
+        raise ValueError(f"tt_decompose requires ndim ≥ 2, got {ndim}")
+
+    cores: list[torch.Tensor] = []
+    C = tensor.reshape(shape[0], -1)  # (n_1, n_2 * ... * n_d)
+    r_prev = 1
+
+    for k in range(ndim - 1):
+        n_k = shape[k]
+        U, S, Vh = torch.linalg.svd(C, full_matrices=False)
+        r_k = min(max_rank, U.shape[1])
+        # Core G_k: shape (r_{k-1}, n_k, r_k)
+        cores.append(U[:, :r_k].reshape(r_prev, n_k, r_k))
+        # Remainder for next step
+        remainder = torch.diag(S[:r_k]) @ Vh[:r_k, :]
+        # Reshape to (r_k * n_{k+1}, remaining_dims)
+        remaining_size = 1
+        for s in shape[k + 1 :]:
+            remaining_size *= s
+        n_next = shape[k + 1]
+        C = remainder.reshape(r_k * n_next, remaining_size // n_next)
+        r_prev = r_k
+
+    # Last core: shape (r_{d-1}, n_d, 1)
+    cores.append(C.reshape(r_prev, shape[-1], 1))
+    return cores
+
+
+def tt_reconstruct(cores: list[torch.Tensor]) -> torch.Tensor:
+    """Reconstruct a tensor from its Tensor Train cores.
+
+    Contracts the core chain left to right:
+    ``result = G_1 @ G_2 @ ... @ G_d``
+
+    Args:
+        cores: List of core tensors, each of shape ``(r_{k-1}, n_k, r_k)``.
+
+    Returns:
+        Reconstructed tensor of shape ``(n_1, n_2, ..., n_d)``.
+    """
+    # result starts as cores[0][0, :, :] — shape (n_1, r_1)
+    result = cores[0][0, :, :]
+    for core in cores[1:]:
+        # result: (..., r_{k-1}), core: (r_{k-1}, n_k, r_k)
+        result = torch.tensordot(result, core, dims=1)
+    # Squeeze final bond dimension (r_d = 1)
+    return result[..., 0]
 
 
 # --- Tensor algebra helpers ---
