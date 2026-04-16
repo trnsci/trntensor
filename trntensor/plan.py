@@ -36,6 +36,7 @@ class ContractionPlan:
     # Greedy-optimal order for 3+ operand einsums. Each (i, j) pair refers to
     # indices in the CURRENT operand list at that step (opt_einsum convention):
     # contract ops[i] and ops[j], remove both, append the result.
+    precision: str = "fast"  # "fast" | "kahan" | "dd"
 
 
 def _backend_for(strategy: str, operands: tuple) -> str:
@@ -115,9 +116,11 @@ def _validate_subscripts(subscripts: str, operands: tuple[torch.Tensor, ...]) ->
 _PLAN_CACHE: dict[tuple, ContractionPlan] = {}
 
 
-def _shape_key(subscripts: str, operands: tuple[torch.Tensor, ...]) -> tuple:
-    """Build a hashable cache key from subscripts and operand shapes."""
-    return (subscripts, tuple(tuple(op.shape) for op in operands))
+def _shape_key(
+    subscripts: str, operands: tuple[torch.Tensor, ...], precision: str = "fast"
+) -> tuple:
+    """Build a hashable cache key from subscripts, operand shapes, and precision."""
+    return (subscripts, tuple(tuple(op.shape) for op in operands), precision)
 
 
 def clear_plan_cache() -> None:
@@ -134,15 +137,27 @@ def plan_cache_info() -> dict[str, int]:
     return {"size": len(_PLAN_CACHE)}
 
 
-def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPlan:
+def plan_contraction(
+    subscripts: str, *operands: torch.Tensor, precision: str = "fast"
+) -> ContractionPlan:
     """Analyze contraction and select execution strategy.
 
-    Results are cached by ``(subscripts, operand shapes)``. Repeated calls
-    with the same subscript and shapes skip replanning entirely. Call
-    ``clear_plan_cache()`` to invalidate the cache (e.g. after a backend change).
+    Results are cached by ``(subscripts, operand shapes, precision)``. Repeated
+    calls with the same subscript, shapes, and precision skip replanning entirely.
+    Call ``clear_plan_cache()`` to invalidate the cache (e.g. after a backend change).
+
+    Args:
+        subscripts: Einstein summation subscript string.
+        *operands: Input tensors.
+        precision: Accumulation precision. ``"fast"`` (default) uses native dtype
+            and may route to NKI kernels. ``"kahan"`` promotes operands to fp64
+            before contracting and casts the result back to the original dtype.
+            ``"dd"`` requests double-double accumulation (not yet available).
     """
     _validate_subscripts(subscripts, operands)
-    key = _shape_key(subscripts, operands)
+    if precision not in ("fast", "kahan", "dd"):
+        raise ValueError(f"precision must be 'fast', 'kahan', or 'dd', got {precision!r}")
+    key = _shape_key(subscripts, operands, precision)
     if key in _PLAN_CACHE:
         return _PLAN_CACHE[key]
 
@@ -165,6 +180,7 @@ def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPla
     else:
         plan = ContractionPlan(subscripts=subscripts, strategy="torch")
     plan.backend = _backend_for(plan.strategy, operands)
+    plan.precision = precision
     _PLAN_CACHE[key] = plan
     return plan
 

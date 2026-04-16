@@ -245,3 +245,29 @@ class TestPlanCache:
         r1 = trntensor.einsum("ij,jk->ik", A, B)
         r2 = trntensor.einsum("ij,jk->ik", A, B)  # cache hit
         np.testing.assert_allclose(r1.numpy(), r2.numpy(), atol=1e-6)
+
+
+class TestPrecision:
+    """Tests for the precision= kwarg on plan_contraction (#28)."""
+
+    def setup_method(self):
+        trntensor.clear_plan_cache()
+
+    def test_precision_field_stored(self):
+        """plan.precision reflects the kwarg passed to plan_contraction."""
+        A, B = torch.randn(4, 3), torch.randn(3, 5)
+        plan = trntensor.plan_contraction("ij,jk->ik", A, B, precision="kahan")
+        assert plan.precision == "kahan"
+
+    def test_precision_affects_cache_key(self):
+        """Same shapes with 'fast' vs 'kahan' → two distinct cache entries."""
+        A, B = torch.randn(4, 3), torch.randn(3, 5)
+        trntensor.plan_contraction("ij,jk->ik", A, B, precision="fast")
+        trntensor.plan_contraction("ij,jk->ik", A, B, precision="kahan")
+        assert trntensor.plan_cache_info()["size"] == 2
+
+    def test_precision_invalid_raises(self):
+        """Unknown precision string raises ValueError with helpful message."""
+        A, B = torch.randn(4, 3), torch.randn(3, 5)
+        with pytest.raises(ValueError, match="precision must be"):
+            trntensor.plan_contraction("ij,jk->ik", A, B, precision="super")

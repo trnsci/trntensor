@@ -55,6 +55,7 @@ def einsum(
     beta: float = 0.0,
     out: torch.Tensor | None = None,
     dtype: str | torch.dtype | None = None,
+    precision: str = "fast",
 ) -> torch.Tensor:
     """Einstein summation with contraction planning.
 
@@ -86,11 +87,14 @@ def einsum(
 
         # DF-MP2 energy contraction
         einsum("iap,jbp->ijab", B, B)
+
+        # High-precision accumulation (fp64 internally, result in original dtype)
+        einsum("ij,jk->ik", A, B, precision="kahan")
     """
     target = _resolve_dtype(dtype)
     if target is not None:
         operands = tuple(op.to(target) for op in operands)
-    plan = plan_contraction(subscripts, *operands)
+    plan = plan_contraction(subscripts, *operands, precision=precision)
     result = _execute_contraction(subscripts, operands, plan)
     if alpha != 1.0:
         result = result.mul(alpha)
@@ -101,6 +105,15 @@ def einsum(
 
 def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
     """Execute contraction according to plan."""
+    if plan.precision == "kahan":
+        orig_dtype = operands[0].dtype if operands else torch.float32
+        result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
+        return result.to(orig_dtype)
+    elif plan.precision == "dd":
+        raise NotImplementedError(
+            "precision='dd' requires trnblas Phase 2 double-double GEMM kernels; "
+            "use precision='kahan' (fp64 accumulation) as an alternative."
+        )
     if plan.strategy == "torch":
         return torch.einsum(subscripts, *operands)
     elif plan.strategy == "bmm":

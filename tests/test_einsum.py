@@ -291,3 +291,52 @@ class TestDtype:
         result_bf16 = trntensor.einsum("ij,jk->ik", A, B, dtype="bf16").float()
         result_fp32 = trntensor.einsum("ij,jk->ik", A, B)
         np.testing.assert_allclose(result_bf16.numpy(), result_fp32.numpy(), atol=0.05)
+
+
+class TestPrecision:
+    """Tests for the precision= kwarg on einsum (#28)."""
+
+    def test_kahan_result_dtype_preserved(self):
+        """fp32 inputs + precision='kahan' → result dtype is float32."""
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, precision="kahan")
+        assert result.dtype == torch.float32
+
+    def test_kahan_accuracy_ill_conditioned(self):
+        """kahan result is closer to fp64 reference than plain fp32 for ill-conditioned sum."""
+        import numpy as np
+
+        torch.manual_seed(42)
+        # Build vectors where plain fp32 summation loses precision:
+        # large constant plus many small values that should nearly cancel.
+        n = 512
+        large = torch.full((1, n), 1e6)
+        small = torch.randn(n, 1) * 1e-3  # small perturbations
+
+        # Contraction: "ij,jk->ik" contracts over j, result shape (1,1)
+        # fp64 reference
+        ref = torch.einsum("ij,jk->ik", large.double(), small.double()).float()
+        fast = trntensor.einsum("ij,jk->ik", large, small, precision="fast")
+        kahan = trntensor.einsum("ij,jk->ik", large, small, precision="kahan")
+
+        err_fast = abs(float(fast) - float(ref))
+        err_kahan = abs(float(kahan) - float(ref))
+        # kahan goes through fp64 internally so it is exact (or very close)
+        assert err_kahan <= err_fast + 1e-3
+
+    def test_dd_raises(self):
+        """precision='dd' raises NotImplementedError pointing to 'kahan'."""
+        A, B = torch.randn(4, 3), torch.randn(3, 5)
+        with pytest.raises(NotImplementedError, match="kahan"):
+            trntensor.einsum("ij,jk->ik", A, B, precision="dd")
+
+    def test_fast_unchanged(self):
+        """precision='fast' produces the same result as the default (no kwarg)."""
+        import numpy as np
+
+        torch.manual_seed(0)
+        A, B = torch.randn(8, 6), torch.randn(6, 10)
+        default = trntensor.einsum("ij,jk->ik", A, B)
+        fast = trntensor.einsum("ij,jk->ik", A, B, precision="fast")
+        np.testing.assert_array_equal(default.numpy(), fast.numpy())

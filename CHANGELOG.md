@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`precision=` kwarg for `einsum` and `plan_contraction`** (#28 partial) —
+  three modes: `"fast"` (default, no change), `"kahan"` (promotes all operands
+  to `float64` before contracting via `torch.einsum`, casts result back to
+  original dtype — gives ~15.9 significant digits; bypasses NKI dispatch for
+  CPU compatibility), `"dd"` (raises `NotImplementedError` pending trnblas Phase
+  2 double-double GEMM). `precision` is included in the plan cache key so
+  `"fast"` and `"kahan"` plans cache independently. Useful for DF-MP2 / CCSD
+  energy convergence where fp32's ~7.2 digits are insufficient.
+
 - **`dtype` mixed-precision override for `einsum`** (#22) — accepts string
   aliases (`"bf16"`, `"fp16"`, `"f32"`) or `torch.dtype` instances. When set,
   all operands are cast to the requested dtype before contracting and the
