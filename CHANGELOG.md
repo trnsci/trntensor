@@ -25,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the three-center integral tensor `B` feeds many pair
   contractions. Falls back to the existing per-contraction loop on CPU.
 
+- **Subscript and shape validation with descriptive errors** (#26) —
+  `plan_contraction()` now validates subscripts up-front and raises
+  `ValueError` with precise messages: wrong operand count, rank
+  mismatch, and inconsistent index sizes are all caught before any
+  torch operation runs. Eliminates cryptic downstream errors from
+  `torch.einsum`.
+
+- **PEP 561 `py.typed` marker** (#25) — `trntensor` now ships a
+  `py.typed` file so type checkers (mypy, pyright, etc.) recognise
+  the package as typed and apply inline annotations.
+
+- **`alpha`/`beta` scaling for `einsum`** (#20) — matches cuTENSOR's
+  GEMM-style interface:
+  `einsum(subscripts, A, B, alpha=α, beta=β, out=C)` returns
+  `α * contract(A, B) + β * C`. Defaults (`alpha=1, beta=0, out=None`)
+  preserve existing behaviour exactly. Useful for accumulation patterns
+  and in-place gradient updates without an extra allocation.
+
 ## [0.2.0] — 2026-04-15
 
 ### Added

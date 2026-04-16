@@ -24,32 +24,46 @@ import torch
 from .plan import ContractionPlan, _parse_subscripts, plan_contraction
 
 
-def einsum(subscripts: str, *operands: torch.Tensor) -> torch.Tensor:
+def einsum(
+    subscripts: str,
+    *operands: torch.Tensor,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Einstein summation with contraction planning.
 
     Supports the same subscript notation as torch.einsum and numpy.einsum.
+
+    Args:
+        subscripts: Einstein summation subscript string, e.g. ``"ij,jk->ik"``.
+        *operands: Input tensors.
+        alpha: Scalar multiplier applied to the contraction result (default 1.0).
+        beta: Scalar multiplier applied to ``out`` before accumulation (default 0.0).
+        out: Optional accumulation tensor. When provided the return value is
+            ``alpha * contract(operands) + beta * out``. Must have the same
+            shape as the contraction result.
 
     Examples:
         # Matrix multiply
         einsum("ij,jk->ik", A, B)
 
+        # Scaled GEMM: 2*A@B + 0.5*C  (cuTENSOR-style alpha/beta)
+        einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
+
         # Batched matrix multiply
         einsum("bij,bjk->bik", A, B)
 
-        # Trace
-        einsum("ii->", A)
-
-        # Outer product
-        einsum("i,j->ij", x, y)
-
         # DF-MP2 energy contraction
         einsum("iap,jbp->ijab", B, B)
-
-        # Tensor contraction (4-index transform)
-        einsum("mi,mnP->inP", C, integrals)
     """
     plan = plan_contraction(subscripts, *operands)
-    return _execute_contraction(subscripts, operands, plan)
+    result = _execute_contraction(subscripts, operands, plan)
+    if alpha != 1.0:
+        result = result.mul(alpha)
+    if out is not None:
+        result = result.add(out, alpha=beta)
+    return result
 
 
 def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:

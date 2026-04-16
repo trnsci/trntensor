@@ -211,3 +211,38 @@ class TestPlan:
         B = torch.randn(20, 30)
         flops = trntensor.estimate_flops("ij,jk->ik", A, B)
         assert flops == 10 * 20 * 30
+
+
+class TestAlphaBeta:
+    """Tests for alpha/beta scaling interface (#20)."""
+
+    def test_alpha_scaling(self):
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, alpha=2.0)
+        expected = 2.0 * (A @ B)
+        np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-5)
+
+    def test_beta_accumulate(self):
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        C = torch.randn(4, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, beta=0.5, out=C)
+        expected = A @ B + 0.5 * C
+        np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-5)
+
+    def test_alpha_beta_combined(self):
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        C = torch.randn(4, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
+        expected = 2.0 * (A @ B) + 0.5 * C
+        np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-5)
+
+    def test_defaults_unchanged(self):
+        """Default alpha=1, beta=0, out=None is identical to plain einsum."""
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        result = trntensor.einsum("ij,jk->ik", A, B, alpha=1.0, beta=0.0, out=None)
+        expected = A @ B
+        np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-5)
