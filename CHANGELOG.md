@@ -43,6 +43,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserve existing behaviour exactly. Useful for accumulation patterns
   and in-place gradient updates without an extra allocation.
 
+- **Contraction plan cache** (#29 partial) — `plan_contraction()` caches
+  results by `(subscripts, operand shapes)`. Repeated calls with the same
+  subscript and shapes skip replanning entirely. `clear_plan_cache()` and
+  `plan_cache_info()` are exported from the top-level API.
+
+- **Tensor Train (TT) decomposition** (#23) — `tt_decompose(tensor, max_rank)`
+  decomposes a d-dimensional tensor into a chain of 3-tensor cores via TT-SVD
+  (Oseledets 2011), bond dimension capped at `max_rank`. `tt_reconstruct(cores)`
+  contracts the chain back. Useful for DMRG-style high-dimensional compression.
+
+- **Non-negative CP and warm-start CP** (#24) — `cp_decompose` gains two new
+  keyword arguments: `nonneg=True` switches ALS to multiplicative updates
+  to enforce non-negative factors; `factors=` accepts a list of pre-computed
+  factor matrices to warm-start from, skipping random initialization.
+  Both options compose.
+
 ## [0.2.0] — 2026-04-15
 
 ### Added
