@@ -64,8 +64,56 @@ def _backend_for(strategy: str, operands: tuple) -> str:
     return "nki" if flops >= _MIN_NKI_FLOPS else "pytorch"
 
 
+def _validate_subscripts(subscripts: str, operands: tuple[torch.Tensor, ...]) -> None:
+    """Validate subscripts and operand shapes, raising ValueError with specific messages.
+
+    Checks performed in order:
+    1. Subscript string characters are valid (a-zA-Z, commas, optional '->').
+    2. Number of comma-separated input terms matches ``len(operands)``.
+    3. Each term's length matches the corresponding operand's ndim.
+    4. Every index character is consistently sized across all operands that share it.
+    """
+    # 1 — character-set check
+    if not re.fullmatch(r"[a-zA-Z,]+(->[a-zA-Z]*)?", subscripts):
+        raise ValueError(
+            f"einsum subscript {subscripts!r} contains invalid characters; "
+            "only a-zA-Z, commas, and '->' are allowed"
+        )
+
+    input_str, _ = _parse_subscripts(subscripts)
+    terms = input_str.split(",")
+
+    # 2 — operand count
+    if len(terms) != len(operands):
+        raise ValueError(
+            f"einsum subscript {subscripts!r} has {len(terms)} operand term(s) "
+            f"but {len(operands)} operand(s) were given"
+        )
+
+    # 3 — rank check; 4 — consistent sizes
+    index_sizes: dict[str, tuple[int, int]] = {}  # char → (size, operand_index)
+    for op_idx, (term, op) in enumerate(zip(terms, operands, strict=True)):
+        if len(term) != op.ndim:
+            raise ValueError(
+                f"einsum operand {op_idx} has shape {tuple(op.shape)} (ndim={op.ndim}) "
+                f"but subscript term {term!r} has {len(term)} indices"
+            )
+        for char, size in zip(term, op.shape, strict=True):
+            size = int(size)
+            if char in index_sizes:
+                prev_size, prev_op = index_sizes[char]
+                if prev_size != size:
+                    raise ValueError(
+                        f"einsum index {char!r} is size {prev_size} in operand {prev_op} "
+                        f"but size {size} in operand {op_idx}"
+                    )
+            else:
+                index_sizes[char] = (size, op_idx)
+
+
 def plan_contraction(subscripts: str, *operands: torch.Tensor) -> ContractionPlan:
     """Analyze contraction and select execution strategy."""
+    _validate_subscripts(subscripts, operands)
     input_str, output_str = _parse_subscripts(subscripts)
     input_indices = input_str.split(",")
 

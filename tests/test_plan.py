@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import trntensor
-from trntensor.plan import _greedy_path_search, _parse_subscripts
+from trntensor.plan import _greedy_path_search, _parse_subscripts, _validate_subscripts
 
 
 class TestParseSubscripts:
@@ -173,3 +173,38 @@ class TestGreedyPathSearch:
             output = f"i0i{n}"
             path = _greedy_path_search(inputs, output, size_map)
             assert len(path) == n - 1
+
+
+class TestValidation:
+    """Tests for _validate_subscripts error messages (#26)."""
+
+    def test_wrong_operand_count(self):
+        """2 subscript terms but 3 operands → ValueError naming the mismatch."""
+        with pytest.raises(ValueError, match="2 operand term"):
+            _validate_subscripts(
+                "ij,jk->ik", (torch.randn(4, 3), torch.randn(3, 5), torch.randn(5, 2))
+            )
+
+    def test_wrong_rank(self):
+        """3-index term applied to a 2D operand → ValueError naming operand and term."""
+        with pytest.raises(ValueError, match="operand 1"):
+            _validate_subscripts("ij,jkl->ikl", (torch.randn(4, 3), torch.randn(3, 5)))
+
+    def test_inconsistent_index_size(self):
+        """Index 'j' is size 3 in A but size 5 in B → ValueError naming the index."""
+        with pytest.raises(ValueError, match="index 'j'"):
+            _validate_subscripts("ij,jk->ik", (torch.randn(4, 3), torch.randn(5, 6)))
+
+    def test_invalid_characters(self):
+        """Non-letter characters in subscript (other than , and ->) → ValueError."""
+        with pytest.raises(ValueError, match="invalid characters"):
+            _validate_subscripts("i j,jk->ik", (torch.randn(4, 3), torch.randn(3, 5)))
+
+    def test_valid_subscript_passes(self):
+        """Correct subscript and shapes pass without error."""
+        _validate_subscripts("ij,jk->ik", (torch.randn(4, 3), torch.randn(3, 5)))  # no raise
+
+    def test_plan_contraction_raises_on_shape_mismatch(self):
+        """plan_contraction integrates validation — shape error surfaces from there."""
+        with pytest.raises(ValueError, match="index 'j'"):
+            trntensor.plan_contraction("ij,jk->ik", torch.randn(4, 3), torch.randn(5, 6))
