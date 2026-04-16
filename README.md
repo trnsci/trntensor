@@ -82,7 +82,8 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 - [x] Tensor Train (TT) decomposition (TT-SVD)
 - [x] Non-negative CP + warm-start CP
 - [x] PEP 561 `py.typed` marker
-- [ ] Mixed precision / `dtype` override for bf16/fp16
+- [x] Mixed precision / `dtype` override for bf16/fp16
+- [x] `precision=` kwarg (`"fast"` / `"kahan"` fp64 promotion / `"dd"` stub)
 
 ## Related Projects
 

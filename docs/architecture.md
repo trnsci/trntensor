@@ -22,9 +22,14 @@ The planner analyzes einsum subscripts and selects a dispatch target:
 - **matmul**: 2D contraction over a single shared index → `torch.matmul`
 - **bmm**: batched 2D contraction → `torch.bmm`
 - **torch**: complex patterns → `torch.einsum`
+- **path**: 3+ operands → greedy binary contraction ordering; each binary step re-enters the full backend-selection stack so large sub-contractions still reach NKI
 - **nki** (future): fused multi-index contractions on the Tensor Engine
 
-`ContractionPlan` carries the dispatch decision, the FLOPs estimate, and any reshape/transpose preamble so the same plan can be re-executed cheaply.
+`ContractionPlan` carries the dispatch decision, the FLOPs estimate, any reshape/transpose preamble, the greedy `contraction_path` for multi-operand contractions, and the `precision` setting — so the same plan can be re-executed cheaply without re-analyzing subscripts. Plans are cached by `(subscripts, shapes, precision)`; call `clear_plan_cache()` to invalidate after a backend change.
+
+### Greedy path search
+
+For 3+ operand contractions, `_greedy_path_search` selects the cheapest binary contraction order by minimizing per-step FLOP cost (product of all index sizes in the pair union). This is the same criterion as `opt_einsum`'s greedy mode. The resulting `contraction_path` drives `_execute_path`, which routes each binary step through the full backend-selection stack — a large sub-contraction in the middle of a 4-operand chain still dispatches to NKI if the matmul threshold is met.
 
 ## Fused contraction-reduction: the architectural core
 
@@ -55,9 +60,32 @@ A third pattern — **user-level operand residency** — exposes that same data-
 
 **Performance honest note.** Fused kernels are architecturally correct. Without residency, per-dispatch overhead dominates at small chemistry sizes and the CPU fallback wins on benchmarks. With residency (`to_xla` / `from_xla`), the overhead is paid once per pipeline instead of once per call, and the fusion work starts paying for itself. See [Benchmarks](benchmarks.md) for the current numbers.
 
+## Precision control
+
+`einsum` and `plan_contraction` accept `precision=`:
+
+- **`"fast"`** (default) — native operand dtype; NKI kernels accumulate in fp32
+  via PSUM, result returned in operand dtype. No overhead.
+- **`"kahan"`** — promotes all operands to fp64 before contracting (via
+  `torch.einsum`), casts result back to original dtype. Provides ~15.9
+  significant digits of accumulation accuracy. Bypasses NKI dispatch so it
+  works on CPU without Trainium hardware. Useful for DF-MP2/CCSD energy
+  convergence where fp32's ~7.2 digits are insufficient.
+- **`"dd"`** — double-double accumulation via trnblas Phase 2 fused GEMM kernel.
+  Not yet available; raises `NotImplementedError`. Tracked in trnblas#22.
+
+```python
+# Accumulate DF-MP2 energy with ~15-digit precision
+E_corr = trntensor.einsum("ijab,ijab->", T, T2, precision="kahan")
+```
+
+`precision` is included in the plan cache key so `"fast"` and `"kahan"` plans
+cache independently without cross-contaminating the execution path.
+
 ## Decompositions for quantum chemistry
 
-- **CP (CANDECOMP/PARAFAC)** — Tensor hypercontraction (THC) of two-electron integrals. Reduces $O(N^4)$ storage to $O(N^2 R)$.
+- **CP (CANDECOMP/PARAFAC)** — Tensor hypercontraction (THC) of two-electron integrals. Reduces $O(N^4)$ storage to $O(N^2 R)$. Supports `nonneg=True` (multiplicative ALS updates) and `factors=` warm-start.
 - **Tucker (HOSVD)** — Low-rank approximation of DF coefficient tensors. Reduces memory for large auxiliary basis sets.
+- **Tensor Train (TT-SVD)** — Chain-of-cores decomposition for high-dimensional tensors (Oseledets 2011). Bond dimension capped at `max_rank`. Reduces $O(n^d)$ storage to $O(d \cdot n \cdot R^2)$ at the cost of truncation error. Useful for DMRG-style state-vector compression.
 
-Both use alternating-least-squares on top of `trnblas`-style GEMM primitives. The decompositions can be fed back through `einsum` at evaluation time — e.g., contracting Tucker factors directly against a state vector without materializing the full tensor.
+CP and Tucker use alternating-least-squares on top of `trnblas`-style GEMM primitives. TT-SVD uses successive truncated SVD. All decompositions can be fed back through `einsum` at evaluation time — e.g., contracting Tucker factors directly against a state vector without materializing the full tensor.
