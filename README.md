@@ -71,9 +71,11 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 - [x] CP decomposition (ALS)
 - [x] Tucker decomposition (HOSVD)
 - [x] DF-MP2 einsum example
-- [ ] NKI fused contraction kernels
-- [ ] Multi-contraction fusion
+- [x] NKI fused contraction kernels (`mp2_energy`, `ao_to_mo_transform`)
+- [x] XLA operand residency (`to_xla` / `from_xla`)
+- [x] NKI CPU simulator + `nki-simulator` CI gate
 - [ ] Optimal contraction ordering (like opt_einsum)
+- [ ] Multi-contraction shared-operand fusion
 
 ## Related Projects
 

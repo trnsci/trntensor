@@ -7,15 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-15
+
+### Added
+
+- **`trntensor.to_xla(tensor)` / `trntensor.from_xla(tensor)`** — explicit
+  operand residency on the Trainium XLA device. Pre-pinning operands
+  lets repeated trntensor calls skip per-dispatch host↔device
+  transfer, which otherwise dominates at current kernel sizes. The
+  full DF-MP2 pipeline (`ao_to_mo_transform` → `mp2_energy`) with all
+  operands pre-pinned pays transfer cost once instead of once per
+  call. The dispatch layer's `_to_xla` helper takes a fast path when
+  every operand is already on XLA, returning the result on XLA — the
+  caller decides when to pull back via `from_xla`. Closes #34.
+- **`trntensor.ao_to_mo_transform(eri, C_occ, C_vir)`** — fused 4-index
+  AO→MO integral transform with K-tiling over the basis index (#37).
+  One NKI program computes `B[i,a,P] = Σ_{μν} C_occ[μ,i] · C_vir[ν,a] ·
+  eri[μ,ν,P]`. Tiles over μ (step 1) and ν (step 2) in TILE_K=128
+  chunks so `nbasis` up to 512 is supported; dispatch pads to the
+  nearest TILE_K multiple. Shape constraints: `nbasis ≤ 512`,
+  `nocc ≤ 128`, `nvir ≤ 512`. Composes with `mp2_energy` for the full
+  DF-MP2 pipeline from AO integrals to correlation energy. Validated
+  on trn1 (hardware) and via the CPU simulator CI job.
+- **NKI CPU simulator dispatch** via `TRNTENSOR_USE_SIMULATOR=1`.
+  Routes kernels through `nki.simulate(kernel)(numpy_args)` on CPU,
+  bypassing `torch_xla` + NEFF compile. Iteration loop drops from
+  ~5 min per SSM round-trip to seconds. Correctness-only — MLIR
+  verifier errors remain hardware-only.
+- **`nki-simulator` CI job on `ubuntu-latest`** — runs the
+  `nki_simulator`-marked suite against `nki>=0.3.0` from the AWS pip
+  index on every push + PR. Zero AWS cost for the correctness gate.
+- `tests/test_nki_sim.py` — simulator-backed correctness suite,
+  marker `nki_simulator`. Covers matmul, batched matmul,
+  `ao_to_mo_transform` (including K-tiled nbasis=256 and non-aligned
+  nbasis=200), and `mp2_energy`.
+- `scripts/run_simulator_tests.sh` — SSM runner for the simulator
+  suite on the trn1 DLAMI.
+- `docs/developing_kernels.md` — NKI kernel development guide with
+  trntensor-specific env vars and file locations.
+
+### Changed
+
+- **Migrated to NKI 0.3.0 / Neuron SDK 2.29.** Canonical `nki.*`
+  namespace; the legacy `neuronxcc.nki.*` shim is no longer used.
+  Kernels updated for the NKI 0.3.0 breaking-change surface:
+  `nisa.nc_matmul(dst=, stationary=, moving=, accumulate=True)` (all
+  kwargs); `nl.copy(psum)` returns a view — use `nl.ndarray` +
+  `nisa.tensor_copy` instead; tensor-tensor `nl.divide` dropped — use
+  `multiply × reciprocal`.
+- Dev workflow migrated to [uv](https://github.com/astral-sh/uv).
+  `uv sync --extra dev` replaces `pip install -e ".[dev]"`; CI uses
+  `astral-sh/setup-uv@v6` and `uv run pytest` / `uvx ruff`. `uv.lock`
+  is committed for reproducible installs.
+- Removed the `[neuron]` optional-dependencies extra. `nki` is
+  installed from the AWS Neuron pip index in CI or provided by the
+  Deep Learning AMI's pre-built venv on hardware.
+- `CONTRIBUTING.md` updated to reflect the uv-based setup.
+
 ### Fixed
 
 - `mp2_energy_kernel` 1D-load ambiguity on pre-pinned XLA ε inputs
   (#38). Reshape `eps_occ` / `eps_vir` to 2D `(N, 1)` at the dispatch
-  boundary; kernel `nl.load` signatures updated to match. Makes
-  partition-dim inference unambiguous regardless of residency state.
-  Also switched `mp2_energy_kernel`'s per-(i,j) reduction to trnblas's
-  accumulator pattern (persistent `(1, 1)` SBUF tile) so the `nl.sum`
-  result doesn't need a 0-D SBUF allocation.
+  boundary; partition-dim inference is unambiguous regardless of
+  residency state.
+- `mp2_energy_kernel` 0-D SBUF rejection (`SBUF tensors must have at
+  least 2 dimensions`). Per-`(i,j)` reduction now uses a persistent
+  `(1, 1)` SBUF accumulator (`nl.zeros((1, 1), ...)`) instead of a
+  direct `nl.sum` store.
 - `_to_xla` fast-path now calls `xm.mark_step()` when operands are
   already on XLA, forcing pending lazy computations to materialize
   before the next kernel dispatch.
@@ -28,80 +86,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instructions that fail verification on trn1. Workaround: `from_xla`
   the intermediate `B` between the two calls. Tracked in #39 for
   upstream AWS escalation.
-
-### Added
-
-- **`trntensor.to_xla(tensor)` / `trntensor.from_xla(tensor)`** — explicit
-  operand residency on the Trainium XLA device. Pre-pinning operands
-  lets repeated trntensor calls skip per-dispatch host↔device
-  transfer, which otherwise dominates at current kernel sizes. The
-  full DF-MP2 pipeline (`ao_to_mo_transform` → `mp2_energy`) with all
-  operands pre-pinned pays transfer cost once instead of once per
-  call. The dispatch layer's `_to_xla` helper takes a fast path when
-  every operand is already on XLA, returning the result on XLA — the
-  caller decides when to pull back via `from_xla`. Third architectural
-  pattern after fused-reduce and fused multi-contraction; see
-  `docs/architecture.md`. Closes #34.
-- **`trntensor.ao_to_mo_transform(eri, C_occ, C_vir)`** — fused 4-index
-  AO→MO integral transform. One NKI program computes
-  `B[i,a,P] = Σ_{μν} C_occ[μ,i] · C_vir[ν,a] · eri[μ,ν,P]` with C_occ
-  and C_vir SBUF-resident across all P iterations. The per-P
-  intermediate `(i, ν)` tile round-trips through kernel-scratch HBM to
-  handle the partition-dim change between the two sequential
-  `nc_matmul` steps. Composes with `mp2_energy` for the full DF-MP2
-  pipeline from AO integrals to correlation energy. Single-tile path
-  this release (`nbasis ≤ 128`); K/N tiling follow-up.
-  Validated on trn1 (hardware) and via the CPU simulator CI job.
-
-### Changed
-
-- **Migrated to NKI 0.3.0 / Neuron SDK 2.29.** Canonical `nki.*`
-  namespace; the legacy `neuronxcc.nki.*` shim is no longer used.
-  Kernels (`matmul_kernel`, `batched_matmul_kernel`,
-  `mp2_energy_kernel`) updated for the NKI 0.3.0 breaking-change
-  surface:
-  - `nisa.nc_matmul(dst=, stationary=, moving=, accumulate=True)`
-    (all kwargs; internal accumulate replaces external
-    `psum[...] += ...`).
-  - `nl.copy(psum, ...)` returns a view; use `nl.ndarray` +
-    `nisa.tensor_copy` to move PSUM → SBUF before `nl.store`.
-  - Tensor-tensor `nl.divide` dropped; use `multiply × reciprocal`
-    in `mp2_energy_kernel`.
-- Dev workflow migrated to [uv](https://github.com/astral-sh/uv).
-  `uv sync --extra dev` replaces `pip install -e ".[dev]"`; CI uses
-  `astral-sh/setup-uv@v6` and invokes `uv run pytest` / `uvx ruff`.
-  `uv.lock` is committed for reproducible installs.
-- Removed the `[neuron]` optional-dependencies extra. `nki` (the
-  runtime) is installed separately from the AWS Neuron pip index in
-  CI, or provided by the Deep Learning AMI's pre-built venv on
-  hardware.
-- `CONTRIBUTING.md` updated to reflect the uv-based setup.
-
-### Added
-
-- **NKI CPU simulator dispatch** via `TRNTENSOR_USE_SIMULATOR=1`.
-  Routes kernels through `nki.simulate(kernel)(numpy_args)` on CPU,
-  bypassing `torch_xla` + NEFF compile. Iteration loop drops from
-  ~5 min per SSM round-trip to seconds. All three dispatch wrappers
-  (`nki_matmul`, `nki_batched_matmul`, `_nki_mp2_energy`) carry the
-  simulator branch. Correctness-only — MLIR verifier errors remain
-  hardware-only. See
-  [`docs/developing_kernels.md`](docs/developing_kernels.md).
-- `tests/test_nki_sim.py` — curated simulator-backed correctness
-  suite, marker `nki_simulator`. Skips unless
-  `TRNTENSOR_USE_SIMULATOR=1` + `nki` is importable.
-- `scripts/run_simulator_tests.sh` — SSM runner that runs the
-  simulator suite on the trn1 DLAMI (parity with
-  `run_neuron_tests.sh`; the primary simulator runner is the CI job).
-- **`nki-simulator` CI job on `ubuntu-latest`.** Runs the
-  `nki_simulator`-marked suite against `nki>=0.3.0` from the AWS
-  pip index (`--extra-index-url
-  https://pip.repos.neuron.amazonaws.com`) on every push + PR. Zero
-  AWS cost for the correctness gate; hardware SSM now reserved for
-  perf + MLIR verification.
-- `docs/developing_kernels.md` — thin pointer to the umbrella's
-  canonical NKI how-to plus trntensor-specific env vars and file
-  locations.
 
 ## [0.1.2] — 2026-04-12
 
