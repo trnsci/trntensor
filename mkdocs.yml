@@ -31,6 +31,7 @@ nav:
   - Benchmarks: benchmarks.md
   - Tutorials:
       - DF-MP2 with trntensor: tutorial_df_mp2.md
+      - Contraction patterns (cuTENSOR ↔ trntensor): contraction_patterns.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
 
