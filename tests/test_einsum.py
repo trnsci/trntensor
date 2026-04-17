@@ -340,3 +340,54 @@ class TestPrecision:
         default = trntensor.einsum("ij,jk->ik", A, B)
         fast = trntensor.einsum("ij,jk->ik", A, B, precision="fast")
         np.testing.assert_array_equal(default.numpy(), fast.numpy())
+
+
+class TestMultiEinsumBatched:
+    """Tests for homogeneous batching in multi_einsum (#33 Phase 3)."""
+
+    def test_homogeneous_batching_result(self):
+        """N same-shape matmul contractions via multi_einsum match individual einsum results."""
+        torch.manual_seed(0)
+        nvir, naux = 8, 12
+        # Four independent "ap,bp->ab" contractions with different operands but same shape
+        A0, A1, A2, A3 = (torch.randn(nvir, naux) for _ in range(4))
+        B0, B1, B2, B3 = (torch.randn(nvir, naux) for _ in range(4))
+
+        results = trntensor.multi_einsum(
+            ("ap,bp->ab", A0, B0),
+            ("ap,bp->ab", A1, B1),
+            ("ap,bp->ab", A2, B2),
+            ("ap,bp->ab", A3, B3),
+        )
+        assert len(results) == 4
+        for i, (A, B) in enumerate([(A0, B0), (A1, B1), (A2, B2), (A3, B3)]):
+            expected = trntensor.einsum("ap,bp->ab", A, B)
+            np.testing.assert_allclose(results[i].numpy(), expected.numpy(), atol=1e-5)
+
+    def test_homogeneous_batching_mixed_shapes_fallback(self):
+        """Contractions with different shapes fall through to per-contraction path without error."""
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        C = torch.randn(5, 2)
+        D = torch.randn(2, 6)
+        # Same subscript, different shapes → should NOT batch (fallback)
+        results = trntensor.multi_einsum(
+            ("ij,jk->ik", A, B),
+            ("ij,jk->ik", C, D),
+        )
+        assert len(results) == 2
+        np.testing.assert_allclose(results[0].numpy(), (A @ B).numpy(), atol=1e-5)
+        np.testing.assert_allclose(results[1].numpy(), (C @ D).numpy(), atol=1e-5)
+
+    def test_heterogeneous_subscripts_fallback(self):
+        """Different subscripts fall through to per-contraction path without error."""
+        torch.manual_seed(1)
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        results = trntensor.multi_einsum(
+            ("ij,jk->ik", A, B),  # matmul → (4, 5)
+            ("ij,ij->", A, A),  # frobenius inner product → scalar
+        )
+        assert len(results) == 2
+        np.testing.assert_allclose(results[0].numpy(), (A @ B).numpy(), atol=1e-5)
+        np.testing.assert_allclose(results[1].item(), (A * A).sum().item(), atol=1e-5)

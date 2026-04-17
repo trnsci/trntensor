@@ -193,6 +193,44 @@ def _execute_path(subscripts: str, operands: tuple, plan: ContractionPlan) -> to
     return ops[0]
 
 
+def _try_batched_multi_einsum(contractions: list) -> list[torch.Tensor] | None:
+    """Batch homogeneous 2D matmul contractions into a single dispatch.
+
+    Returns a result list when all contractions share the same subscript,
+    are 2-operand, resolve to strategy ``"matmul"``, and have identical
+    operand shapes. Returns ``None`` otherwise (caller falls through to
+    the per-contraction loop).
+
+    Amortizes the ~0.67 ms fixed XLA dispatch latency across N contractions:
+    instead of N individual ``nki_matmul`` calls each paying that overhead,
+    the stack is dispatched once via ``nki_batched_matmul``.
+    """
+    if len(contractions) < 2:
+        return None
+    subscripts = contractions[0][0]
+    if not all(c[0] == subscripts for c in contractions):
+        return None
+    if not all(len(c) == 3 for c in contractions):
+        return None
+    plan = plan_contraction(subscripts, contractions[0][1], contractions[0][2])
+    if plan.strategy != "matmul":
+        return None
+    shape_key = (contractions[0][1].shape, contractions[0][2].shape)
+    if not all((c[1].shape, c[2].shape) == shape_key for c in contractions):
+        return None
+
+    from .nki.dispatch import nki_batched_matmul
+
+    A_stack = torch.stack([c[1].T if plan.transA else c[1] for c in contractions])
+    B_stack = torch.stack([c[2].T if plan.transB else c[2] for c in contractions])
+    out_stack = nki_batched_matmul(A_stack, B_stack)
+    if out_stack.device.type == "xla":
+        from .nki.dispatch import from_xla
+
+        out_stack = from_xla(out_stack)
+    return [out_stack[i] for i in range(len(contractions))]
+
+
 def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
     """Execute multiple contractions, fusing where possible.
 
@@ -202,6 +240,12 @@ def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
     Shared operands (same tensor object appearing in more than one
     contraction) are pre-pinned to XLA once when NKI is available,
     avoiding repeated host→device transfers.
+
+    When all contractions are homogeneous — same subscript, same operand
+    shapes, 2-operand matmul — they are stacked and dispatched as a single
+    ``nki_batched_matmul`` call, amortizing the fixed XLA dispatch overhead
+    across the batch. Heterogeneous contractions fall through to the
+    per-contraction loop.
 
     Useful for DF-MP2 where many independent contractions share operands:
         results = multi_einsum(
@@ -228,10 +272,19 @@ def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
 
         xla_map = {tid: to_xla(id_to_tensor[tid]) for tid in shared_ids}
 
+    # Build substituted contraction list with pre-pinned operands applied
+    subst = [(c[0], *(xla_map.get(id(op), op) for op in c[1:])) for c in contractions]
+
+    # Try homogeneous batching: N same-shape matmuls → one batched dispatch
+    batched = _try_batched_multi_einsum(subst)
+    if batched is not None:
+        return batched
+
+    # Fallback: per-contraction loop
     results = []
-    for c in contractions:
+    for c in subst:
         subscripts = c[0]
-        ops = tuple(xla_map.get(id(op), op) for op in c[1:])
+        ops = c[1:]
         result = einsum(subscripts, *ops)
         if hasattr(result, "device") and result.device.type == "xla":
             from .nki.dispatch import from_xla
