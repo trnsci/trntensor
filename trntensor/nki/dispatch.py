@@ -41,37 +41,52 @@ def _use_simulator() -> bool:
     return _USE_SIMULATOR and HAS_NKI
 
 
-# Total-FLOP threshold below which we skip NKI and use torch.matmul / torch.bmm
-# directly. The NKI wrapper has ~1 ms of XLA dispatch overhead per call; for
-# small contractions the PyTorch path finishes in less time than the overhead
-# alone. Calibrated on trn1.2xlarge: matmul_2048 (8.6 GFLOPs) wins with NKI,
-# matmul_1024 (1.07 GFLOPs) loses. Set the threshold at 2 GFLOPs conservatively;
-# override with TRNTENSOR_MIN_NKI_FLOPS or scripts/autotune_dispatch.py.
+# FLOP thresholds for NKI dispatch.
 #
-# Autotune cache: if scripts/autotune_dispatch.py --write-cache has been run,
-# its calibrated threshold is read from the cache file (default path
-# /var/tmp/trntensor-autotune/threshold.json; override with
-# TRNTENSOR_AUTOTUNE_CACHE). Explicit TRNTENSOR_MIN_NKI_FLOPS env var always
-# takes priority over the cache.
-def _load_min_nki_flops() -> int:
-    env_val = os.environ.get("TRNTENSOR_MIN_NKI_FLOPS", "")
-    if env_val:
-        return int(env_val)
+# Profiler findings (trn1.2xlarge, 2026-04-17, scripts/run_neuron_profile.sh):
+#   - XLA kernel submission latency: ~0.67 ms fixed overhead per dispatch
+#   - host→device transfer: ~3.5 MB/ms (scales with tensor size)
+#   - device→host transfer: ~5.5 MB/ms
+#
+# Without XLA residency (operands on CPU):
+#   - NKI barely beats torch.matmul at 1024² (2.94 ms vs 2.94 ms)
+#   - 2× speedup at 1536² (4.51 ms vs 9.44 ms)
+#   Crossover: ~2 GFLOPs
+#
+# With XLA residency (operands pre-pinned via to_xla):
+#   - Eliminates host→device transfer; crossover drops to ~900 MFLOPs
+#   - 1024² wins (1.60 ms vs 2.90 ms = 1.8×)
+#   - 2048² wins (4.12 ms vs 23.3 ms = 5.65×)
+#   Crossover: ~1 GFLOPs
+#
+# Two thresholds:
+#   _MIN_NKI_FLOPS        — operands on CPU (default: 2 GFLOPs)
+#   _MIN_NKI_FLOPS_PINNED — operands already on XLA (default: 1 GFLOPs)
+#
+# Override with env vars or scripts/autotune_dispatch.py --write-cache.
+def _load_min_nki_flops() -> tuple[int, int]:
+    """Return (threshold_unpinned, threshold_pinned)."""
+    env_unpinned = os.environ.get("TRNTENSOR_MIN_NKI_FLOPS", "")
+    env_pinned = os.environ.get("TRNTENSOR_MIN_NKI_FLOPS_PINNED", "")
     cache_path = os.environ.get(
         "TRNTENSOR_AUTOTUNE_CACHE", "/var/tmp/trntensor-autotune/threshold.json"
     )
+    cache_unpinned = cache_pinned = None
     try:
         import json
 
         with open(cache_path) as f:
             data = json.load(f)
-        return int(data["trntensor_min_nki_flops"])
+        cache_unpinned = int(data.get("trntensor_min_nki_flops", 2_000_000_000))
+        cache_pinned = int(data.get("trntensor_min_nki_flops_pinned", 1_000_000_000))
     except (FileNotFoundError, KeyError, ValueError, OSError):
         pass
-    return 2_000_000_000  # 2 GFLOPs conservative default
+    unpinned = int(env_unpinned) if env_unpinned else (cache_unpinned or 2_000_000_000)
+    pinned = int(env_pinned) if env_pinned else (cache_pinned or 1_000_000_000)
+    return unpinned, pinned
 
 
-_MIN_NKI_FLOPS = _load_min_nki_flops()
+_MIN_NKI_FLOPS, _MIN_NKI_FLOPS_PINNED = _load_min_nki_flops()
 
 _backend = "auto"
 
@@ -182,8 +197,11 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
     M, K = A.shape
     _, N = B.shape
-    # Skip NKI when dispatch overhead would exceed kernel work.
-    if M * K * N < _MIN_NKI_FLOPS:
+    # Use a lower threshold when operands are already on XLA — no host→device
+    # transfer cost. Crossover measured at ~900 MFLOPs vs ~2 GFLOPs unpinned.
+    already_pinned = A.device.type == "xla" and B.device.type == "xla"
+    flop_threshold = _MIN_NKI_FLOPS_PINNED if already_pinned else _MIN_NKI_FLOPS
+    if flop_threshold > M * K * N:
         return torch.matmul(A, B)
 
     from ._kernels import matmul_kernel
@@ -331,7 +349,9 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
     Bsz, M, K = A.shape
     _, _, N = B.shape
-    if Bsz * M * K * N < _MIN_NKI_FLOPS:
+    already_pinned = A.device.type == "xla" and B.device.type == "xla"
+    flop_threshold = _MIN_NKI_FLOPS_PINNED if already_pinned else _MIN_NKI_FLOPS
+    if Bsz * M * K * N < flop_threshold:
         return torch.bmm(A, B)
 
     from ._kernels import batched_matmul_kernel

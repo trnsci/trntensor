@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`_MIN_NKI_FLOPS_PINNED` dispatch threshold** (#33) — second FLOP gate for
+  when operands are already XLA-resident (`to_xla` pre-applied). Profiler data
+  (trn1.2xlarge, `scripts/run_neuron_profile.sh --dispatch-timing`) shows the
+  NKI crossover drops from ~2 GFLOPs to ~900 MFLOPs when host→device transfer
+  is eliminated. Default: 1 GFLOPs. Override with `TRNTENSOR_MIN_NKI_FLOPS_PINNED`.
+  Dispatch automatically detects XLA-resident inputs and uses the lower threshold.
+
+- **`docs/design/matmul_dispatch_findings.md`** — full per-step timing analysis
+  documenting XLA dispatch latency (~0.67 ms fixed overhead), transfer costs, and
+  the unpinned vs pre-pinned crossover. Raw JSON timing data included.
+
 ## [0.4.0] — 2026-04-16
 
 ### Added
