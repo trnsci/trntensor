@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-04-17
+
+### Added
+
+- **Tiled `mp2_energy_kernel`** — lifts `nvir ≤ 128` and `naux ≤ 128`
+  single-tile constraints. The kernel now M-tiles over the virtual-orbital
+  dimensions (TILE_M=128 per side) and K-tiles over the auxiliary index P
+  (TILE_K=128), enabling arbitrary `nvir` and `naux` (dispatcher pads to
+  tile multiples with zero-fill). Typical real-molecule sizes now supported:
+  aug-cc-pVDZ (naux≈300+), cc-pVTZ (nvir≈200+). Both `nvir=256` + `naux=256`
+  benchmarked at the same correctness tolerance as the single-tile path.
+
+- **NVIR/NAUX padding in `_nki_mp2_energy` dispatch** — `_nki_mp2_energy`
+  now pads `B` to `(nocc, nvir_pad, naux_pad)` and `eps_vir` to
+  `(nvir_pad, 1)` before kernel entry. Zero-padding is safe: padded B
+  entries are 0, so tile contributions to `T*(2T-T.T)/Δ` are 0 regardless
+  of Δ.
+
+- **Simulator tests for tiled shapes** (`tests/test_nki_sim.py`,
+  `TestMp2EnergySimulator`) — three new cases: `test_naux_tiled`
+  (nocc=4, nvir=32, naux=256), `test_nvir_tiled` (nocc=4, nvir=256,
+  naux=64), `test_both_tiled` (nocc=4, nvir=256, naux=256). Each verifies
+  against `_cpu_mp2_energy` via the NKI CPU simulator.
+
+### Changed
+
+- **`mp2_energy` gate removed** — the `NotImplementedError` for
+  `nvir > 128 or naux > 128` is gone. The NKI path now handles all sizes
+  ≥ TILE_M / TILE_K via the tiled kernel; smaller sizes (padded up) are
+  handled identically to the original single-tile path.
+
 ## [0.5.0] — 2026-04-17
 
 ### Added

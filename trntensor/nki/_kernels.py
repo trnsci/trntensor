@@ -118,31 +118,39 @@ if HAS_NKI:
 
     @nki.jit
     def mp2_energy_kernel(B, eps_occ, eps_vir):
-        """Fully fused DF-MP2 correlation energy.
+        """Fully fused DF-MP2 correlation energy with K/M tiling.
 
-        For each ``(i, j)`` pair, this program:
+        Lifts the single-tile ``nvir ≤ 128`` / ``naux ≤ 128`` constraints.
+        NVIR and NAUX must be multiples of ``TILE_M`` / ``TILE_K``; the
+        dispatch layer pads both before entry.
 
-        1. computes ``T_ab = Σ_P B[i,a,P] B[j,b,P]`` via ``nc_matmul`` —
-           result lives in PSUM, never hits HBM;
-        2. computes ``T^T_ab = T_ba`` via a second ``nc_matmul`` with
-           the operand roles swapped, also in PSUM;
-        3. builds the MP2 denominator ``Δ_ab = ε_i + ε_j - ε_a - ε_b``
-           on the Vector Engine from SBUF-resident ε tiles;
-        4. evaluates ``term = T * (2T - T^T) / Δ`` element-wise in
-           SBUF;
-        5. folds ``Σ_ab term`` into a scalar SBUF accumulator — one
-           HBM store per (i, j) instead of one per ab tile.
+        For each ``(i, j)`` pair this program tiles over the ``(a, b)``
+        virtual-orbital block (M-tiling, TILE_M=128 per side) and over the
+        auxiliary index P (K-tiling, TILE_K=128):
 
-        The whole energy summation is one NKI program — one dispatch,
-        one HBM round-trip for the final partial array. Assumes
-        ``nvir ≤ 128`` and ``naux ≤ 128`` (single-tile path). Larger
-        cases will need K/M tiling; not in this kernel.
+        1. For each ``(m_tile, n_tile)`` block:
+           K-accumulate ``T[m,n] = Σ_P B[i,m,P] B[j,n,P]`` and
+           ``T.T[m,n] = Σ_P B[j,m,P] B[i,n,P]`` in PSUM;
+        2. PSUM → SBUF; build the ``(TILE_M, TILE_M)`` denominator
+           ``Δ_ab = ε_i + ε_j - ε_a - ε_b`` on the Vector Engine;
+        3. Fold ``Σ_ab T*(2T-T.T)/Δ`` into the ``(1,1)`` pair accumulator.
+
+        One HBM store per ``(i, j)`` — same as the original single-tile kernel.
+
+        T.T tile correctness:
+        ``nc_matmul(stationary=Bj_m, moving=Bi_n)[da, db]``
+        ``= Σ_P B[j, m+da, P] · B[i, n+db, P]``
+        ``= T_{ji}[m+da, n+db]``
+        ``= T_{ij}[n+db, m+da]``  (scalar product commutes)
+        ``= T.T[m+da, n+db]`` ✓
 
         Inputs
         ------
-        B       : (nocc, nvir, naux) — DF coefficients.
-        eps_occ : (nocc, 1)         — occupied orbital energies (2D for NKI load hygiene).
-        eps_vir : (nvir, 1)         — virtual orbital energies (2D for NKI load hygiene).
+        B       : (nocc, nvir, naux) — DF coefficients; nvir % TILE_M == 0,
+                                       naux % TILE_K == 0 (dispatcher pads).
+        eps_occ : (nocc, 1)         — occupied orbital energies (2D for NKI
+                                       load hygiene regardless of residency).
+        eps_vir : (nvir, 1)         — virtual orbital energies (2D, same).
 
         Returns
         -------
@@ -151,57 +159,74 @@ if HAS_NKI:
         NOCC, NVIR, NAUX = B.shape
         partial = nl.ndarray((NOCC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
 
-        # Pre-load eps_vir once; reused for every (i, j). Loaded as 2D
-        # (NVIR, 1) so partition dim is unambiguous to the NKI compiler
-        # regardless of whether eps_vir arrived fresh-from-CPU or was
-        # pre-pinned on the XLA device. See #38.
-        ev = nl.load(eps_vir[0:NVIR, 0:1])  # shape (NVIR, 1)
-
         for i in nl.affine_range(NOCC):
             eo_i = nl.load(eps_occ[i : i + 1, 0:1])  # (1, 1)
-            # Load Bi once per i, transposed so partition dim = NAUX.
-            # Shape becomes (NAUX, NVIR) in SBUF.
-            Bi_t = nl.load_transpose2d(B[i, 0:NVIR, 0:NAUX])
 
             for j in nl.affine_range(NOCC):
                 eo_j = nl.load(eps_occ[j : j + 1, 0:1])  # (1, 1)
                 eo_sum = nl.add(eo_i, eo_j)  # (1, 1)
 
-                # Bj for this (i,j). Load transposed → (NAUX, NVIR).
-                Bj_t = nl.load_transpose2d(B[j, 0:NVIR, 0:NAUX])
-
-                # T = Bi @ Bj.T   — stationary Bi_t, moving Bj_t.
-                # T.T = Bj @ Bi.T — swap the roles.
-                psum_T = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
-                psum_Tt = nl.zeros((NVIR, NVIR), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dst=psum_T, stationary=Bi_t, moving=Bj_t, accumulate=True)
-                nisa.nc_matmul(dst=psum_Tt, stationary=Bj_t, moving=Bi_t, accumulate=True)
-
-                # PSUM → SBUF: NKI 0.3.0 requires an explicit tensor_copy
-                # into a fresh SBUF tile for downstream Vector Engine ops.
-                t = nl.ndarray((NVIR, NVIR), dtype=B.dtype, buffer=nl.sbuf)
-                t_T = nl.ndarray((NVIR, NVIR), dtype=B.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(src=psum_T, dst=t)
-                nisa.tensor_copy(src=psum_Tt, dst=t_T)
-
-                # Δ_ab = (ε_i + ε_j) - ε_a - ε_b
-                # Build the (NVIR, NVIR) denominator on the Vector Engine.
-                # ev is already (NVIR, 1); reshape to (1, NVIR) for the second step.
-                denom_rows = nl.subtract(eo_sum, ev)  # broadcasts (1,1) - (NVIR,1) → (NVIR,1)
-                denom = nl.subtract(denom_rows, ev.reshape((1, NVIR)))  # (NVIR, NVIR)
-
-                # term = T * (2T - T.T) / Δ. NKI 0.3.0 drops tensor-tensor
-                # nl.divide; use multiply × reciprocal.
-                two_t_minus_tT = nl.subtract(nl.multiply(t, 2.0), t_T)
-                numerator = nl.multiply(t, two_t_minus_tT)
-                term = nl.multiply(numerator, nl.reciprocal(denom))
-
-                # Reduce to scalar via a persistent (1, 1) SBUF accumulator.
-                # NKI rejects 0-D SBUF tiles, so we can't allocate one
-                # directly from nl.sum; instead broadcast the 0-D sum into
-                # a (1, 1) tile via nl.add. Matches trnblas's pattern.
+                # Persistent (1,1) SBUF accumulator for this (i,j) pair.
                 acc = nl.zeros((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-                acc[...] = nl.add(acc, nl.sum(term, axis=(0, 1)))
+
+                for m_tile in nl.affine_range(NVIR // TILE_M):
+                    m_off = m_tile * TILE_M
+                    # eps_vir slice for the a-dimension; reused for all n_tile.
+                    ev_m = nl.load(eps_vir[m_off : m_off + TILE_M, 0:1])  # (TILE_M, 1)
+
+                    for n_tile in nl.affine_range(NVIR // TILE_M):
+                        n_off = n_tile * TILE_M
+                        ev_n = nl.load(eps_vir[n_off : n_off + TILE_M, 0:1])  # (TILE_M, 1)
+
+                        psum_T = nl.zeros((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
+                        psum_Tt = nl.zeros((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
+
+                        for k_p in nl.affine_range(NAUX // TILE_K):
+                            p_off = k_p * TILE_K
+                            # T[m,n] = Σ_P B[i,m,P] * B[j,n,P]
+                            # load_transpose2d: (TILE_M, TILE_K) → (TILE_K, TILE_M) in SBUF
+                            Bi_m = nl.load_transpose2d(
+                                B[i, m_off : m_off + TILE_M, p_off : p_off + TILE_K]
+                            )
+                            Bj_n = nl.load_transpose2d(
+                                B[j, n_off : n_off + TILE_M, p_off : p_off + TILE_K]
+                            )
+                            nisa.nc_matmul(
+                                dst=psum_T, stationary=Bi_m, moving=Bj_n, accumulate=True
+                            )
+                            # T.T[m,n] = T[n,m] = Σ_P B[j,m,P] * B[i,n,P]
+                            Bj_m = nl.load_transpose2d(
+                                B[j, m_off : m_off + TILE_M, p_off : p_off + TILE_K]
+                            )
+                            Bi_n = nl.load_transpose2d(
+                                B[i, n_off : n_off + TILE_M, p_off : p_off + TILE_K]
+                            )
+                            nisa.nc_matmul(
+                                dst=psum_Tt, stationary=Bj_m, moving=Bi_n, accumulate=True
+                            )
+
+                        # PSUM → SBUF: NKI 0.3.0 requires an explicit tensor_copy
+                        # into a fresh SBUF tile for downstream Vector Engine ops.
+                        t = nl.ndarray((TILE_M, TILE_M), dtype=B.dtype, buffer=nl.sbuf)
+                        t_T = nl.ndarray((TILE_M, TILE_M), dtype=B.dtype, buffer=nl.sbuf)
+                        nisa.tensor_copy(src=psum_T, dst=t)
+                        nisa.tensor_copy(src=psum_Tt, dst=t_T)
+
+                        # Δ_ab = (ε_i + ε_j) - ε_a - ε_b for this (m_tile, n_tile) block.
+                        # ev_m: (TILE_M, 1) — a-dimension energies
+                        # ev_n: (TILE_M, 1) — b-dimension energies
+                        denom_rows = nl.subtract(eo_sum, ev_m)  # (TILE_M, 1)
+                        denom = nl.subtract(
+                            denom_rows, ev_n.reshape((1, TILE_M))
+                        )  # (TILE_M, TILE_M)
+
+                        # term = T * (2T - T.T) / Δ. NKI 0.3.0 drops tensor-tensor
+                        # nl.divide; use multiply × reciprocal.
+                        two_t_minus_tT = nl.subtract(nl.multiply(t, 2.0), t_T)
+                        numerator = nl.multiply(t, two_t_minus_tT)
+                        term = nl.multiply(numerator, nl.reciprocal(denom))
+                        acc[...] = nl.add(acc, nl.sum(term, axis=(0, 1)))
+
                 nl.store(partial[i : i + 1, j : j + 1], value=acc)
 
         return partial

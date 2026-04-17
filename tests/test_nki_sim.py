@@ -152,3 +152,60 @@ class TestMp2EnergySimulator:
             torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
         finally:
             trntensor.set_backend("auto")
+
+    def test_naux_tiled(self):
+        """K-tiling path: naux=256 = 2×TILE_K, nvir padded to TILE_M."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(43)
+            nocc, nvir, naux = 4, 32, 256
+            B = torch.randn(nocc, nvir, naux) * 0.1
+            eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+            eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+            got = trntensor.mp2_energy(B, eps_occ, eps_vir)
+            expected = _cpu_mp2_energy(B, eps_occ, eps_vir)
+            torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_nvir_tiled(self):
+        """M-tiling path: nvir=256 = 2×TILE_M, naux padded to TILE_K."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(44)
+            nocc, nvir, naux = 4, 256, 64
+            B = torch.randn(nocc, nvir, naux) * 0.1
+            eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+            eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+            got = trntensor.mp2_energy(B, eps_occ, eps_vir)
+            expected = _cpu_mp2_energy(B, eps_occ, eps_vir)
+            torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_both_tiled(self):
+        """K+M tiling: nvir=256 = 2×TILE_M and naux=256 = 2×TILE_K."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(45)
+            nocc, nvir, naux = 4, 256, 256
+            B = torch.randn(nocc, nvir, naux) * 0.1
+            eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+            eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+            got = trntensor.mp2_energy(B, eps_occ, eps_vir)
+            expected = _cpu_mp2_energy(B, eps_occ, eps_vir)
+            torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")

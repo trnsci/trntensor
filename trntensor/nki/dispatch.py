@@ -255,13 +255,6 @@ def _nki_mp2_energy(
     from ._kernels import mp2_energy_kernel
 
     nocc, nvir, naux = B.shape
-    # Single-tile constraints of the kernel. Caller gets a clear error
-    # rather than a cryptic compile failure.
-    if nvir > 128 or naux > 128:
-        raise NotImplementedError(
-            f"mp2_energy_kernel requires nvir ≤ 128 and naux ≤ 128 "
-            f"(got nvir={nvir}, naux={naux}). K/M tiling not yet implemented."
-        )
 
     # Reshape ε vectors to 2D at the dispatch boundary. NKI's
     # partition-dim inference is ambiguous on 1D tensor slices when
@@ -271,6 +264,21 @@ def _nki_mp2_energy(
     B_feed = B.contiguous()
     eo_feed = eps_occ.reshape(-1, 1).contiguous()
     ev_feed = eps_vir.reshape(-1, 1).contiguous()
+
+    # Pad NVIR to a TILE_M multiple and NAUX to a TILE_K multiple so the
+    # kernel's affine_range loops always see clean tile boundaries.
+    # Zero-padding is safe: padded B entries are 0, so their contribution
+    # to term = T*(2T-T.T)/Δ is 0 regardless of Δ.
+    nvir_pad = _round_up(nvir, TILE_M)
+    naux_pad = _round_up(naux, TILE_K)
+    needs_pad = nvir_pad != nvir or naux_pad != naux
+    if needs_pad:
+        B_p = torch.zeros(nocc, nvir_pad, naux_pad, dtype=B_feed.dtype, device=B_feed.device)
+        B_p[:, :nvir, :naux] = B_feed
+        ev_p = torch.zeros(nvir_pad, 1, dtype=ev_feed.dtype, device=ev_feed.device)
+        ev_p[:nvir, :] = ev_feed
+        B_feed = B_p.contiguous()
+        ev_feed = ev_p.contiguous()
 
     if _use_simulator():
         out_np = nki.simulate(mp2_energy_kernel)(
