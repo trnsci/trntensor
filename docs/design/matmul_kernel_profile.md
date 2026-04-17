@@ -121,6 +121,28 @@ Kernel work for 4096 contractions of shape (nvir=512, naux=512):
 - At 47.5 TFLOPS fp32 peak: ~45 ms
 - Actual: one batched dispatch submits all of this in one NEFF
 
+### 4. Kern and to_cpu already partially overlap (#35 closed)
+
+The `kern ms` column in the dispatch timing tables measures XLA graph submission
+latency — Python dispatch, lazy graph compilation/cache lookup, and NEFF handoff
+to the Neuron Runtime — not the raw Tensor Engine execution time. When measured as
+`nki_tot` (end-to-end NKI path wall-clock), the sum of steps slightly exceeds the
+total:
+
+| Size | to_xla | kern | to_cpu | Sum | nki_tot | Gap |
+|------|--------|------|--------|-----|---------|-----|
+| 1024² (unpinned) | 1.502 ms | 0.684 ms | 0.970 ms | 3.156 ms | 2.935 ms | **−0.22 ms** |
+
+The gap confirms kern and to_cpu already partially pipeline: the Neuron Runtime
+begins DMA while the host is still processing the XLA submission handoff.
+
+No additional async pipelining is available at the dispatch level. The
+`xm.mark_step()` call in `_to_xla` is a **necessary correctness barrier**: without
+it, the XLA lazy evaluator fuses consecutive NKI kernels into a single graph that
+triggers trn2-only shared-memory instructions failing trn1 verification (#39). The
+sync is not a performance regression — removing it would improve latency only until
+the compiler bug is fixed, and would produce wrong results on trn1 in the meantime.
+
 ---
 
 ## Recommended next steps
