@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-04-17
+
+### Added
+
+- **N-tiled `ao_to_mo_transform_kernel`** — lifts `nbasis ≤ 512` and
+  `nvir ≤ 512` single-N-tile constraints. Step 1 now tiles the ν (basis)
+  dimension in ``TILE_N=512``-wide chunks; step 2 tiles the virtual-orbital
+  a dimension similarly. Enables full DF-MP2 AO→MO transform for large basis
+  sets: cc-pVTZ on naphthalene (nbasis≈572), aug-cc-pVTZ virtual spaces
+  (nvir > 512). Dispatcher pads both `nbasis` and `nvir` to ``TILE_N``
+  multiples (zero-fill); result sliced back to `(nocc, nvir, naux)`.
+
+- **Simulator tests for N-tiled shapes** (`tests/test_nki_sim.py`,
+  `TestAoToMoTransformSimulator`) — three new cases: `test_n_tiled_nbasis`
+  (nbasis=640 > TILE_N), `test_n_tiled_nvir` (nvir=600 > TILE_N),
+  `test_both_n_tiled` (nbasis=640, nvir=600). Each verifies against the
+  CPU einsum reference.
+
+### Changed
+
+- **`ao_to_mo_transform` gates removed** — `NotImplementedError` for
+  `nbasis > 512` and `nvir > 512` removed; both constraints are now handled
+  by the tiled kernel + dispatcher. The `nocc > 128` gate remains (M-tiling
+  not yet implemented).
+- **`_nki_ao_to_mo_transform` padding** — `nbasis` now padded to
+  `_round_up(nbasis, TILE_N)` instead of `_round_up(nbasis, TILE_K)`.
+  TILE_N alignment is stricter (multiples of 512 vs 128), but implies
+  TILE_K alignment (TILE_N = 4×TILE_K). `nvir` padding added.
+
 ## [0.6.0] — 2026-04-17
 
 ### Added

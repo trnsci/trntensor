@@ -310,19 +310,26 @@ def _nki_ao_to_mo_transform(
     from ._kernels import ao_to_mo_transform_kernel
 
     nbasis = eri.shape[0]
-    nbasis_pad = _round_up(nbasis, TILE_K)
-    needs_nbasis_pad = nbasis_pad != nbasis
+    naux = eri.shape[2]
+    nocc = C_occ.shape[1]
+    nvir = C_vir.shape[1]
 
-    if needs_nbasis_pad:
-        naux = eri.shape[2]
-        nocc = C_occ.shape[1]
-        nvir = C_vir.shape[1]
+    # Pad nbasis to a TILE_N (512) multiple — the kernel's step-1 ν-tile and
+    # step-2 K-tile loops both require this. TILE_N = 4×TILE_K, so TILE_N
+    # alignment implies TILE_K alignment for the inner k_mu/k_nu loops.
+    # Pad nvir to a TILE_N multiple — the kernel's step-2 a-tile loop requires
+    # this. Slice the result back to (nocc, nvir, naux) after kernel returns.
+    nbasis_pad = _round_up(nbasis, TILE_N)
+    nvir_pad = _round_up(nvir, TILE_N)
+    needs_pad = nbasis_pad != nbasis or nvir_pad != nvir
+
+    if needs_pad:
         eri_p = torch.zeros(nbasis_pad, nbasis_pad, naux, dtype=eri.dtype, device=eri.device)
         eri_p[:nbasis, :nbasis, :] = eri
         C_occ_p = torch.zeros(nbasis_pad, nocc, dtype=C_occ.dtype, device=C_occ.device)
         C_occ_p[:nbasis, :] = C_occ
-        C_vir_p = torch.zeros(nbasis_pad, nvir, dtype=C_vir.dtype, device=C_vir.device)
-        C_vir_p[:nbasis, :] = C_vir
+        C_vir_p = torch.zeros(nbasis_pad, nvir_pad, dtype=C_vir.dtype, device=C_vir.device)
+        C_vir_p[:nbasis, :nvir] = C_vir
         eri_feed = eri_p.contiguous()
         C_occ_feed = C_occ_p.contiguous()
         C_vir_feed = C_vir_p.contiguous()
@@ -337,11 +344,13 @@ def _nki_ao_to_mo_transform(
             C_occ_feed.cpu().numpy(),
             C_vir_feed.cpu().numpy(),
         )
-        return torch.from_numpy(np.asarray(out_np)).to(eri.device)
+        result = torch.from_numpy(np.asarray(out_np)).to(eri.device)
+        return result[:, :nvir, :] if nvir_pad != nvir else result
 
     (e, co, cv), orig_device = _to_xla(eri_feed, C_occ_feed, C_vir_feed)
     B = ao_to_mo_transform_kernel(e, co, cv)
-    return B.to(orig_device)
+    result = B.to(orig_device)
+    return result[:, :nvir, :] if nvir_pad != nvir else result
 
 
 def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:

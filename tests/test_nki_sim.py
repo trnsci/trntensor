@@ -115,7 +115,7 @@ class TestAoToMoTransformSimulator:
             trntensor.set_backend("auto")
 
     def test_k_tiled_nbasis_non_multiple(self):
-        """nbasis=200 is not a multiple of TILE_K; dispatch pads to 256.
+        """nbasis=200 is not a multiple of TILE_K; dispatch pads to 512.
         Padded zeros must not corrupt the result.
         """
         import trntensor
@@ -124,6 +124,57 @@ class TestAoToMoTransformSimulator:
         try:
             torch.manual_seed(11)
             nbasis, nocc, nvir, naux = 200, 6, 12, 12
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_n_tiled_nbasis(self):
+        """N-tiling path for ν: nbasis=640 > TILE_N=512, padded to 1024 = 2 ν-tiles."""
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(20)
+            nbasis, nocc, nvir, naux = 640, 4, 8, 4
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_n_tiled_nvir(self):
+        """N-tiling path for a: nvir=600 > TILE_N=512, padded to 1024 = 2 a-tiles."""
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(21)
+            nbasis, nocc, nvir, naux = 128, 4, 600, 4
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_both_n_tiled(self):
+        """N-tiling for both ν and a: nbasis=640, nvir=600 — both exceed TILE_N=512."""
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(22)
+            nbasis, nocc, nvir, naux = 640, 4, 600, 4
             eri = torch.randn(nbasis, nbasis, naux) * 0.1
             C_occ = torch.randn(nbasis, nocc)
             C_vir = torch.randn(nbasis, nvir)
