@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-04-17
+
 ### Added
+
+- **`multi_einsum` homogeneous batching** (#33 Phase 3) — when all contractions
+  share the same subscript, operand shapes, and resolve to a 2D matmul, they are
+  stacked and dispatched as a single `nki_batched_matmul` call instead of N
+  independent ones. Amortizes the ~0.67 ms fixed XLA dispatch overhead across the
+  batch (nocc²=4096 pair contractions: 2.7 s → 0.67 ms dispatch overhead). Falls
+  through to the per-contraction loop for heterogeneous sets.
 
 - **`_MIN_NKI_FLOPS_PINNED` dispatch threshold** (#33) — second FLOP gate for
   when operands are already XLA-resident (`to_xla` pre-applied). Profiler data
@@ -19,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`docs/design/matmul_dispatch_findings.md`** — full per-step timing analysis
   documenting XLA dispatch latency (~0.67 ms fixed overhead), transfer costs, and
   the unpinned vs pre-pinned crossover. Raw JSON timing data included.
+
+- **`docs/design/matmul_kernel_profile.md`** — Tensor Engine utilization profile
+  for `matmul_kernel` on trn1.2xlarge. Captures TE/VE split, DMA transfer
+  breakdown, and PSUM accumulation efficiency at medium (1024²) and large (2048²)
+  matrix sizes.
+
+- **`infra/terraform/terraform.tfvars`** — VPC/subnet/region values for
+  `trntensor-ci-trn1` (us-east-1, vpc-cd49bfb0, subnet-1bd24d15).
+
+### Changed
+
+- **`infra/terraform/main.tf`** — default `aws_region` corrected from `us-west-2`
+  to `us-east-1` to match the existing VPC/subnet. Running `terraform apply`
+  without overrides now selects the correct region.
 
 ## [0.4.0] — 2026-04-16
 
