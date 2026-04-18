@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-04-18
+
+### Fixed
+
+- **`_execute_path` now routes binary steps through `einsum()`** — multi-operand
+  contractions (3+ tensors via the greedy path planner) previously called
+  `torch.einsum` directly for each binary step, bypassing the entire trntensor
+  dispatch layer (plan cache, FLOP thresholds, NKI routing). The fix is a
+  one-line change: each step now calls `einsum(sub, a, b, precision=plan.precision)`,
+  so matmul-shaped steps dispatch to NKI when operand size clears the threshold.
+  All correctness tests are unaffected; top-level `ContractionPlan.backend` for
+  strategy `"path"` remains `"pytorch"` (accurate: no single NKI kernel spans
+  an arbitrary path). (#18 follow-up)
+
 ## [0.7.0] — 2026-04-17
 
 ### Added

@@ -186,6 +186,33 @@ class TestPathExecution:
         result = trntensor.einsum("ij,jk,kl->il", A, B, C)
         assert result.shape == (7, 11)
 
+    def test_three_operand_nki_backend(self):
+        """Large binary steps in a 3-operand chain route through trntensor dispatch.
+
+        Verifies that _execute_path calls einsum() recursively so that matmul-shaped
+        binary steps are eligible for NKI dispatch, not silently sent to torch.einsum.
+        On CPU-only installs (HAS_NKI=False) this degrades to a correctness check.
+        """
+        from trntensor.nki import HAS_NKI
+        from trntensor.nki.dispatch import _MIN_NKI_FLOPS
+
+        # Both binary steps are 512×512×512 → well above default _MIN_NKI_FLOPS
+        torch.manual_seed(3)
+        A = torch.randn(512, 512)
+        B = torch.randn(512, 512)
+        C = torch.randn(512, 512)
+        result = trntensor.einsum("ij,jk,kl->il", A, B, C)
+        expected = torch.einsum("ij,jk,kl->il", A, B, C)
+        torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-4)
+
+        # The plan for the first binary step (ij,jk->ik at 512×512×512) should
+        # select "matmul" strategy and "nki" backend when NKI is available.
+        trntensor.clear_plan_cache()
+        step_plan = trntensor.plan_contraction("ij,jk->ik", A, B)
+        assert step_plan.strategy == "matmul"
+        if HAS_NKI and _MIN_NKI_FLOPS <= 512 * 512 * 512:
+            assert step_plan.backend == "nki"
+
 
 class TestPlan:
     def test_matmul_detected(self):

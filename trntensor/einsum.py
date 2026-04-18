@@ -184,8 +184,19 @@ def _execute_path(subscripts: str, operands: tuple, plan: ContractionPlan) -> to
                     inter_parts.append(c)
             inter_str = "".join(inter_parts)
 
-        sub = f"{inputs[i]},{inputs[j]}->{inter_str}"
-        result = torch.einsum(sub, ops[i], ops[j])
+        # Normalize operand order: _plan_binary expects A's free dims to appear
+        # before B's free dims in the output (standard matmul orientation).
+        # When the greedy path leaves operands in the wrong order (e.g.
+        # "kl,ik->il" where i comes from the second operand), swap them so the
+        # binary subscript is in canonical form.
+        step_contracted = (set(inputs[i]) | set(inputs[j])) - set(inter_str)
+        free_i = set(inputs[i]) - step_contracted
+        if inter_str and inter_str[0] not in free_i:
+            sub = f"{inputs[j]},{inputs[i]}->{inter_str}"
+            result = einsum(sub, ops[j], ops[i], precision=plan.precision)
+        else:
+            sub = f"{inputs[i]},{inputs[j]}->{inter_str}"
+            result = einsum(sub, ops[i], ops[j], precision=plan.precision)
 
         ops = [op for k, op in enumerate(ops) if k not in (i, j)] + [result]
         inputs = [inp for k, inp in enumerate(inputs) if k not in (i, j)] + [inter_str]
