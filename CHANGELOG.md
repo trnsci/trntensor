@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-04-18
+
+### Added
+
+- **`trntensor.parallel` module** — Phase 4 foundation for output-parallel tensor
+  contractions. Introduces ``ShardedTensor``, ``scatter``, and ``gather``:
+  - ``ShardedTensor``: wraps a list of dense chunk tensors split along a single
+    ``partition_dim``. Carries the partition spec so ``einsum()`` can detect it
+    and classify the sharding mode.
+  - ``scatter(tensor, dim, n_shards)``: splits a dense tensor evenly along
+    ``dim``; last shard absorbs any remainder.
+  - ``gather(st)``: reconstructs the dense tensor via ``torch.cat``.
+
+- **Output-parallel sharding in ``einsum()``**: when any operand is a
+  ``ShardedTensor``, ``einsum()`` checks whether the partition dimension maps to
+  an output index (output-parallel). If so, each shard's contraction is dispatched
+  independently (no cross-shard communication) and the result is returned as a
+  ``ShardedTensor``. Works for all subscript patterns handled by the existing
+  planner (matmul, bmm, torch, path) and propagates through multi-operand chains.
+
+- **Reduce-parallel gate**: if the partition dimension is a contraction index
+  (not in the output), ``einsum()`` raises ``NotImplementedError`` with a clear
+  explanation: reduce-parallel sharding requires ``nki.collectives`` all-reduce,
+  arriving in Neuron SDK 2.30+. The gate prevents silent wrong results.
+
+### Notes
+
+``nki.collectives`` (all-reduce, all-gather) is not available in NKI 0.3.0
+Stable. Reduce-parallel sharding (contracted-dimension sharding) is gated until
+SDK 2.30+. This sprint covers the output-parallel subset, which handles the
+common row-parallel and column-parallel matmul patterns used in DF-MP2
+AO→MO transform with large basis sets (nbasis > 3000 across chips).
+
 ## [0.8.0] — 2026-04-18
 
 ### Fixed

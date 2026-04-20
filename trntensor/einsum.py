@@ -91,6 +91,16 @@ def einsum(
         # High-precision accumulation (fp64 internally, result in original dtype)
         einsum("ij,jk->ik", A, B, precision="kahan")
     """
+    # Early detection: ShardedTensor operands route to the sharded dispatch path.
+    from .parallel import ShardedTensor
+
+    if any(isinstance(op, ShardedTensor) for op in operands):
+        if out is not None:
+            raise NotImplementedError(
+                "The 'out' accumulation argument is not supported with ShardedTensor operands."
+            )
+        return _execute_sharded(subscripts, operands, alpha=alpha, dtype=dtype, precision=precision)
+
     target = _resolve_dtype(dtype)
     if target is not None:
         operands = tuple(op.to(target) for op in operands)
@@ -101,6 +111,85 @@ def einsum(
     if out is not None:
         result = result.add(out, alpha=beta)
     return result
+
+
+def _execute_sharded(
+    subscripts: str,
+    operands: tuple,
+    alpha: float = 1.0,
+    dtype: str | torch.dtype | None = None,
+    precision: str = "fast",
+):
+    """Dispatch output-parallel sharded contractions.
+
+    For each sharded operand, validates that the partition dimension maps to
+    an output index (output-parallel sharding — no collective communication
+    required). Raises ``NotImplementedError`` for reduce-parallel sharding
+    (contracted partition dimension), which requires ``nki.collectives``
+    landing in Neuron SDK 2.30+.
+
+    Dispatches each shard independently by substituting the dense chunk for
+    the sharded operand and calling ``einsum()`` on the resulting tuple. The
+    per-shard results are returned as a :class:`~trntensor.parallel.ShardedTensor`
+    partitioned along the output dimension that corresponds to the partition index.
+    """
+    from .parallel import ShardedTensor
+    from .plan import _parse_subscripts
+
+    _, output_str = _parse_subscripts(subscripts)
+    input_str, _ = _parse_subscripts(subscripts)
+    input_terms = input_str.split(",")
+
+    if len(operands) != len(input_terms):
+        raise ValueError(
+            f"Subscript has {len(input_terms)} operand terms but {len(operands)} operands given."
+        )
+
+    # Validate all sharded operands and collect shard specs.
+    sharded_indices: dict[int, tuple[int, ShardedTensor]] = {}  # op_idx → (out_dim, shard_op)
+    for op_idx, op in enumerate(operands):
+        if not isinstance(op, ShardedTensor):
+            continue
+        shard_char = input_terms[op_idx][op.partition_dim]
+        if shard_char not in output_str:
+            raise NotImplementedError(
+                f"Reduce-parallel sharding: dimension '{shard_char}' of operand {op_idx} "
+                "is a contraction index (not in output). Reducing across shards requires "
+                "all-reduce collective operations, which land in Neuron SDK 2.30+ via "
+                "nki.collectives. Use output-parallel sharding (partition along an output "
+                "dimension) until then."
+            )
+        out_dim = list(output_str).index(shard_char)
+        sharded_indices[op_idx] = (out_dim, op)
+
+    if len(sharded_indices) > 1:
+        # Multiple sharded operands — require they are all sharded along the same
+        # output dimension with the same number of shards, so we can zip chunks.
+        out_dims = {v[0] for v in sharded_indices.values()}
+        n_shards_set = {v[1].n_shards for v in sharded_indices.values()}
+        if len(out_dims) > 1 or len(n_shards_set) > 1:
+            raise NotImplementedError(
+                "Multiple ShardedTensor operands must all be partitioned along "
+                "the same output dimension with the same n_shards. "
+                "Heterogeneous multi-operand sharding is not yet supported."
+            )
+
+    # Pick the representative (first) sharded operand to drive the shard loop.
+    first_op_idx = next(iter(sharded_indices))
+    out_dim, ref_shard = sharded_indices[first_op_idx]
+    n_shards = ref_shard.n_shards
+
+    # Dispatch each shard independently.
+    results = []
+    for shard_idx in range(n_shards):
+        dense_ops = tuple(
+            (sharded_indices[i][1].chunks[shard_idx] if i in sharded_indices else op)
+            for i, op in enumerate(operands)
+        )
+        result_chunk = einsum(subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision)
+        results.append(result_chunk)
+
+    return ShardedTensor(results, partition_dim=out_dim)
 
 
 def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
