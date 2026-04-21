@@ -143,3 +143,41 @@ def gather(st: ShardedTensor) -> torch.Tensor:
         Dense tensor of full logical shape.
     """
     return torch.cat(st.chunks, dim=st.partition_dim)
+
+
+def shard_boundaries(st: ShardedTensor) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` index pairs for each shard along ``partition_dim``.
+
+    Used internally by the reduce-parallel dispatch path to co-partition
+    non-sharded operands that share the contracted dimension.
+
+    Args:
+        st: :class:`ShardedTensor` to inspect.
+
+    Returns:
+        List of ``(start, end)`` pairs, one per shard, where ``end - start``
+        equals ``chunk.shape[partition_dim]`` for that chunk.
+    """
+    bounds = []
+    pos = 0
+    for chunk in st.chunks:
+        size = chunk.shape[st.partition_dim]
+        bounds.append((pos, pos + size))
+        pos += size
+    return bounds
+
+
+def _mock_allreduce(partials: list[torch.Tensor]) -> torch.Tensor:
+    """Mock all-reduce for CPU testing: sum partial contractions across simulated shards.
+
+    On Trainium, this operation maps to ``nki.collectives.allreduce`` (arriving
+    in Neuron SDK 2.30+). This torch-based implementation enables reduce-parallel
+    sharding to be tested on CPU without hardware.
+
+    Args:
+        partials: Per-shard partial contraction results, all of identical shape.
+
+    Returns:
+        Element-wise sum of all partials — the all-reduced result.
+    """
+    return torch.stack(partials).sum(dim=0)

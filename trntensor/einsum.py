@@ -120,24 +120,33 @@ def _execute_sharded(
     dtype: str | torch.dtype | None = None,
     precision: str = "fast",
 ):
-    """Dispatch output-parallel sharded contractions.
+    """Dispatch sharded tensor contractions (output-parallel and reduce-parallel).
 
-    For each sharded operand, validates that the partition dimension maps to
-    an output index (output-parallel sharding — no collective communication
-    required). Raises ``NotImplementedError`` for reduce-parallel sharding
-    (contracted partition dimension), which requires ``nki.collectives``
-    landing in Neuron SDK 2.30+.
+    Classifies each :class:`~trntensor.parallel.ShardedTensor` operand as either:
 
-    Dispatches each shard independently by substituting the dense chunk for
-    the sharded operand and calling ``einsum()`` on the resulting tuple. The
-    per-shard results are returned as a :class:`~trntensor.parallel.ShardedTensor`
-    partitioned along the output dimension that corresponds to the partition index.
+    - **Output-parallel**: the partition dimension maps to an output index.
+      No cross-shard communication required — each shard is contracted
+      independently and results are assembled into a ``ShardedTensor``.
+
+    - **Reduce-parallel**: the partition dimension is a contraction index
+      (not in the output). Each shard produces a partial result of the full
+      output shape; the shards must be summed (all-reduced).
+
+      On Trainium (``HAS_NKI=True``): raises ``NotImplementedError`` — requires
+      ``nki.collectives`` arriving in Neuron SDK 2.30+.
+
+      On CPU (``HAS_NKI=False``): dispatches via :func:`~trntensor.parallel._mock_allreduce`,
+      a torch-based stand-in that enables reduce-parallel paths to be tested
+      without hardware.
+
+    Mixed output-parallel + reduce-parallel operands in the same einsum are
+    not yet supported and raise ``NotImplementedError``.
     """
-    from .parallel import ShardedTensor
+    from .nki.dispatch import HAS_NKI
+    from .parallel import ShardedTensor, _mock_allreduce, shard_boundaries
     from .plan import _parse_subscripts
 
-    _, output_str = _parse_subscripts(subscripts)
-    input_str, _ = _parse_subscripts(subscripts)
+    input_str, output_str = _parse_subscripts(subscripts)
     input_terms = input_str.split(",")
 
     if len(operands) != len(input_terms):
@@ -145,51 +154,107 @@ def _execute_sharded(
             f"Subscript has {len(input_terms)} operand terms but {len(operands)} operands given."
         )
 
-    # Validate all sharded operands and collect shard specs.
-    sharded_indices: dict[int, tuple[int, ShardedTensor]] = {}  # op_idx → (out_dim, shard_op)
+    # Classify each ShardedTensor operand as output-parallel or reduce-parallel.
+    output_parallel: dict[int, tuple[int, ShardedTensor]] = {}  # op_idx → (out_dim, shard_op)
+    reduce_parallel: dict[int, tuple[str, ShardedTensor]] = {}  # op_idx → (shard_char, shard_op)
+
     for op_idx, op in enumerate(operands):
         if not isinstance(op, ShardedTensor):
             continue
         shard_char = input_terms[op_idx][op.partition_dim]
-        if shard_char not in output_str:
-            raise NotImplementedError(
-                f"Reduce-parallel sharding: dimension '{shard_char}' of operand {op_idx} "
-                "is a contraction index (not in output). Reducing across shards requires "
-                "all-reduce collective operations, which land in Neuron SDK 2.30+ via "
-                "nki.collectives. Use output-parallel sharding (partition along an output "
-                "dimension) until then."
-            )
-        out_dim = list(output_str).index(shard_char)
-        sharded_indices[op_idx] = (out_dim, op)
+        if shard_char in output_str:
+            out_dim = list(output_str).index(shard_char)
+            output_parallel[op_idx] = (out_dim, op)
+        else:
+            reduce_parallel[op_idx] = (shard_char, op)
 
-    if len(sharded_indices) > 1:
-        # Multiple sharded operands — require they are all sharded along the same
-        # output dimension with the same number of shards, so we can zip chunks.
-        out_dims = {v[0] for v in sharded_indices.values()}
-        n_shards_set = {v[1].n_shards for v in sharded_indices.values()}
-        if len(out_dims) > 1 or len(n_shards_set) > 1:
-            raise NotImplementedError(
-                "Multiple ShardedTensor operands must all be partitioned along "
-                "the same output dimension with the same n_shards. "
-                "Heterogeneous multi-operand sharding is not yet supported."
-            )
-
-    # Pick the representative (first) sharded operand to drive the shard loop.
-    first_op_idx = next(iter(sharded_indices))
-    out_dim, ref_shard = sharded_indices[first_op_idx]
-    n_shards = ref_shard.n_shards
-
-    # Dispatch each shard independently.
-    results = []
-    for shard_idx in range(n_shards):
-        dense_ops = tuple(
-            (sharded_indices[i][1].chunks[shard_idx] if i in sharded_indices else op)
-            for i, op in enumerate(operands)
+    # Mixed output+reduce-parallel in the same einsum is not yet supported.
+    if output_parallel and reduce_parallel:
+        raise NotImplementedError(
+            "Mixed output-parallel and reduce-parallel sharding in the same einsum "
+            "is not yet supported. All ShardedTensor operands must either all be "
+            "partitioned along an output dimension (output-parallel) or all along "
+            "a contracted dimension (reduce-parallel)."
         )
-        result_chunk = einsum(subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision)
-        results.append(result_chunk)
 
-    return ShardedTensor(results, partition_dim=out_dim)
+    # ------------------------------------------------------------------ #
+    # Output-parallel path                                                 #
+    # ------------------------------------------------------------------ #
+    if output_parallel:
+        if len(output_parallel) > 1:
+            # Multiple sharded operands must share the same output dim and n_shards.
+            out_dims = {v[0] for v in output_parallel.values()}
+            n_shards_set = {v[1].n_shards for v in output_parallel.values()}
+            if len(out_dims) > 1 or len(n_shards_set) > 1:
+                raise NotImplementedError(
+                    "Multiple ShardedTensor operands must all be partitioned along "
+                    "the same output dimension with the same n_shards. "
+                    "Heterogeneous multi-operand sharding is not yet supported."
+                )
+
+        first_op_idx = next(iter(output_parallel))
+        out_dim, ref_shard = output_parallel[first_op_idx]
+        n_shards = ref_shard.n_shards
+
+        results = []
+        for shard_idx in range(n_shards):
+            dense_ops = tuple(
+                (output_parallel[i][1].chunks[shard_idx] if i in output_parallel else op)
+                for i, op in enumerate(operands)
+            )
+            result_chunk = einsum(
+                subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision
+            )
+            results.append(result_chunk)
+
+        return ShardedTensor(results, partition_dim=out_dim)
+
+    # ------------------------------------------------------------------ #
+    # Reduce-parallel path                                                 #
+    # ------------------------------------------------------------------ #
+    rp_chars = {v[0] for v in reduce_parallel.values()}
+    rp_n_shards = {v[1].n_shards for v in reduce_parallel.values()}
+
+    if HAS_NKI:
+        shard_char = next(iter(rp_chars))
+        raise NotImplementedError(
+            f"Reduce-parallel sharding: dimension '{shard_char}' is a contraction "
+            "index (not in output). Reducing across shards requires all-reduce "
+            "collective operations, which land in Neuron SDK 2.30+ via "
+            "nki.collectives. Use output-parallel sharding (partition along an output "
+            "dimension) until then."
+        )
+
+    if len(rp_chars) > 1 or len(rp_n_shards) > 1:
+        raise NotImplementedError(
+            "Multiple reduce-parallel ShardedTensor operands must all be partitioned "
+            "along the same contracted dimension with the same n_shards."
+        )
+
+    shard_char = next(iter(rp_chars))
+    ref_shard = next(iter(reduce_parallel.values()))[1]
+    n_shards = ref_shard.n_shards
+    bounds = shard_boundaries(ref_shard)
+
+    # Dispatch per shard, co-partitioning plain operands that share shard_char.
+    partials = []
+    for shard_idx in range(n_shards):
+        start, end = bounds[shard_idx]
+        dense_ops = []
+        for op_idx, op in enumerate(operands):
+            if op_idx in reduce_parallel:
+                dense_ops.append(op.chunks[shard_idx])
+            elif not isinstance(op, ShardedTensor) and shard_char in input_terms[op_idx]:
+                dim_in_op = input_terms[op_idx].index(shard_char)
+                slices = [slice(None)] * op.ndim
+                slices[dim_in_op] = slice(start, end)
+                dense_ops.append(op[tuple(slices)])
+            else:
+                dense_ops.append(op)
+        partial = einsum(subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision)
+        partials.append(partial)
+
+    return _mock_allreduce(partials)
 
 
 def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:

@@ -138,10 +138,17 @@ class TestShardedEinsum:
 
 
 class TestReduceParallelError:
-    """Reduce-parallel sharding must raise NotImplementedError."""
+    """Reduce-parallel sharding raises NotImplementedError on NKI hardware (HAS_NKI=True).
 
-    def test_contracted_dim_raises(self):
-        """Sharding along the contracted index requires all-reduce → error."""
+    On CPU (HAS_NKI=False) the mock-allreduce path activates — those cases are
+    covered by :class:`TestReduceParallelMock` below.
+    """
+
+    def test_contracted_dim_raises_on_nki(self, monkeypatch):
+        """On NKI hardware, sharding along the contracted index raises with SDK note."""
+        import trntensor.nki.dispatch as _nd
+
+        monkeypatch.setattr(_nd, "HAS_NKI", True)
         A = torch.randn(8, 16)
         B = torch.randn(16, 6)
         A_sharded = scatter(A, dim=1, n_shards=4)  # shard along j (contracted in "ij,jk->ik")
@@ -149,8 +156,11 @@ class TestReduceParallelError:
         with pytest.raises(NotImplementedError, match="nki.collectives"):
             trntensor.einsum("ij,jk->ik", A_sharded, B)
 
-    def test_error_message_names_dimension(self):
-        """Error message names the contracted dimension character."""
+    def test_error_message_names_dimension_on_nki(self, monkeypatch):
+        """On NKI hardware, error message names the contracted dimension character."""
+        import trntensor.nki.dispatch as _nd
+
+        monkeypatch.setattr(_nd, "HAS_NKI", True)
         A = torch.randn(8, 12)
         B = torch.randn(12, 5)
         A_sharded = scatter(A, dim=1, n_shards=3)  # shard along 'j'
@@ -167,3 +177,84 @@ class TestReduceParallelError:
 
         with pytest.raises(NotImplementedError, match="out"):
             trntensor.einsum("ij,jk->ik", A_sharded, B, out=out)
+
+
+class TestReduceParallelMock:
+    """CPU mock-allreduce path for reduce-parallel sharding (HAS_NKI=False).
+
+    On CPU, contracting across a sharded dimension uses :func:`_mock_allreduce`
+    (torch-based sum of per-shard partial results) in place of the
+    ``nki.collectives.allreduce`` that will be used on Trainium (SDK 2.30+).
+    """
+
+    def test_basic_contracted_dim(self):
+        """'ij,jk->ik' with A sharded along j (contracted) — mock allreduce."""
+        torch.manual_seed(10)
+        A = torch.randn(8, 16)
+        B = torch.randn(16, 6)
+        A_sharded = scatter(A, dim=1, n_shards=4)
+
+        result = trntensor.einsum("ij,jk->ik", A_sharded, B)
+
+        assert isinstance(result, torch.Tensor)
+        torch.testing.assert_close(result, A @ B, atol=1e-5, rtol=1e-5)
+
+    def test_b_copartitioned(self):
+        """Both operands sharded along j: B is co-partitioned automatically."""
+        torch.manual_seed(11)
+        A = torch.randn(8, 12)
+        B = torch.randn(12, 5)
+        A_sharded = scatter(A, dim=1, n_shards=3)
+        B_sharded = scatter(B, dim=0, n_shards=3)
+
+        result = trntensor.einsum("ij,jk->ik", A_sharded, B_sharded)
+
+        torch.testing.assert_close(result, A @ B, atol=1e-5, rtol=1e-5)
+
+    def test_uneven_shards(self):
+        """Size not divisible by n_shards — last shard absorbs remainder."""
+        torch.manual_seed(12)
+        A = torch.randn(7, 11)
+        B = torch.randn(11, 5)
+        A_sharded = scatter(A, dim=1, n_shards=3)
+
+        result = trntensor.einsum("ij,jk->ik", A_sharded, B)
+
+        torch.testing.assert_close(result, A @ B, atol=1e-5, rtol=1e-5)
+
+    def test_three_operand_chain(self):
+        """'ij,jk,kl->il' with A sharded along j — B is co-partitioned, C is passed full."""
+        torch.manual_seed(13)
+        A = torch.randn(8, 12)
+        B = torch.randn(12, 6)
+        C = torch.randn(6, 4)
+        A_sharded = scatter(A, dim=1, n_shards=3)
+
+        result = trntensor.einsum("ij,jk,kl->il", A_sharded, B, C)
+        expected = torch.einsum("ij,jk,kl->il", A, B, C)
+
+        torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
+
+    def test_nki_path_still_raises(self, monkeypatch):
+        """When HAS_NKI=True, reduce-parallel raises NotImplementedError (not mock)."""
+        import trntensor.nki.dispatch as _nd
+
+        monkeypatch.setattr(_nd, "HAS_NKI", True)
+        A = torch.randn(8, 16)
+        B = torch.randn(16, 6)
+        A_sharded = scatter(A, dim=1, n_shards=4)
+
+        with pytest.raises(NotImplementedError, match="nki.collectives"):
+            trntensor.einsum("ij,jk->ik", A_sharded, B)
+
+    def test_mixed_output_reduce_raises(self):
+        """Mixed output-parallel + reduce-parallel operands raises NotImplementedError."""
+        torch.manual_seed(14)
+        A = torch.randn(12, 6)
+        B = torch.randn(6, 8)
+        C = torch.randn(8, 4)
+        A_sharded = scatter(A, dim=0, n_shards=3)  # output-parallel: 'i' in output
+        C_sharded = scatter(C, dim=0, n_shards=3)  # reduce-parallel: 'k' contracted
+
+        with pytest.raises(NotImplementedError, match="[Mm]ixed"):
+            trntensor.einsum("ij,jk,kl->il", A_sharded, B, C_sharded)

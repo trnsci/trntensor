@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-04-21
+
+### Added
+
+- **Reduce-parallel sharding on CPU** — the ``NotImplementedError`` gate for
+  contracted-dimension sharding is now conditional on ``HAS_NKI``. On CPU
+  (``HAS_NKI=False``) reduce-parallel contractions dispatch through a mock
+  all-reduce (torch-based sum of per-shard partial results), making the full
+  sharding API testable in CI without hardware.
+
+  On Trainium (``HAS_NKI=True``) the gate is unchanged — ``nki.collectives``
+  is required for production reduce-parallel, arriving in Neuron SDK 2.30+.
+
+- **Co-partitioning of plain-tensor operands** — when a reduce-parallel
+  ``ShardedTensor`` operand partitions along a contracted index, ``einsum()``
+  automatically slices any non-sharded operand that shares that index along
+  the matching dimension per shard. No API change required; callers can mix
+  sharded and dense operands in the same reduce-parallel einsum.
+
+- **``shard_boundaries(st)``** in ``trntensor.parallel`` — returns the
+  ``(start, end)`` slice pairs for each shard. Used internally by the dispatch
+  layer; also useful for callers that need to manually co-partition ancillary
+  data structures.
+
+- **``_mock_allreduce(partials)``** in ``trntensor.parallel`` — sums a list of
+  same-shape tensors element-wise. Named and documented to clearly identify the
+  operation that ``nki.collectives.allreduce`` will replace on hardware.
+
+### Notes
+
+Mixed output-parallel + reduce-parallel operands in the same einsum are not
+yet supported and raise ``NotImplementedError``. This covers an edge case not
+present in the DF-MP2 patterns; deferred to v0.11.0.
+
 ## [0.9.0] — 2026-04-18
 
 ### Added
