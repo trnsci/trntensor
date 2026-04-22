@@ -247,14 +247,100 @@ class TestReduceParallelMock:
         with pytest.raises(NotImplementedError, match="nki.collectives"):
             trntensor.einsum("ij,jk->ik", A_sharded, B)
 
-    def test_mixed_output_reduce_raises(self):
-        """Mixed output-parallel + reduce-parallel operands raises NotImplementedError."""
+    def test_mixed_cpu_no_longer_raises(self):
+        """Mixed output+reduce-parallel computes correctly on CPU (v0.12.0)."""
         torch.manual_seed(14)
         A = torch.randn(12, 6)
         B = torch.randn(6, 8)
         C = torch.randn(8, 4)
         A_sharded = scatter(A, dim=0, n_shards=3)  # output-parallel: 'i' in output
-        C_sharded = scatter(C, dim=0, n_shards=3)  # reduce-parallel: 'k' contracted
+        C_sharded = scatter(C, dim=0, n_shards=2)  # reduce-parallel: 'k' contracted
 
-        with pytest.raises(NotImplementedError, match="[Mm]ixed"):
-            trntensor.einsum("ij,jk,kl->il", A_sharded, B, C_sharded)
+        result = trntensor.einsum("ij,jk,kl->il", A_sharded, B, C_sharded)
+        expected = torch.einsum("ij,jk,kl->il", A, B, C)
+        torch.testing.assert_close(gather(result), expected, atol=1e-4, rtol=1e-4)
+
+
+class TestMixedParallel:
+    """CPU mock path for mixed output-parallel + reduce-parallel sharding (v0.12.0).
+
+    When an einsum has both a ShardedTensor partitioned along an output dimension
+    (output-parallel) and a ShardedTensor partitioned along a contracted dimension
+    (reduce-parallel), the dispatch uses a nested loop: for each output shard,
+    accumulate partial contractions over all reduce shards via :func:`_mock_allreduce`.
+
+    On Trainium (``HAS_NKI=True``) the reduce step raises ``NotImplementedError``
+    — the same gate as pure reduce-parallel (``nki.collectives``, SDK 2.30+).
+    """
+
+    def test_basic_correctness(self):
+        """'ij,jk->ik': A sharded along i (output), B sharded along j (reduce)."""
+        torch.manual_seed(20)
+        A = torch.randn(12, 8)
+        B = torch.randn(8, 6)
+        A_sh = scatter(A, dim=0, n_shards=3)  # output-parallel: 'i'
+        B_sh = scatter(B, dim=0, n_shards=4)  # reduce-parallel: 'j'
+
+        result = trntensor.einsum("ij,jk->ik", A_sh, B_sh)
+
+        assert isinstance(result, ShardedTensor)
+        assert result.partition_dim == 0
+        torch.testing.assert_close(gather(result), A @ B, atol=1e-5, rtol=1e-5)
+
+    def test_three_operand_case(self):
+        """'ij,jk,kl->il': A sharded along i (output), C sharded along k (reduce)."""
+        torch.manual_seed(21)
+        A = torch.randn(12, 6)
+        B = torch.randn(6, 8)
+        C = torch.randn(8, 4)
+        A_sh = scatter(A, dim=0, n_shards=3)  # output-parallel: 'i'
+        C_sh = scatter(C, dim=0, n_shards=2)  # reduce-parallel: 'k'
+
+        result = trntensor.einsum("ij,jk,kl->il", A_sh, B, C_sh)
+        expected = torch.einsum("ij,jk,kl->il", A, B, C)
+
+        assert isinstance(result, ShardedTensor)
+        torch.testing.assert_close(gather(result), expected, atol=1e-4, rtol=1e-4)
+
+    def test_output_shard_count(self):
+        """result.n_shards matches the output-parallel operand's n_shards."""
+        A_sh = scatter(torch.randn(12, 6), dim=0, n_shards=4)
+        B_sh = scatter(torch.randn(6, 8), dim=0, n_shards=3)
+        result = trntensor.einsum("ij,jk->ik", A_sh, B_sh)
+        assert result.n_shards == 4
+
+    def test_uneven_shards(self):
+        """Non-divisible sizes work for both output and reduce shards."""
+        torch.manual_seed(22)
+        A = torch.randn(11, 7)
+        B = torch.randn(7, 5)
+        result = trntensor.einsum(
+            "ij,jk->ik",
+            scatter(A, dim=0, n_shards=3),
+            scatter(B, dim=0, n_shards=2),
+        )
+        torch.testing.assert_close(gather(result), A @ B, atol=1e-5, rtol=1e-5)
+
+    def test_nki_raises(self, monkeypatch):
+        """On NKI hardware, mixed sharding raises NotImplementedError (nki.collectives)."""
+        import trntensor.nki.dispatch as _nd
+
+        monkeypatch.setattr(_nd, "HAS_NKI", True)
+        A_sh = scatter(torch.randn(8, 6), dim=0, n_shards=2)
+        B_sh = scatter(torch.randn(6, 4), dim=0, n_shards=2)
+
+        with pytest.raises(NotImplementedError, match="nki.collectives"):
+            trntensor.einsum("ij,jk->ik", A_sh, B_sh)
+
+    def test_alpha_threads_through(self):
+        """alpha kwarg is applied correctly in the mixed path."""
+        torch.manual_seed(23)
+        A = torch.randn(8, 6)
+        B = torch.randn(6, 4)
+        A_sh = scatter(A, dim=0, n_shards=2)
+        B_sh = scatter(B, dim=0, n_shards=2)
+
+        result_scaled = trntensor.einsum("ij,jk->ik", A_sh, B_sh, alpha=3.0)
+        result_plain = trntensor.einsum("ij,jk->ik", A_sh, B_sh)
+
+        torch.testing.assert_close(gather(result_scaled), 3.0 * gather(result_plain))

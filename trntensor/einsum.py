@@ -171,14 +171,81 @@ def _execute_sharded(
         else:
             reduce_parallel[op_idx] = (shard_char, op)
 
-    # Mixed output+reduce-parallel in the same einsum is not yet supported.
+    # Reduce-parallel metadata — needed by both the mixed and pure reduce paths.
+    rp_chars = {v[0] for v in reduce_parallel.values()}
+    rp_n_shards_set = {v[1].n_shards for v in reduce_parallel.values()}
+
+    # ------------------------------------------------------------------ #
+    # Mixed output-parallel + reduce-parallel path                         #
+    # ------------------------------------------------------------------ #
     if output_parallel and reduce_parallel:
-        raise NotImplementedError(
-            "Mixed output-parallel and reduce-parallel sharding in the same einsum "
-            "is not yet supported. All ShardedTensor operands must either all be "
-            "partitioned along an output dimension (output-parallel) or all along "
-            "a contracted dimension (reduce-parallel)."
-        )
+        # Validate output-parallel side (same constraint as pure output-parallel)
+        if len(output_parallel) > 1:
+            out_dims = {v[0] for v in output_parallel.values()}
+            n_shards_set = {v[1].n_shards for v in output_parallel.values()}
+            if len(out_dims) > 1 or len(n_shards_set) > 1:
+                raise NotImplementedError(
+                    "Multiple ShardedTensor operands in a mixed einsum must all be "
+                    "partitioned along the same output dimension with the same n_shards. "
+                    "Heterogeneous multi-operand sharding is not yet supported."
+                )
+        # Validate reduce-parallel side (same constraint as pure reduce-parallel)
+        if len(rp_chars) > 1 or len(rp_n_shards_set) > 1:
+            raise NotImplementedError(
+                "Multiple reduce-parallel ShardedTensor operands in a mixed einsum must "
+                "all be partitioned along the same contracted dimension with the same "
+                "n_shards."
+            )
+        # NKI gate: inner all-reduce still requires nki.collectives (SDK 2.30+)
+        if HAS_NKI:
+            shard_char_rp = next(iter(rp_chars))
+            raise NotImplementedError(
+                f"Mixed output-parallel + reduce-parallel sharding: reducing across "
+                f"dimension '{shard_char_rp}' requires all-reduce collective operations "
+                "(nki.collectives, Neuron SDK 2.30+). Use output-parallel sharding only "
+                "until then."
+            )
+        # CPU: nested outer-output × inner-reduce dispatch
+        first_out_idx = next(iter(output_parallel))
+        out_dim, ref_out_shard = output_parallel[first_out_idx]
+        out_n_shards = ref_out_shard.n_shards
+        shard_char = next(iter(rp_chars))
+        ref_rp = next(iter(reduce_parallel.values()))[1]
+        rp_n = ref_rp.n_shards
+        bounds = shard_boundaries(ref_rp)
+
+        output_chunks = []
+        for out_s in range(out_n_shards):
+            partials = []
+            for rp_t in range(rp_n):
+                start, end = bounds[rp_t]
+                dense_ops = []
+                for op_idx, op in enumerate(operands):
+                    if op_idx in output_parallel:
+                        chunk = output_parallel[op_idx][1].chunks[out_s]
+                        if shard_char in input_terms[op_idx]:
+                            dim_in_chunk = input_terms[op_idx].index(shard_char)
+                            slices = [slice(None)] * chunk.ndim
+                            slices[dim_in_chunk] = slice(start, end)
+                            dense_ops.append(chunk[tuple(slices)])
+                        else:
+                            dense_ops.append(chunk)
+                    elif op_idx in reduce_parallel:
+                        dense_ops.append(reduce_parallel[op_idx][1].chunks[rp_t])
+                    elif not isinstance(op, ShardedTensor) and shard_char in input_terms[op_idx]:
+                        dim_in_op = input_terms[op_idx].index(shard_char)
+                        slices = [slice(None)] * op.ndim
+                        slices[dim_in_op] = slice(start, end)
+                        dense_ops.append(op[tuple(slices)])
+                    else:
+                        dense_ops.append(op)
+                partial = einsum(
+                    subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision
+                )
+                partials.append(partial)
+            output_chunks.append(_mock_allreduce(partials))
+
+        return ShardedTensor(output_chunks, partition_dim=out_dim)
 
     # ------------------------------------------------------------------ #
     # Output-parallel path                                                 #
@@ -213,10 +280,9 @@ def _execute_sharded(
         return ShardedTensor(results, partition_dim=out_dim)
 
     # ------------------------------------------------------------------ #
-    # Reduce-parallel path                                                 #
+    # Pure reduce-parallel path                                            #
     # ------------------------------------------------------------------ #
-    rp_chars = {v[0] for v in reduce_parallel.values()}
-    rp_n_shards = {v[1].n_shards for v in reduce_parallel.values()}
+    # rp_chars and rp_n_shards_set already computed above.
 
     if HAS_NKI:
         shard_char = next(iter(rp_chars))
@@ -228,7 +294,7 @@ def _execute_sharded(
             "dimension) until then."
         )
 
-    if len(rp_chars) > 1 or len(rp_n_shards) > 1:
+    if len(rp_chars) > 1 or len(rp_n_shards_set) > 1:
         raise NotImplementedError(
             "Multiple reduce-parallel ShardedTensor operands must all be partitioned "
             "along the same contracted dimension with the same n_shards."

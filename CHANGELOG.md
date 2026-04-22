@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-04-22
+
+### Added
+
+- **Mixed output-parallel + reduce-parallel sharding** — ``einsum()`` now
+  supports einsums where some ``ShardedTensor`` operands are partitioned along
+  an output dimension (output-parallel) and others along a contracted dimension
+  (reduce-parallel) in the same call.
+
+  The dispatch uses a nested loop: for each output shard ``s``, partial
+  contractions over all reduce shards are accumulated via
+  :func:`~trntensor.parallel._mock_allreduce` and the result becomes output
+  chunk ``s``. The return value is a ``ShardedTensor`` partitioned along the
+  output dimension.
+
+  Operands that are neither sharded but share the contracted index are
+  co-partitioned automatically (same behavior as pure reduce-parallel).
+  Output-parallel operand chunks are also co-partitioned along the contracted
+  index when they span it.
+
+  On Trainium (``HAS_NKI=True``) the gate is unchanged — the inner all-reduce
+  still requires ``nki.collectives`` (Neuron SDK 2.30+).
+
+  3-operand and higher chains work naturally: the inner recursive ``einsum()``
+  call receives dense operands and dispatches through the normal path.
+
+### Notes
+
+Mixed output-parallel + reduce-parallel with ``HAS_NKI=True`` raises
+``NotImplementedError`` with the same ``nki.collectives`` message as pure
+reduce-parallel. SDK 2.30+ unblocks both simultaneously.
+
 ## [0.11.0] — 2026-04-21
 
 ### Added
