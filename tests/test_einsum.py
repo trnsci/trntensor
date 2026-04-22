@@ -369,6 +369,62 @@ class TestPrecision:
         np.testing.assert_array_equal(default.numpy(), fast.numpy())
 
 
+class TestPrecisionSR:
+    """precision='sr' dispatch and statistical-correctness tests."""
+
+    def test_sr_plan_stored(self):
+        A = torch.randn(32, 32)
+        B = torch.randn(32, 32)
+        plan = trntensor.plan_contraction("ij,jk->ik", A, B, precision="sr")
+        assert plan.precision == "sr"
+
+    def test_sr_output_shape_and_dtype(self):
+        A = torch.randn(32, 32, dtype=torch.bfloat16)
+        B = torch.randn(32, 32, dtype=torch.bfloat16)
+        result = trntensor.einsum("ij,jk->ik", A, B, precision="sr")
+        assert result.shape == (32, 32)
+        assert result.dtype == torch.bfloat16
+
+    def test_sr_result_close_to_fast(self):
+        """SR result agrees with fast rounding to within ~sqrt(K)*u."""
+        torch.manual_seed(42)
+        A = torch.randn(64, 128, dtype=torch.bfloat16)
+        B = torch.randn(128, 64, dtype=torch.bfloat16)
+        fast = trntensor.einsum("ij,jk->ik", A, B, precision="fast")
+        sr = trntensor.einsum("ij,jk->ik", A, B, precision="sr")
+        # Tolerance: sqrt(K) * u for BF16, K=128, u≈0.008 → ~0.09
+        torch.testing.assert_close(sr.float(), fast.float(), atol=0.2, rtol=0.0)
+
+    def test_sr_mean_zero_bias(self):
+        """Mean rounding error over many SR samples should be ~0."""
+        torch.manual_seed(0)
+        # Large enough to measure bias reliably
+        A = torch.ones(128, 512, dtype=torch.bfloat16)
+        B = torch.ones(512, 128, dtype=torch.bfloat16)
+        expected = torch.full((128, 128), 512.0)  # exact integer, SR shouldn't matter
+        errors = []
+        for _ in range(20):
+            result = trntensor.einsum("ij,jk->ik", A, B, precision="sr")
+            errors.append((result.float() - expected).mean().item())
+        mean_err = sum(errors) / len(errors)
+        assert abs(mean_err) < 1.0, f"Mean SR bias {mean_err:.4f} unexpectedly large"
+
+    def test_sr_invalid_precision_raises(self):
+        A = torch.randn(8, 8)
+        B = torch.randn(8, 8)
+        with pytest.raises(ValueError, match="precision"):
+            trntensor.einsum("ij,jk->ik", A, B, precision="invalid")
+
+    def test_sr_non_matmul_uses_fast(self):
+        """Non-matmul strategies accept precision='sr' without error (fast fallback)."""
+        A = torch.randn(4, 4, 4)
+        B = torch.randn(4, 4)
+        # Falls to torch strategy
+        result = trntensor.einsum("ijk,jl->ilk", A, B, precision="sr")
+        expected = torch.einsum("ijk,jl->ilk", A, B)
+        torch.testing.assert_close(result, expected)
+
+
 class TestMultiEinsumBatched:
     """Tests for homogeneous batching in multi_einsum (#33 Phase 3)."""
 

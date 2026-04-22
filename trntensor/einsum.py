@@ -90,6 +90,9 @@ def einsum(
 
         # High-precision accumulation (fp64 internally, result in original dtype)
         einsum("ij,jk->ik", A, B, precision="kahan")
+
+        # Stochastic rounding: correctness requirement for BF16 K ≥ ~300
+        einsum("ij,jk->ik", A, B, precision="sr")
     """
     # Early detection: ShardedTensor operands route to the sharded dispatch path.
     from .parallel import ShardedTensor
@@ -291,7 +294,7 @@ def _execute_matmul(subscripts: str, operands: tuple, plan: ContractionPlan) -> 
     A, B = operands
     a = A.T if plan.transA else A
     b = B.T if plan.transB else B
-    return nki_matmul(a, b)
+    return nki_matmul(a, b, use_sr=(plan.precision == "sr"))
 
 
 def _execute_bmm(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:

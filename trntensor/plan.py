@@ -36,7 +36,7 @@ class ContractionPlan:
     # Greedy-optimal order for 3+ operand einsums. Each (i, j) pair refers to
     # indices in the CURRENT operand list at that step (opt_einsum convention):
     # contract ops[i] and ops[j], remove both, append the result.
-    precision: str = "fast"  # "fast" | "kahan" | "dd"
+    precision: str = "fast"  # "fast" | "kahan" | "dd" | "sr"
 
 
 def _backend_for(strategy: str, operands: tuple) -> str:
@@ -153,10 +153,14 @@ def plan_contraction(
             and may route to NKI kernels. ``"kahan"`` promotes operands to fp64
             before contracting and casts the result back to the original dtype.
             ``"dd"`` requests double-double accumulation (not yet available).
+            ``"sr"`` applies stochastic rounding at the PSUM→SBUF downcast step
+            in the NKI matmul kernel — reduces accumulation bias for long
+            K-reductions in BF16 (correctness requirement for K ≥ ~300).
+            Only affects the ``matmul`` strategy; other strategies use fast rounding.
     """
     _validate_subscripts(subscripts, operands)
-    if precision not in ("fast", "kahan", "dd"):
-        raise ValueError(f"precision must be 'fast', 'kahan', or 'dd', got {precision!r}")
+    if precision not in ("fast", "kahan", "dd", "sr"):
+        raise ValueError(f"precision must be 'fast', 'kahan', 'dd', or 'sr', got {precision!r}")
     key = _shape_key(subscripts, operands, precision)
     if key in _PLAN_CACHE:
         return _PLAN_CACHE[key]

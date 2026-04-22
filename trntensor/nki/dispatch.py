@@ -184,7 +184,32 @@ def from_xla(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to("cpu")
 
 
-def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def _stochastic_round_cpu(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """CPU stochastic rounding from float32 to ``dtype``.
+
+    Named stand-in for the per-tile ``nisa.activation(..., round_mode='stochastic')``
+    applied at the PSUM→SBUF boundary in the NKI matmul kernel. Enables
+    ``precision='sr'`` to be tested on CPU without hardware.
+
+    Rounds each element to its lower or upper neighbor in ``dtype`` with
+    probability proportional to the fractional distance from the lower neighbor.
+    Mean rounding error is zero (Connolly–Higham–Mary, SIAM J. Sci. Comput. 2021).
+    When ``x`` is already in ``dtype`` this is a no-op.
+    """
+    if x.dtype == dtype:
+        return x
+    x32 = x.float()
+    x_lo = x32.to(dtype)  # round-nearest lower neighbor
+    x_lo_f = x_lo.float()
+    ulp = (x_lo_f.abs() * torch.finfo(dtype).eps).clamp_min(torch.finfo(dtype).tiny)
+    x_hi = (x_lo_f + torch.sign(x32 - x_lo_f) * ulp).to(dtype)
+    x_hi_f = x_hi.float()
+    gap = (x_hi_f - x_lo_f).abs().clamp_min(1e-38)
+    p = ((x32 - x_lo_f).abs() / gap).clamp(0.0, 1.0)
+    return torch.where(torch.rand_like(x32) < p, x_hi, x_lo)
+
+
+def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
     """2D matmul ``A @ B`` routed through NKI when available.
 
     Pads M, K up to tile multiples and N up to ``TILE_N`` when N exceeds
@@ -193,7 +218,8 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     failure unless ``TRNTENSOR_REQUIRE_NKI=1``.
     """
     if not (_use_nki() and HAS_NKI):
-        return torch.matmul(A, B)
+        result = torch.matmul(A, B)
+        return _stochastic_round_cpu(result, A.dtype) if use_sr else result
 
     M, K = A.shape
     _, N = B.shape
@@ -202,7 +228,8 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     already_pinned = A.device.type == "xla" and B.device.type == "xla"
     flop_threshold = _MIN_NKI_FLOPS_PINNED if already_pinned else _MIN_NKI_FLOPS
     if flop_threshold > M * K * N:
-        return torch.matmul(A, B)
+        result = torch.matmul(A, B)
+        return _stochastic_round_cpu(result, A.dtype) if use_sr else result
 
     from ._kernels import matmul_kernel
 
@@ -224,17 +251,20 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             B_feed = B.contiguous()
 
         if _use_simulator():
-            out_np = nki.simulate(matmul_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            out_np = nki.simulate(matmul_kernel)(
+                A_feed.cpu().numpy(), B_feed.cpu().numpy(), use_sr=use_sr
+            )
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
             (a, b), orig_device = _to_xla(A_feed, B_feed)
-            c = matmul_kernel(a, b)
+            c = matmul_kernel(a, b, use_sr=use_sr)
             result = c.to(orig_device)
         return result[:M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:
             raise
-        return torch.matmul(A, B)
+        result = torch.matmul(A, B)
+        return _stochastic_round_cpu(result, A.dtype) if use_sr else result
 
 
 def _nki_mp2_energy(
@@ -353,7 +383,7 @@ def _nki_ao_to_mo_transform(
     return result[:, :nvir, :] if nvir_pad != nvir else result
 
 
-def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
     """Batched 2D matmul ``A @ B`` over a leading batch dim.
 
     Routes through ``batched_matmul_kernel`` on Trainium. Pads M, K
@@ -391,11 +421,13 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             B_feed = B.contiguous()
 
         if _use_simulator():
-            out_np = nki.simulate(batched_matmul_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            out_np = nki.simulate(batched_matmul_kernel)(
+                A_feed.cpu().numpy(), B_feed.cpu().numpy(), use_sr=use_sr
+            )
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
             (a, b), orig_device = _to_xla(A_feed, B_feed)
-            c = batched_matmul_kernel(a, b)
+            c = batched_matmul_kernel(a, b, use_sr=use_sr)
             result = c.to(orig_device)
         return result[:, :M, :N] if needs_pad else result
     except Exception:

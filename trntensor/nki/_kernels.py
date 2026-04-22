@@ -33,12 +33,19 @@ TILE_N = 512
 if HAS_NKI:
 
     @nki.jit
-    def matmul_kernel(a, b):
+    def matmul_kernel(a, b, use_sr: bool = False):
         """``C = A @ B`` with stationary-A tile reuse.
 
         Caller guarantees M, K are multiples of ``TILE_M``/``TILE_K`` and N
         is either ≤ ``TILE_N`` or a clean multiple of ``TILE_N``. PSUM
         accumulates over K-tiles before the single store per (m, n) pair.
+
+        When ``use_sr=True``, the PSUM→SBUF downcast uses
+        ``nisa.activation(..., round_mode="stochastic")`` instead of
+        ``nisa.tensor_copy``. This is a correctness requirement for BF16
+        dot products with K ≥ ~300 (Connolly–Higham–Mary, SIAM J. Sci.
+        Comput. 2021): stochastic rounding replaces Wilkinson's n·u
+        worst-case bias with a mean-zero √n·u bound.
         """
         M, K = a.shape
         _, N = b.shape
@@ -66,7 +73,17 @@ if HAS_NKI:
                 # fresh SBUF tile and nisa.tensor_copy PSUM into it before
                 # the HBM store.
                 c_sbuf = nl.ndarray((tile_m, tile_n), dtype=a.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                if use_sr:
+                    nisa.activation(
+                        psum,
+                        bias=None,
+                        scale=1.0,
+                        out_dtype=a.dtype,
+                        round_mode="stochastic",
+                        dst=c_sbuf,
+                    )
+                else:
+                    nisa.tensor_copy(src=psum, dst=c_sbuf)
                 nl.store(
                     c[m_off : m_off + tile_m, n_off : n_off + tile_n],
                     value=c_sbuf,
@@ -75,12 +92,14 @@ if HAS_NKI:
         return c
 
     @nki.jit
-    def batched_matmul_kernel(a, b):
+    def batched_matmul_kernel(a, b, use_sr: bool = False):
         """Batched ``C[b] = A[b] @ B[b]`` — one matmul per batch slice.
 
         Caller pads (M, K, N) the same way as ``matmul_kernel``. The
         batch dim is iterated with ``nl.affine_range``; each slice
-        reuses the stationary-A tile layout.
+        reuses the stationary-A tile layout. ``use_sr`` applies
+        stochastic rounding at the PSUM→SBUF downcast (see
+        ``matmul_kernel`` for the correctness motivation).
         """
         B, M, K = a.shape
         _, _, N = b.shape
@@ -108,7 +127,17 @@ if HAS_NKI:
                         nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
 
                     c_sbuf = nl.ndarray((tile_m, tile_n), dtype=a.dtype, buffer=nl.sbuf)
-                    nisa.tensor_copy(src=psum, dst=c_sbuf)
+                    if use_sr:
+                        nisa.activation(
+                            psum,
+                            bias=None,
+                            scale=1.0,
+                            out_dtype=a.dtype,
+                            round_mode="stochastic",
+                            dst=c_sbuf,
+                        )
+                    else:
+                        nisa.tensor_copy(src=psum, dst=c_sbuf)
                     nl.store(
                         c[batch, m_off : m_off + tile_m, n_off : n_off + tile_n],
                         value=c_sbuf,

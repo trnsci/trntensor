@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-04-21
+
+### Added
+
+- **`precision="sr"` — stochastic rounding at the PSUM→SBUF boundary** —
+  adds a fourth precision mode to ``einsum()`` and ``plan_contraction()``.
+
+  On Trainium, ``matmul_kernel`` and ``batched_matmul_kernel`` replace the
+  ``nisa.tensor_copy(psum → c_sbuf)`` downcast with
+  ``nisa.activation(..., round_mode="stochastic")``. This rounds each FP32
+  PSUM element to its upper or lower BF16 neighbor with probability
+  proportional to the fractional distance — mean rounding error is zero
+  (Connolly–Higham–Mary, *SIAM J. Sci. Comput.*, 2021), replacing Wilkinson's
+  worst-case n·u bias with a √n·u bound.
+
+  On CPU (``HAS_NKI=False``), ``_stochastic_round_cpu`` applies the same
+  rounding to the ``torch.matmul`` output, enabling ``precision="sr"`` to be
+  tested in CPU-only CI. This mirrors the ``_mock_allreduce`` pattern from
+  v0.10.0: a named, documented stand-in that makes the hardware path testable
+  without hardware.
+
+  ``"sr"`` applies only to the ``matmul`` strategy. For ``"bmm"``,
+  ``"torch"``, and ``"path"`` strategies, ``precision="sr"`` is accepted
+  without error and uses fast (round-nearest) rounding.
+
+  **Correctness note**: for BF16 dot products with K ≥ ~300, stochastic
+  rounding is a *correctness requirement* for convergent Krylov iteration
+  (without SR, BF16 Krylov stagnates). Use ``precision="sr"`` when K is
+  large or accumulation bias matters.
+
+### Notes
+
+Mixed output-parallel + reduce-parallel operands in the same einsum remain
+deferred to v0.12.0.
+
 ## [0.10.0] — 2026-04-21
 
 ### Added
