@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-04-22
+
+### Fixed
+
+- **`precision="sr"` now honored for the `bmm` strategy** — `_execute_bmm`
+  was calling ``nki_batched_matmul(A, B)`` without ``use_sr``, ignoring
+  ``plan.precision``. The NKI kernel already supported ``use_sr`` since
+  v0.11.0; the dispatch layer just didn't thread it through.
+
+### Added
+
+- **`precision=` kwarg for `multi_einsum()`** — all contractions in a
+  ``multi_einsum`` call now share the same precision mode. The homogeneous
+  batching path (``_try_batched_multi_einsum``) passes ``use_sr`` to
+  ``nki_batched_matmul`` when ``precision="sr"``; ``"kahan"`` and ``"dd"``
+  fall through to the per-contraction loop which handles them correctly.
+
+### Notes
+
+``precision=`` is now uniformly honored across all dispatch paths: single
+matmul (`einsum` → `_execute_matmul`), batched matmul (`einsum` →
+`_execute_bmm`), path execution (`einsum` → `_execute_path` → recursive
+`einsum`), and multi-contraction (`multi_einsum`).
+
 ## [0.12.0] — 2026-04-22
 
 ### Added

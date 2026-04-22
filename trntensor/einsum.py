@@ -368,7 +368,7 @@ def _execute_bmm(subscripts: str, operands: tuple, plan: ContractionPlan) -> tor
     from .nki.dispatch import nki_batched_matmul
 
     A, B = operands
-    return nki_batched_matmul(A, B)
+    return nki_batched_matmul(A, B, use_sr=(plan.precision == "sr"))
 
 
 def _execute_path(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
@@ -427,7 +427,9 @@ def _execute_path(subscripts: str, operands: tuple, plan: ContractionPlan) -> to
     return ops[0]
 
 
-def _try_batched_multi_einsum(contractions: list) -> list[torch.Tensor] | None:
+def _try_batched_multi_einsum(
+    contractions: list, precision: str = "fast"
+) -> list[torch.Tensor] | None:
     """Batch homogeneous 2D matmul contractions into a single dispatch.
 
     Returns a result list when all contractions share the same subscript,
@@ -438,7 +440,12 @@ def _try_batched_multi_einsum(contractions: list) -> list[torch.Tensor] | None:
     Amortizes the ~0.67 ms fixed XLA dispatch latency across N contractions:
     instead of N individual ``nki_matmul`` calls each paying that overhead,
     the stack is dispatched once via ``nki_batched_matmul``.
+
+    Only optimizes ``"fast"`` and ``"sr"`` precision; ``"kahan"`` and ``"dd"``
+    fall through to the per-contraction loop which handles them correctly.
     """
+    if precision not in ("fast", "sr"):
+        return None
     if len(contractions) < 2:
         return None
     subscripts = contractions[0][0]
@@ -457,7 +464,7 @@ def _try_batched_multi_einsum(contractions: list) -> list[torch.Tensor] | None:
 
     A_stack = torch.stack([c[1].T if plan.transA else c[1] for c in contractions])
     B_stack = torch.stack([c[2].T if plan.transB else c[2] for c in contractions])
-    out_stack = nki_batched_matmul(A_stack, B_stack)
+    out_stack = nki_batched_matmul(A_stack, B_stack, use_sr=(precision == "sr"))
     if out_stack.device.type == "xla":
         from .nki.dispatch import from_xla
 
@@ -465,7 +472,7 @@ def _try_batched_multi_einsum(contractions: list) -> list[torch.Tensor] | None:
     return [out_stack[i] for i in range(len(contractions))]
 
 
-def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
+def multi_einsum(*contractions: tuple, precision: str = "fast") -> list[torch.Tensor]:
     """Execute multiple contractions, fusing where possible.
 
     Each contraction is (subscripts, *operands).
@@ -481,10 +488,18 @@ def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
     across the batch. Heterogeneous contractions fall through to the
     per-contraction loop.
 
+    Args:
+        *contractions: Each element is ``(subscripts, *operands)``.
+        precision: Accumulation precision applied to every contraction.
+            ``"fast"`` (default), ``"kahan"``, ``"sr"``, or ``"dd"``.
+            Homogeneous batching is only attempted for ``"fast"`` and
+            ``"sr"``; other modes fall through to the per-contraction loop.
+
     Useful for DF-MP2 where many independent contractions share operands:
         results = multi_einsum(
             ("iap,jbp->ijab", B, B),
             ("ibp,jap->ijab", B, B),  # Exchange term
+            precision="sr",
         )
     """
     from .nki.dispatch import HAS_NKI, _use_nki
@@ -510,7 +525,7 @@ def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
     subst = [(c[0], *(xla_map.get(id(op), op) for op in c[1:])) for c in contractions]
 
     # Try homogeneous batching: N same-shape matmuls → one batched dispatch
-    batched = _try_batched_multi_einsum(subst)
+    batched = _try_batched_multi_einsum(subst, precision=precision)
     if batched is not None:
         return batched
 
@@ -519,7 +534,7 @@ def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
     for c in subst:
         subscripts = c[0]
         ops = c[1:]
-        result = einsum(subscripts, *ops)
+        result = einsum(subscripts, *ops, precision=precision)
         if hasattr(result, "device") and result.device.type == "xla":
             from .nki.dispatch import from_xla
 

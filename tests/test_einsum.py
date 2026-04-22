@@ -424,6 +424,35 @@ class TestPrecisionSR:
         expected = torch.einsum("ijk,jl->ilk", A, B)
         torch.testing.assert_close(result, expected)
 
+    def test_sr_bmm_shape_and_dtype(self):
+        """precision='sr' is honored for batched matmul (bmm strategy)."""
+        A = torch.randn(4, 16, 32, dtype=torch.bfloat16)
+        B = torch.randn(4, 32, 16, dtype=torch.bfloat16)
+        result = trntensor.einsum("bij,bjk->bik", A, B, precision="sr")
+        assert result.shape == (4, 16, 16)
+        assert result.dtype == torch.bfloat16
+
+    def test_sr_bmm_close_to_fast(self):
+        """SR bmm result agrees with fast rounding to within ~sqrt(K)*u."""
+        torch.manual_seed(42)
+        A = torch.randn(4, 32, 64, dtype=torch.bfloat16)
+        B = torch.randn(4, 64, 32, dtype=torch.bfloat16)
+        fast = trntensor.einsum("bij,bjk->bik", A, B, precision="fast")
+        sr = trntensor.einsum("bij,bjk->bik", A, B, precision="sr")
+        torch.testing.assert_close(sr.float(), fast.float(), atol=0.3, rtol=0.0)
+
+    def test_sr_multi_einsum_threads_precision(self):
+        """multi_einsum precision='sr' threads through to each contraction."""
+        torch.manual_seed(99)
+        A = torch.randn(32, 64, dtype=torch.bfloat16)
+        B = torch.randn(64, 32, dtype=torch.bfloat16)
+        results_sr = trntensor.multi_einsum(("ij,jk->ik", A, B), precision="sr")
+        results_fast = trntensor.multi_einsum(("ij,jk->ik", A, B))
+        assert results_sr[0].dtype == torch.bfloat16
+        torch.testing.assert_close(
+            results_sr[0].float(), results_fast[0].float(), atol=0.2, rtol=0.0
+        )
+
 
 class TestMultiEinsumBatched:
     """Tests for homogeneous batching in multi_einsum (#33 Phase 3)."""
