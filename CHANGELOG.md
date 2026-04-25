@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-04-24
+
+### Added
+
+- **`precision="dd"` on CPU — Ozaki-2 splitting** — lifts the unconditional
+  ``NotImplementedError`` for double-double accumulation on CPU.
+
+  ``_ozaki_split_cpu(A, k)`` splits a FP32 tensor into ``k`` BF16-precision
+  summands using the Ogita–Rump–Oishi error-free split: at each step,
+  ``s = round_bfloat16(remainder)`` and ``remainder -= s`` (exact by Sterbenz's
+  lemma since ``|remainder|/|s| ∈ [0.5, 2]``). ``_ozaki_matmul_cpu(A, B, k=2)``
+  computes ``k²`` FP32 matmuls of the summand pairs and sums in FP32, achieving
+  forward error O(K · u_bf² · |C|) vs O(K · u_bf · |C|) for a single BF16
+  matmul — substantially more accurate for large K.
+
+  On CPU (``HAS_NKI=False``): ``precision="dd"`` routes the ``matmul`` strategy
+  through ``_ozaki_matmul_cpu``; the ``path`` strategy propagates ``precision="dd"``
+  recursively so each binary matmul step uses Ozaki; ``bmm`` and ``torch``
+  strategies fall back to kahan (fp64 promotion).
+
+  On Trainium (``HAS_NKI=True``): ``NotImplementedError`` preserved — the fused
+  NKI version requires trnblas Phase 2 double-double GEMM kernels (trnblas#22),
+  which hold both the main and correction PSUM tiles simultaneously in one NKI
+  program rather than dispatching four separate kernel calls.
+
+  Same named-mock pattern as ``_stochastic_round_cpu`` (SR, v0.11.0) and
+  ``_mock_allreduce`` (reduce-parallel, v0.10.0).
+
+### Notes
+
+The remaining ``NotImplementedError`` for ``precision="dd"`` on Trainium gates
+on trnblas#22. The CPU contract is now fully testable.
+
 ## [0.13.0] — 2026-04-22
 
 ### Fixed

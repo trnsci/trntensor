@@ -157,6 +157,13 @@ def plan_contraction(
             in the NKI matmul kernel — reduces accumulation bias for long
             K-reductions in BF16 (correctness requirement for K ≥ ~300).
             Only affects the ``matmul`` strategy; other strategies use fast rounding.
+            ``"dd"`` double-double accumulation via Ogita–Rump–Oishi error-free
+            split: splits each FP32 operand into two BF16-precision summands,
+            computes four BF16-precision matmuls, sums in FP32.
+            On CPU: ``_ozaki_matmul_cpu`` (named mock for trnblas#22).
+            Applies to ``matmul`` strategy; ``path`` execution propagates to binary
+            matmul steps; ``bmm`` and ``torch`` strategies fall back to kahan.
+            On Trainium: requires trnblas Phase 2 GEMM kernels (trnblas#22).
     """
     _validate_subscripts(subscripts, operands)
     if precision not in ("fast", "kahan", "dd", "sr"):

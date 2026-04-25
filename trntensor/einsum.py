@@ -333,10 +333,27 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
         result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
         return result.to(orig_dtype)
     elif plan.precision == "dd":
-        raise NotImplementedError(
-            "precision='dd' requires trnblas Phase 2 double-double GEMM kernels; "
-            "use precision='kahan' (fp64 accumulation) as an alternative."
-        )
+        from .nki.dispatch import HAS_NKI, _ozaki_matmul_cpu
+
+        if HAS_NKI:
+            raise NotImplementedError(
+                "precision='dd' on Trainium requires trnblas Phase 2 double-double "
+                "GEMM kernels (trnblas#22). Use precision='kahan' (fp64 accumulation) "
+                "as an alternative."
+            )
+        # CPU: Ozaki-2 for matmul; recurse for path (binary steps get Ozaki);
+        # kahan fallback for bmm and torch strategies.
+        if plan.strategy == "matmul":
+            A, B = operands
+            a = A.T if plan.transA else A
+            b = B.T if plan.transB else B
+            result = _ozaki_matmul_cpu(a.float(), b.float(), k=2)
+            return result.to(A.dtype)
+        if plan.strategy == "path":
+            return _execute_path(subscripts, operands, plan)
+        orig_dtype = operands[0].dtype if operands else torch.float32
+        result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
+        return result.to(orig_dtype)
     if plan.strategy == "torch":
         return torch.einsum(subscripts, *operands)
     elif plan.strategy == "bmm":

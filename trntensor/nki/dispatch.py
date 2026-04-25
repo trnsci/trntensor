@@ -209,6 +209,47 @@ def _stochastic_round_cpu(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return torch.where(torch.rand_like(x32) < p, x_hi, x_lo)
 
 
+def _ozaki_split_cpu(A: torch.Tensor, k: int = 2) -> list[torch.Tensor]:
+    """Split FP32 tensor into k BF16-precision summands (stored as FP32).
+
+    CPU stand-in for the per-tile Ogita–Rump–Oishi error-free split used by
+    the trnblas Phase 2 double-double GEMM kernel (trnblas#22). Each summand
+    holds only BF16-precision information; their sum reconstructs A to FP32
+    working precision. The subtraction at each stage is exact by Sterbenz's
+    lemma: since s = round_bfloat16(remainder) satisfies |s - remainder| ≤
+    u_bf·|s|, the ratio |remainder|/|s| lies in [0.5, 2], meeting the lemma's
+    condition for exact FP32 subtraction.
+    """
+    remainder = A.float()
+    summands: list[torch.Tensor] = []
+    for _ in range(k):
+        s = remainder.to(torch.bfloat16).float()
+        summands.append(s)
+        remainder = remainder - s
+    return summands
+
+
+def _ozaki_matmul_cpu(A: torch.Tensor, B: torch.Tensor, k: int = 2) -> torch.Tensor:
+    """Ozaki-k matmul: accumulates k² BF16-precision products in FP32.
+
+    CPU stand-in for nki_matmul with the trnblas Phase 2 double-double GEMM
+    kernel (trnblas#22). Splits each FP32 operand into k BF16-precision
+    summands, computes k² matmuls of those summands, and sums the results in
+    FP32. Achieves forward error O(K · u_bf^k · |C|) vs O(K · u_bf · |C|)
+    for a single BF16 matmul — substantially more accurate for large K.
+
+    The fused NKI version (trnblas#22) holds both main and correction tiles
+    simultaneously in PSUM rather than dispatching k² separate kernel calls.
+    """
+    A_splits = _ozaki_split_cpu(A, k)
+    B_splits = _ozaki_split_cpu(B, k)
+    result = torch.zeros(A.shape[0], B.shape[1], dtype=torch.float32, device=A.device)
+    for Ai in A_splits:
+        for Bj in B_splits:
+            result = result + torch.matmul(Ai, Bj)
+    return result
+
+
 def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
     """2D matmul ``A @ B`` routed through NKI when available.
 

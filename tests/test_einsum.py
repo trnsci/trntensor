@@ -352,11 +352,11 @@ class TestPrecision:
         # kahan goes through fp64 internally so it is exact (or very close)
         assert err_kahan <= err_fast + 1e-3
 
-    def test_dd_raises(self):
-        """precision='dd' raises NotImplementedError pointing to 'kahan'."""
+    def test_dd_cpu_no_longer_raises(self):
+        """precision='dd' computes correctly on CPU via Ozaki-2 (v0.14.0)."""
         A, B = torch.randn(4, 3), torch.randn(3, 5)
-        with pytest.raises(NotImplementedError, match="kahan"):
-            trntensor.einsum("ij,jk->ik", A, B, precision="dd")
+        result = trntensor.einsum("ij,jk->ik", A, B, precision="dd")
+        assert result.shape == (4, 5)
 
     def test_fast_unchanged(self):
         """precision='fast' produces the same result as the default (no kwarg)."""
@@ -452,6 +452,65 @@ class TestPrecisionSR:
         torch.testing.assert_close(
             results_sr[0].float(), results_fast[0].float(), atol=0.2, rtol=0.0
         )
+
+
+class TestPrecisionDD:
+    """precision='dd' Ozaki-2 dispatch and accuracy tests (CPU mock)."""
+
+    def test_dd_plan_stored(self):
+        A = torch.randn(32, 32)
+        B = torch.randn(32, 32)
+        plan = trntensor.plan_contraction("ij,jk->ik", A, B, precision="dd")
+        assert plan.precision == "dd"
+
+    def test_dd_output_shape_and_dtype_fp32(self):
+        A = torch.randn(32, 64, dtype=torch.float32)
+        B = torch.randn(64, 32, dtype=torch.float32)
+        result = trntensor.einsum("ij,jk->ik", A, B, precision="dd")
+        assert result.shape == (32, 32)
+        assert result.dtype == torch.float32
+
+    def test_dd_more_accurate_than_fast_bf16(self):
+        """DD achieves smaller error vs FP32 reference than single BF16 matmul."""
+        torch.manual_seed(7)
+        A = torch.randn(64, 512, dtype=torch.float32)
+        B = torch.randn(512, 64, dtype=torch.float32)
+        expected = A @ B
+
+        fast_err = (
+            (
+                trntensor.einsum("ij,jk->ik", A.bfloat16(), B.bfloat16(), precision="fast").float()
+                - expected
+            )
+            .abs()
+            .mean()
+        )
+        dd_err = (trntensor.einsum("ij,jk->ik", A, B, precision="dd") - expected).abs().mean()
+
+        assert (
+            dd_err < fast_err
+        ), f"DD error {dd_err:.4f} should be less than fast BF16 error {fast_err:.4f}"
+
+    def test_dd_nki_still_raises(self, monkeypatch):
+        """On NKI hardware, precision='dd' raises NotImplementedError (trnblas#22)."""
+        import trntensor.nki.dispatch as _nd
+
+        monkeypatch.setattr(_nd, "HAS_NKI", True)
+        A = torch.randn(8, 8)
+        B = torch.randn(8, 8)
+        with pytest.raises(NotImplementedError, match="trnblas"):
+            trntensor.einsum("ij,jk->ik", A, B, precision="dd")
+
+    def test_dd_path_strategy_propagates(self):
+        """3-operand chain with precision='dd' propagates to binary matmul steps."""
+        torch.manual_seed(3)
+        A = torch.randn(16, 32, dtype=torch.float32)
+        B = torch.randn(32, 16, dtype=torch.float32)
+        C = torch.randn(16, 8, dtype=torch.float32)
+        result = trntensor.einsum("ij,jk,kl->il", A, B, C, precision="dd")
+        expected = A @ B @ C
+        assert result.shape == (16, 8)
+        torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
 
 
 class TestMultiEinsumBatched:
