@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-04-27
+
+### Added
+
+- **`target_forward_error=` kwarg for `einsum()`** — automatic precision
+  selection. Instead of specifying a precision mode manually, callers supply
+  a relative forward error bound and trntensor picks the cheapest mode whose
+  theoretical error bound satisfies it:
+
+  ```python
+  einsum("ij,jk->ik", A, B, target_forward_error=1e-4)
+  ```
+
+  Selection order (cheapest first): ``"fast"`` → ``"sr"`` → ``"dd"`` →
+  ``"kahan"``. Error bounds used (Higham 2002 §3, Connolly–Higham–Mary 2021):
+
+  - ``"fast"``:  K · u (Wilkinson worst-case)
+  - ``"sr"``:    √K · u (expected; mean-zero — statistical, not worst-case)
+  - ``"dd"``:    K · u² (Ozaki-2 worst-case)
+  - ``"kahan"``: K · u_f64 (FP64 Wilkinson worst-case)
+
+  Where K = product of contracted dimension sizes and u = unit roundoff for
+  the operand dtype (BF16: 2⁻⁸, FP16: 2⁻¹¹, FP32: 2⁻²⁴, FP64: 2⁻⁵³).
+  ``"sr"`` and ``"dd"`` are only considered for BF16 and FP16 inputs.
+
+  Raises ``ValueError`` when both ``precision=`` and ``target_forward_error=``
+  are given, or when no available mode can achieve the target.
+
+- **`select_precision_for_error(dtype, K, target_forward_error)`** — the
+  selector as a public API function (``trntensor.select_precision_for_error``).
+  Useful for inspecting which mode would be chosen without running the full
+  contraction.
+
+### Notes
+
+``target_forward_error=`` is a first step toward the suite-level
+``target_forward_error`` contract described in the architecture brief. The
+current implementation uses static bounds (Wilkinson/Connolly–Higham–Mary);
+adaptive error estimation (measuring actual residuals) is future work.
+
 ## [0.14.0] — 2026-04-24
 
 ### Added

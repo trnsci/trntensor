@@ -454,6 +454,55 @@ class TestPrecisionSR:
         )
 
 
+class TestTargetForwardError:
+    """target_forward_error= automatic precision selection."""
+
+    def test_large_k_bf16_selects_sr(self):
+        """K=512 BF16 with target=0.1 selects 'sr' (√512·u_bf ≈ 0.088 < 0.1)."""
+        A = torch.randn(16, 512, dtype=torch.bfloat16)
+        B = torch.randn(512, 16, dtype=torch.bfloat16)
+        result = trntensor.einsum("ij,jk->ik", A, B, target_forward_error=0.1)
+        assert result.shape == (16, 16)
+        assert result.dtype == torch.bfloat16
+
+    def test_small_k_selects_fast(self):
+        """K=4 BF16 with target=0.1 selects 'fast' (4·u_bf ≈ 0.016 < 0.1)."""
+        A = torch.randn(8, 4, dtype=torch.bfloat16)
+        B = torch.randn(4, 8, dtype=torch.bfloat16)
+        result = trntensor.einsum("ij,jk->ik", A, B, target_forward_error=0.1)
+        assert result.shape == (8, 8)
+
+    def test_tight_target_selects_dd(self):
+        """K=64 BF16 with target=0.003 selects 'dd' (64·u_bf² ≈ 0.00098 < 0.003)."""
+        A = torch.randn(16, 64, dtype=torch.bfloat16)
+        B = torch.randn(64, 16, dtype=torch.bfloat16)
+        result = trntensor.einsum("ij,jk->ik", A, B, target_forward_error=0.003)
+        assert result.shape == (16, 16)
+
+    def test_very_tight_selects_kahan(self):
+        """K=16 BF16 with target=1e-5 selects 'kahan' (all BF16 modes exceed 1e-5)."""
+        A = torch.randn(8, 16, dtype=torch.bfloat16)
+        B = torch.randn(16, 8, dtype=torch.bfloat16)
+        result = trntensor.einsum("ij,jk->ik", A, B, target_forward_error=1e-5)
+        # kahan promotes to fp64 — verify against kahan-explicit call
+        result_kahan = trntensor.einsum("ij,jk->ik", A, B, precision="kahan")
+        torch.testing.assert_close(result, result_kahan)
+
+    def test_ambiguous_raises(self):
+        """Specifying both precision= and target_forward_error= raises ValueError."""
+        A = torch.randn(8, 8)
+        B = torch.randn(8, 8)
+        with pytest.raises(ValueError, match="target_forward_error"):
+            trntensor.einsum("ij,jk->ik", A, B, precision="sr", target_forward_error=0.1)
+
+    def test_impossible_target_raises(self):
+        """Unachievable target raises ValueError naming 'kahan' as best available."""
+        A = torch.randn(4, 4, dtype=torch.bfloat16)
+        B = torch.randn(4, 4, dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="kahan"):
+            trntensor.einsum("ij,jk->ik", A, B, target_forward_error=1e-20)
+
+
 class TestPrecisionDD:
     """precision='dd' Ozaki-2 dispatch and accuracy tests (CPU mock)."""
 

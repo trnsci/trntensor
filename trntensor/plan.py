@@ -341,3 +341,66 @@ def estimate_flops(subscripts: str, *operands: torch.Tensor) -> int:
         flops *= index_sizes.get(idx, 1)
 
     return flops
+
+
+# Unit roundoffs by dtype (half machine epsilon, round-to-nearest convention).
+# Sources: IEEE 754-2019, Higham 2002 §2.2.
+_UNIT_ROUNDOFF: dict = {
+    torch.bfloat16: 2**-8,
+    torch.float16: 2**-11,
+    torch.float32: 2**-24,
+    torch.float64: 2**-53,
+}
+
+# Dtypes for which SR and Ozaki-DD are meaningful (NKI SR is BF16/FP16;
+# Ozaki splitting requires sub-FP32 precision to have correction terms).
+_SR_DD_DTYPES = (torch.bfloat16, torch.float16)
+
+
+def select_precision_for_error(dtype: torch.dtype, K: int, target_forward_error: float) -> str:
+    """Select the cheapest precision mode whose forward error bound ≤ target.
+
+    Selects from ``"fast"`` → ``"sr"`` → ``"dd"`` → ``"kahan"`` in order of
+    increasing cost. Returns the first mode whose theoretical error bound
+    satisfies ``target_forward_error``.
+
+    Args:
+        dtype: Operand dtype. Determines unit roundoff u.
+        K: Product of all contracted dimension sizes.
+        target_forward_error: Desired upper bound on relative forward error
+            per output element.
+
+    Returns:
+        ``"fast"``, ``"sr"``, ``"dd"``, or ``"kahan"``.
+
+    Raises:
+        ValueError: If even ``"kahan"`` (K · u_f64) cannot achieve the target.
+
+    Error bounds (Higham 2002 §3, Connolly–Higham–Mary SIAM 2021):
+
+    .. code-block:: text
+
+        "fast":  K · u              Wilkinson worst-case, round-to-nearest
+        "sr":    √K · u             Expected; mean-zero bias — statistical, not worst-case
+        "dd":    K · u²             Ozaki-2 worst-case
+        "kahan": K · 2⁻⁵³          FP64 Wilkinson worst-case
+
+    ``"sr"`` and ``"dd"`` are only considered for BF16 and FP16 inputs —
+    those are the dtypes where NKI SR and Ozaki splitting are meaningful.
+    """
+    u = _UNIT_ROUNDOFF.get(dtype, _UNIT_ROUNDOFF[torch.float32])
+    u_f64 = _UNIT_ROUNDOFF[torch.float64]
+
+    if K * u <= target_forward_error:
+        return "fast"
+    if dtype in _SR_DD_DTYPES and K**0.5 * u <= target_forward_error:
+        return "sr"
+    if dtype in _SR_DD_DTYPES and K * u * u <= target_forward_error:
+        return "dd"
+    if K * u_f64 <= target_forward_error:
+        return "kahan"
+    raise ValueError(
+        f"Cannot achieve target_forward_error={target_forward_error:.2e} for "
+        f"K={K}, dtype={dtype}. "
+        f"Best available: 'kahan' (K·u_f64 ≈ {K * u_f64:.2e})."
+    )

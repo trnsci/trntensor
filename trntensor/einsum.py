@@ -56,6 +56,7 @@ def einsum(
     out: torch.Tensor | None = None,
     dtype: str | torch.dtype | None = None,
     precision: str = "fast",
+    target_forward_error: float | None = None,
 ) -> torch.Tensor:
     """Einstein summation with contraction planning.
 
@@ -74,6 +75,12 @@ def einsum(
             Accepts ``torch.dtype`` instances or strings: ``"bf16"``,
             ``"bfloat16"``, ``"fp16"``, ``"float16"``, ``"f32"``, ``"float32"``.
             Matches Neuron SDK autocast recommendations for Trainium.
+        target_forward_error: Optional relative forward error bound. When set,
+            trntensor selects the cheapest precision mode whose theoretical
+            error bound satisfies the target: ``"fast"`` → ``"sr"`` → ``"dd"``
+            → ``"kahan"``. Cannot be combined with an explicit ``precision=``
+            argument. See :func:`~trntensor.select_precision_for_error` for
+            the exact error bounds used.
 
     Examples:
         # Matrix multiply
@@ -93,7 +100,29 @@ def einsum(
 
         # Stochastic rounding: correctness requirement for BF16 K ≥ ~300
         einsum("ij,jk->ik", A, B, precision="sr")
+
+        # Automatic precision selection: trntensor picks the cheapest mode
+        einsum("ij,jk->ik", A, B, target_forward_error=1e-4)
     """
+    if target_forward_error is not None:
+        if precision != "fast":
+            raise ValueError(
+                "Cannot specify both 'precision' and 'target_forward_error'. "
+                "Use one or the other."
+            )
+        from .plan import _parse_subscripts, select_precision_for_error
+
+        _input_str, _output_str = _parse_subscripts(subscripts)
+        _size_map: dict[str, int] = {}
+        for _term, _op in zip(_input_str.split(","), operands, strict=False):
+            for _c, _s in zip(_term, _op.shape, strict=False):
+                _size_map[_c] = int(_s)
+        _contracted = {c for c in _size_map if c not in _output_str}
+        K = 1
+        for c in _contracted:
+            K *= _size_map[c]
+        eff_dtype = _resolve_dtype(dtype) or (operands[0].dtype if operands else torch.float32)
+        precision = select_precision_for_error(eff_dtype, K, target_forward_error)
     # Early detection: ShardedTensor operands route to the sharded dispatch path.
     from .parallel import ShardedTensor
 
