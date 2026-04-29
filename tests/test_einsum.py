@@ -454,6 +454,71 @@ class TestPrecisionSR:
         )
 
 
+class TestTargetForwardErrorMultiEinsum:
+    """target_forward_error= for multi_einsum()."""
+
+    def test_tfe_basic_result_correct(self):
+        """multi_einsum with TFE produces correct result shape and dtype."""
+        A = torch.randn(8, 16, dtype=torch.bfloat16)
+        B = torch.randn(16, 8, dtype=torch.bfloat16)
+        results = trntensor.multi_einsum(("ij,jk->ik", A, B), target_forward_error=0.1)
+        assert len(results) == 1
+        assert results[0].shape == (8, 8)
+        assert results[0].dtype == torch.bfloat16
+
+    def test_tfe_matches_explicit_precision(self):
+        """K=16 BF16 target=1e-5 selects 'kahan'; result matches explicit kahan."""
+        torch.manual_seed(10)
+        A = torch.randn(8, 16, dtype=torch.bfloat16)
+        B = torch.randn(16, 8, dtype=torch.bfloat16)
+        results_tfe = trntensor.multi_einsum(("ij,jk->ik", A, B), target_forward_error=1e-5)
+        results_kahan = trntensor.multi_einsum(("ij,jk->ik", A, B), precision="kahan")
+        torch.testing.assert_close(results_tfe[0], results_kahan[0])
+
+    def test_tfe_heterogeneous_per_contraction(self):
+        """Two contractions with different K each resolve independently."""
+        torch.manual_seed(11)
+        # K=4 (fast region for BF16 at target=0.1) and K=512 (sr region)
+        A_small = torch.randn(8, 4, dtype=torch.bfloat16)
+        B_small = torch.randn(4, 8, dtype=torch.bfloat16)
+        A_large = torch.randn(8, 512, dtype=torch.bfloat16)
+        B_large = torch.randn(512, 8, dtype=torch.bfloat16)
+        results = trntensor.multi_einsum(
+            ("ij,jk->ik", A_small, B_small),
+            ("ij,jk->ik", A_large, B_large),
+            target_forward_error=0.1,
+        )
+        assert results[0].shape == (8, 8)
+        assert results[1].shape == (8, 8)
+
+    def test_tfe_ambiguous_raises(self):
+        """precision= + target_forward_error= raises ValueError."""
+        A = torch.randn(8, 8)
+        B = torch.randn(8, 8)
+        with pytest.raises(ValueError, match="target_forward_error"):
+            trntensor.multi_einsum(("ij,jk->ik", A, B), precision="sr", target_forward_error=0.1)
+
+    def test_tfe_homogeneous_batch_respected(self):
+        """Homogeneous batch with TFE uses resolved precision, not always fast."""
+        torch.manual_seed(12)
+        # K=16, BF16, target=1e-5 → should select kahan (not fast)
+        A = torch.randn(8, 16, dtype=torch.bfloat16)
+        B = torch.randn(16, 8, dtype=torch.bfloat16)
+        # Same operands → homogeneous batch eligible
+        results_tfe = trntensor.multi_einsum(
+            ("ij,jk->ik", A, B),
+            ("ij,jk->ik", A, B),
+            target_forward_error=1e-5,
+        )
+        results_kahan = trntensor.multi_einsum(
+            ("ij,jk->ik", A, B),
+            ("ij,jk->ik", A, B),
+            precision="kahan",
+        )
+        torch.testing.assert_close(results_tfe[0], results_kahan[0])
+        torch.testing.assert_close(results_tfe[1], results_kahan[1])
+
+
 class TestTargetForwardError:
     """target_forward_error= automatic precision selection."""
 

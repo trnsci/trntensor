@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-04-29
+
+### Added
+
+- **`target_forward_error=` for `multi_einsum()`** — extends the automatic
+  precision contract from v0.15.0 to multi-contraction calls.
+
+  For the per-contraction fallback path, each ``einsum()`` call resolves its
+  own K independently, so heterogeneous contractions (different subscripts or
+  operand shapes) each get the cheapest mode that satisfies the target for
+  *their* K. For the homogeneous batching path (same subscript, same shapes),
+  the mode is resolved once from the first contraction's K and dtype — which
+  equals all others in the batch.
+
+  Mutually exclusive with explicit ``precision=``, same as ``einsum()``.
+
 ## [0.15.0] — 2026-04-27
 
 ### Added

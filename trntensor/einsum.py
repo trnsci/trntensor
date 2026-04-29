@@ -518,7 +518,11 @@ def _try_batched_multi_einsum(
     return [out_stack[i] for i in range(len(contractions))]
 
 
-def multi_einsum(*contractions: tuple, precision: str = "fast") -> list[torch.Tensor]:
+def multi_einsum(
+    *contractions: tuple,
+    precision: str = "fast",
+    target_forward_error: float | None = None,
+) -> list[torch.Tensor]:
     """Execute multiple contractions, fusing where possible.
 
     Each contraction is (subscripts, *operands).
@@ -540,6 +544,12 @@ def multi_einsum(*contractions: tuple, precision: str = "fast") -> list[torch.Te
             ``"fast"`` (default), ``"kahan"``, ``"sr"``, or ``"dd"``.
             Homogeneous batching is only attempted for ``"fast"`` and
             ``"sr"``; other modes fall through to the per-contraction loop.
+        target_forward_error: Optional relative forward error bound. When set,
+            trntensor selects the cheapest precision mode per contraction.
+            For homogeneous batching the mode is resolved from the first
+            contraction's K and dtype (all share the same shape). For the
+            per-contraction fallback each call resolves independently.
+            Cannot be combined with an explicit ``precision=`` argument.
 
     Useful for DF-MP2 where many independent contractions share operands:
         results = multi_einsum(
@@ -548,6 +558,10 @@ def multi_einsum(*contractions: tuple, precision: str = "fast") -> list[torch.Te
             precision="sr",
         )
     """
+    if target_forward_error is not None and precision != "fast":
+        raise ValueError(
+            "Cannot specify both 'precision' and 'target_forward_error'. " "Use one or the other."
+        )
     from .nki.dispatch import HAS_NKI, _use_nki
 
     # Count appearances of each tensor object across all contractions
@@ -570,17 +584,40 @@ def multi_einsum(*contractions: tuple, precision: str = "fast") -> list[torch.Te
     # Build substituted contraction list with pre-pinned operands applied
     subst = [(c[0], *(xla_map.get(id(op), op) for op in c[1:])) for c in contractions]
 
+    # Pre-resolve target_forward_error → precision for the homogeneous batching
+    # path (_try_batched_multi_einsum accepts only precision=). All contractions
+    # in a homogeneous batch share the same subscript and operand shapes, so K
+    # is computed once from the first contraction.
+    batched_precision = precision
+    if target_forward_error is not None and subst:
+        from .plan import _parse_subscripts, select_precision_for_error
+
+        _c0 = subst[0]
+        _input_str, _output_str = _parse_subscripts(_c0[0])
+        _size_map: dict[str, int] = {}
+        for _term, _op in zip(_input_str.split(","), _c0[1:], strict=False):
+            for _ch, _sz in zip(_term, _op.shape, strict=False):
+                _size_map[_ch] = int(_sz)
+        _K = 1
+        for _ch in {_ch for _ch in _size_map if _ch not in _output_str}:
+            _K *= _size_map[_ch]
+        _dtype = _c0[1].dtype if len(_c0) > 1 else torch.float32
+        batched_precision = select_precision_for_error(_dtype, _K, target_forward_error)
+
     # Try homogeneous batching: N same-shape matmuls → one batched dispatch
-    batched = _try_batched_multi_einsum(subst, precision=precision)
+    batched = _try_batched_multi_einsum(subst, precision=batched_precision)
     if batched is not None:
         return batched
 
-    # Fallback: per-contraction loop
+    # Fallback: per-contraction loop — pass target_forward_error so each call
+    # resolves its own K independently (optimal for heterogeneous contractions).
     results = []
     for c in subst:
         subscripts = c[0]
         ops = c[1:]
-        result = einsum(subscripts, *ops, precision=precision)
+        result = einsum(
+            subscripts, *ops, precision=precision, target_forward_error=target_forward_error
+        )
         if hasattr(result, "device") and result.device.type == "xla":
             from .nki.dispatch import from_xla
 
