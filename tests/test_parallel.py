@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import trntensor
+from trntensor import parallel
 from trntensor.parallel import ShardedTensor, gather, scatter
 
 
@@ -138,35 +139,7 @@ class TestShardedEinsum:
 
 
 class TestReduceParallelError:
-    """Reduce-parallel sharding raises NotImplementedError on NKI hardware (HAS_NKI=True).
-
-    On CPU (HAS_NKI=False) the mock-allreduce path activates — those cases are
-    covered by :class:`TestReduceParallelMock` below.
-    """
-
-    def test_contracted_dim_raises_on_nki(self, monkeypatch):
-        """On NKI hardware, sharding along the contracted index raises with SDK note."""
-        import trntensor.nki.dispatch as _nd
-
-        monkeypatch.setattr(_nd, "HAS_NKI", True)
-        A = torch.randn(8, 16)
-        B = torch.randn(16, 6)
-        A_sharded = scatter(A, dim=1, n_shards=4)  # shard along j (contracted in "ij,jk->ik")
-
-        with pytest.raises(NotImplementedError, match="nki.collectives"):
-            trntensor.einsum("ij,jk->ik", A_sharded, B)
-
-    def test_error_message_names_dimension_on_nki(self, monkeypatch):
-        """On NKI hardware, error message names the contracted dimension character."""
-        import trntensor.nki.dispatch as _nd
-
-        monkeypatch.setattr(_nd, "HAS_NKI", True)
-        A = torch.randn(8, 12)
-        B = torch.randn(12, 5)
-        A_sharded = scatter(A, dim=1, n_shards=3)  # shard along 'j'
-
-        with pytest.raises(NotImplementedError, match="'j'"):
-            trntensor.einsum("ij,jk->ik", A_sharded, B)
+    """Argument errors on the sharded path."""
 
     def test_out_with_sharded_raises(self):
         """The 'out' accumulation argument is not supported with ShardedTensor."""
@@ -235,17 +208,19 @@ class TestReduceParallelMock:
 
         torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
-    def test_nki_path_still_raises(self, monkeypatch):
-        """When HAS_NKI=True, reduce-parallel raises NotImplementedError (not mock)."""
+    def test_single_process_on_nki_host_uses_mock(self, monkeypatch):
+        """HAS_NKI=True without a process group: mock all-reduce, correct result."""
         import trntensor.nki.dispatch as _nd
 
         monkeypatch.setattr(_nd, "HAS_NKI", True)
+        monkeypatch.setenv("TRNTENSOR_FORCE_BACKEND", "pytorch")
+        torch.manual_seed(15)
         A = torch.randn(8, 16)
         B = torch.randn(16, 6)
         A_sharded = scatter(A, dim=1, n_shards=4)
 
-        with pytest.raises(NotImplementedError, match="nki.collectives"):
-            trntensor.einsum("ij,jk->ik", A_sharded, B)
+        result = trntensor.einsum("ij,jk->ik", A_sharded, B)
+        torch.testing.assert_close(result, A @ B, atol=1e-5, rtol=1e-5)
 
     def test_mixed_cpu_no_longer_raises(self):
         """Mixed output+reduce-parallel computes correctly on CPU (v0.12.0)."""
@@ -269,8 +244,8 @@ class TestMixedParallel:
     (reduce-parallel), the dispatch uses a nested loop: for each output shard,
     accumulate partial contractions over all reduce shards via :func:`_mock_allreduce`.
 
-    On Trainium (``HAS_NKI=True``) the reduce step raises ``NotImplementedError``
-    — the same gate as pure reduce-parallel (``nki.collectives``, SDK 2.30+).
+    The inner reduce step uses the same backend selection as pure
+    reduce-parallel (:func:`trntensor.parallel.allreduce_backend`).
     """
 
     def test_basic_correctness(self):
@@ -321,16 +296,18 @@ class TestMixedParallel:
         )
         torch.testing.assert_close(gather(result), A @ B, atol=1e-5, rtol=1e-5)
 
-    def test_nki_raises(self, monkeypatch):
-        """On NKI hardware, mixed sharding raises NotImplementedError (nki.collectives)."""
+    def test_single_process_on_nki_host_uses_mock(self, monkeypatch):
+        """HAS_NKI=True without a process group: mixed path computes via mock."""
         import trntensor.nki.dispatch as _nd
 
         monkeypatch.setattr(_nd, "HAS_NKI", True)
-        A_sh = scatter(torch.randn(8, 6), dim=0, n_shards=2)
-        B_sh = scatter(torch.randn(6, 4), dim=0, n_shards=2)
-
-        with pytest.raises(NotImplementedError, match="nki.collectives"):
-            trntensor.einsum("ij,jk->ik", A_sh, B_sh)
+        monkeypatch.setenv("TRNTENSOR_FORCE_BACKEND", "pytorch")
+        A = torch.randn(8, 6)
+        B = torch.randn(6, 4)
+        result = trntensor.einsum(
+            "ij,jk->ik", scatter(A, dim=0, n_shards=2), scatter(B, dim=0, n_shards=2)
+        )
+        torch.testing.assert_close(gather(result), A @ B, atol=1e-5, rtol=1e-5)
 
     def test_alpha_threads_through(self):
         """alpha kwarg is applied correctly in the mixed path."""
@@ -344,3 +321,131 @@ class TestMixedParallel:
         result_plain = trntensor.einsum("ij,jk->ik", A_sh, B_sh)
 
         torch.testing.assert_close(gather(result_scaled), 3.0 * gather(result_plain))
+
+
+class TestAllreduceBackendSelection:
+    """``allreduce_backend``: automatic choice plus TRNTENSOR_ALLREDUCE override."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        monkeypatch.delenv("TRNTENSOR_ALLREDUCE", raising=False)
+        parallel.set_allreduce_backend(None)
+        yield
+        parallel.set_allreduce_backend(None)
+
+    def _pg(self, monkeypatch, pg):
+        monkeypatch.setattr(parallel, "_process_group", lambda: pg)
+
+    def test_auto_no_group_is_mock(self, monkeypatch):
+        self._pg(monkeypatch, None)
+        assert parallel.allreduce_backend(4) == "mock"
+
+    def test_auto_world1_is_mock(self, monkeypatch):
+        self._pg(monkeypatch, (0, 1, "neuron"))
+        assert parallel.allreduce_backend(1) == "mock"
+
+    def test_auto_neuron_group_is_nki(self, monkeypatch):
+        self._pg(monkeypatch, (1, 4, "neuron"))
+        assert parallel.allreduce_backend(4) == "nki"
+
+    def test_auto_gloo_group_is_torch(self, monkeypatch):
+        self._pg(monkeypatch, (0, 2, "gloo"))
+        assert parallel.allreduce_backend(2) == "torch"
+
+    def test_auto_shard_count_mismatch_is_mock(self, monkeypatch):
+        self._pg(monkeypatch, (0, 2, "neuron"))
+        assert parallel.allreduce_backend(3) == "mock"
+
+    def test_env_override(self, monkeypatch):
+        self._pg(monkeypatch, (0, 2, "neuron"))
+        monkeypatch.setenv("TRNTENSOR_ALLREDUCE", "torch")
+        assert parallel.allreduce_backend(2) == "torch"
+        monkeypatch.setenv("TRNTENSOR_ALLREDUCE", "mock")
+        assert parallel.allreduce_backend(2) == "mock"
+
+    def test_setter_beats_env(self, monkeypatch):
+        self._pg(monkeypatch, (0, 2, "neuron"))
+        monkeypatch.setenv("TRNTENSOR_ALLREDUCE", "torch")
+        parallel.set_allreduce_backend("mock")
+        assert parallel.allreduce_backend(2) == "mock"
+
+    def test_explicit_without_group_raises(self, monkeypatch):
+        self._pg(monkeypatch, None)
+        monkeypatch.setenv("TRNTENSOR_ALLREDUCE", "torch")
+        with pytest.raises(RuntimeError, match="process group"):
+            parallel.allreduce_backend(2)
+
+    def test_explicit_mismatch_raises(self, monkeypatch):
+        self._pg(monkeypatch, (0, 2, "gloo"))
+        monkeypatch.setenv("TRNTENSOR_ALLREDUCE", "torch")
+        with pytest.raises(RuntimeError, match="n_shards=4"):
+            parallel.allreduce_backend(4)
+
+    def test_nki_needs_neuron_group(self, monkeypatch):
+        self._pg(monkeypatch, (0, 2, "gloo"))
+        monkeypatch.setenv("TRNTENSOR_ALLREDUCE", "nki")
+        with pytest.raises(RuntimeError, match="neuron"):
+            parallel.allreduce_backend(2)
+
+    def test_bad_env_value_raises(self, monkeypatch):
+        monkeypatch.setenv("TRNTENSOR_ALLREDUCE", "nccl")
+        with pytest.raises(ValueError, match="TRNTENSOR_ALLREDUCE"):
+            parallel.allreduce_backend(2)
+
+    def test_bad_setter_value_raises(self):
+        with pytest.raises(ValueError):
+            parallel.set_allreduce_backend("ring")
+
+    def test_rank_local_computes_only_own_partial(self, monkeypatch):
+        """Under a rank-local backend, reduce_partials computes shard ``rank`` only."""
+        import torch.distributed as dist
+
+        self._pg(monkeypatch, (1, 3, "gloo"))
+        monkeypatch.setattr(dist, "get_rank", lambda: 1)
+        monkeypatch.setattr(parallel, "_dist_allreduce", lambda t: t * 10)
+        calls = []
+
+        def partial(i):
+            calls.append(i)
+            return torch.full((2, 2), float(i))
+
+        out = parallel.reduce_partials(partial, 3)
+        assert calls == [1]
+        torch.testing.assert_close(out, torch.full((2, 2), 10.0))
+
+
+class TestMultiRankGloo:
+    """Real 2-rank reduce-parallel einsum on CPU (gloo) via the multi-rank runner."""
+
+    def test_runner_world2_cpu(self, tmp_path):
+        import os
+        import subprocess
+        import sys
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(root, "scripts", "run_reduce_parallel_multirank.py")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                script,
+                "--cpu",
+                "--world",
+                "2",
+                "--sizes",
+                "64",
+                "--reps",
+                "1",
+                "--modes",
+                "auto",
+                "--job-timeout",
+                "120",
+                "--logdir",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+        assert "RESULT [w2/auto/n=64]: PASS" in proc.stdout
+        assert "backend=torch" in proc.stdout

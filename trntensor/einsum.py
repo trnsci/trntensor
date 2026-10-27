@@ -175,18 +175,18 @@ def _execute_sharded(
       (not in the output). Each shard produces a partial result of the full
       output shape; the shards must be summed (all-reduced).
 
-      On Trainium (``HAS_NKI=True``): raises ``NotImplementedError`` — requires
-      ``nki.collectives`` arriving in Neuron SDK 2.30+.
+      The sum goes through :func:`~trntensor.parallel.reduce_partials`. In a
+      single process it is :func:`~trntensor.parallel._mock_allreduce` over
+      every shard's partial. Under a multi-rank ``torch.distributed`` group
+      with ``world_size == n_shards``, rank ``r`` computes only shard ``r``'s
+      partial and the partials are combined by a real all-reduce
+      (``torch.distributed`` or ``nki.collectives``). See
+      :func:`~trntensor.parallel.allreduce_backend`.
 
-      On CPU (``HAS_NKI=False``): dispatches via :func:`~trntensor.parallel._mock_allreduce`,
-      a torch-based stand-in that enables reduce-parallel paths to be tested
-      without hardware.
-
-    Mixed output-parallel + reduce-parallel operands in the same einsum are
-    not yet supported and raise ``NotImplementedError``.
+    Mixed output-parallel + reduce-parallel operands run as a nested loop:
+    for each output shard, the reduce-parallel partials are all-reduced.
     """
-    from .nki.dispatch import HAS_NKI
-    from .parallel import ShardedTensor, _mock_allreduce, shard_boundaries
+    from .parallel import ShardedTensor, reduce_partials, shard_boundaries
     from .plan import _parse_subscripts
 
     input_str, output_str = _parse_subscripts(subscripts)
@@ -236,16 +236,7 @@ def _execute_sharded(
                 "all be partitioned along the same contracted dimension with the same "
                 "n_shards."
             )
-        # NKI gate: inner all-reduce still requires nki.collectives (SDK 2.30+)
-        if HAS_NKI:
-            shard_char_rp = next(iter(rp_chars))
-            raise NotImplementedError(
-                f"Mixed output-parallel + reduce-parallel sharding: reducing across "
-                f"dimension '{shard_char_rp}' requires all-reduce collective operations "
-                "(nki.collectives, Neuron SDK 2.30+). Use output-parallel sharding only "
-                "until then."
-            )
-        # CPU: nested outer-output × inner-reduce dispatch
+        # Nested outer-output × inner-reduce dispatch
         first_out_idx = next(iter(output_parallel))
         out_dim, ref_out_shard = output_parallel[first_out_idx]
         out_n_shards = ref_out_shard.n_shards
@@ -254,36 +245,34 @@ def _execute_sharded(
         rp_n = ref_rp.n_shards
         bounds = shard_boundaries(ref_rp)
 
-        output_chunks = []
-        for out_s in range(out_n_shards):
-            partials = []
-            for rp_t in range(rp_n):
-                start, end = bounds[rp_t]
-                dense_ops = []
-                for op_idx, op in enumerate(operands):
-                    if op_idx in output_parallel:
-                        chunk = output_parallel[op_idx][1].chunks[out_s]
-                        if shard_char in input_terms[op_idx]:
-                            dim_in_chunk = input_terms[op_idx].index(shard_char)
-                            slices = [slice(None)] * chunk.ndim
-                            slices[dim_in_chunk] = slice(start, end)
-                            dense_ops.append(chunk[tuple(slices)])
-                        else:
-                            dense_ops.append(chunk)
-                    elif op_idx in reduce_parallel:
-                        dense_ops.append(reduce_parallel[op_idx][1].chunks[rp_t])
-                    elif not isinstance(op, ShardedTensor) and shard_char in input_terms[op_idx]:
-                        dim_in_op = input_terms[op_idx].index(shard_char)
-                        slices = [slice(None)] * op.ndim
-                        slices[dim_in_op] = slice(start, end)
-                        dense_ops.append(op[tuple(slices)])
+        def mixed_partial(out_s: int, rp_t: int) -> torch.Tensor:
+            start, end = bounds[rp_t]
+            dense_ops = []
+            for op_idx, op in enumerate(operands):
+                if op_idx in output_parallel:
+                    chunk = output_parallel[op_idx][1].chunks[out_s]
+                    if shard_char in input_terms[op_idx]:
+                        dim_in_chunk = input_terms[op_idx].index(shard_char)
+                        slices = [slice(None)] * chunk.ndim
+                        slices[dim_in_chunk] = slice(start, end)
+                        dense_ops.append(chunk[tuple(slices)])
                     else:
-                        dense_ops.append(op)
-                partial = einsum(
-                    subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision
-                )
-                partials.append(partial)
-            output_chunks.append(_mock_allreduce(partials))
+                        dense_ops.append(chunk)
+                elif op_idx in reduce_parallel:
+                    dense_ops.append(reduce_parallel[op_idx][1].chunks[rp_t])
+                elif not isinstance(op, ShardedTensor) and shard_char in input_terms[op_idx]:
+                    dim_in_op = input_terms[op_idx].index(shard_char)
+                    slices = [slice(None)] * op.ndim
+                    slices[dim_in_op] = slice(start, end)
+                    dense_ops.append(op[tuple(slices)])
+                else:
+                    dense_ops.append(op)
+            return einsum(subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision)
+
+        output_chunks = [
+            reduce_partials(lambda t, s=out_s: mixed_partial(s, t), rp_n)
+            for out_s in range(out_n_shards)
+        ]
 
         return ShardedTensor(output_chunks, partition_dim=out_dim)
 
@@ -324,16 +313,6 @@ def _execute_sharded(
     # ------------------------------------------------------------------ #
     # rp_chars and rp_n_shards_set already computed above.
 
-    if HAS_NKI:
-        shard_char = next(iter(rp_chars))
-        raise NotImplementedError(
-            f"Reduce-parallel sharding: dimension '{shard_char}' is a contraction "
-            "index (not in output). Reducing across shards requires all-reduce "
-            "collective operations, which land in Neuron SDK 2.30+ via "
-            "nki.collectives. Use output-parallel sharding (partition along an output "
-            "dimension) until then."
-        )
-
     if len(rp_chars) > 1 or len(rp_n_shards_set) > 1:
         raise NotImplementedError(
             "Multiple reduce-parallel ShardedTensor operands must all be partitioned "
@@ -346,8 +325,7 @@ def _execute_sharded(
     bounds = shard_boundaries(ref_shard)
 
     # Dispatch per shard, co-partitioning plain operands that share shard_char.
-    partials = []
-    for shard_idx in range(n_shards):
+    def partial(shard_idx: int) -> torch.Tensor:
         start, end = bounds[shard_idx]
         dense_ops = []
         for op_idx, op in enumerate(operands):
@@ -360,10 +338,9 @@ def _execute_sharded(
                 dense_ops.append(op[tuple(slices)])
             else:
                 dense_ops.append(op)
-        partial = einsum(subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision)
-        partials.append(partial)
+        return einsum(subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision)
 
-    return _mock_allreduce(partials)
+    return reduce_partials(partial, n_shards)
 
 
 # Device types whose kernels compute genuine IEEE fp64. Anything else (the
