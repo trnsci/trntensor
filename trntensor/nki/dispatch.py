@@ -14,6 +14,7 @@ a separate element-wise pass over the output.
 from __future__ import annotations
 
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -39,6 +40,50 @@ _USE_SIMULATOR = os.environ.get("TRNTENSOR_USE_SIMULATOR", "").lower() in (
 
 def _use_simulator() -> bool:
     return _USE_SIMULATOR and HAS_NKI
+
+
+# Stochastic rounding on NKI 0.7+ is a process-wide Neuron Runtime setting,
+# not a per-instruction one (#41). NKI 0.7 removed ``nisa.activation``'s
+# ``round_mode`` kwarg, so ``use_sr=True`` cannot select SR by itself. The
+# runtime reads this variable once at init: when it is ``"1"`` every
+# FP32->BF16/FP16 downcast in the process rounds stochastically (including
+# ``use_sr=False`` / ``precision="fast"``); otherwise every downcast is
+# round-to-nearest-even. Measured on Trn2, SDK 2.33 / NKI 0.7.0. See
+# aws-neuron-sdk about-neuron/arch/neuron-features/rounding-modes.rst.
+SR_ENV_VAR = "NEURON_RT_STOCHASTIC_ROUNDING_EN"
+
+_sr_warning_emitted = False
+
+
+def sr_runtime_enabled() -> bool:
+    """Return True if the Neuron Runtime is configured for stochastic rounding.
+
+    Checks ``NEURON_RT_STOCHASTIC_ROUNDING_EN == "1"`` in the current
+    environment. The runtime only reads the variable at initialization, so
+    it must be set before the process first touches a Neuron device; setting
+    it afterwards makes this return True without changing rounding.
+    """
+    return os.environ.get(SR_ENV_VAR) == "1"
+
+
+def _warn_if_sr_unavailable() -> None:
+    """Emit a one-time ``RuntimeWarning`` when SR is requested on the native
+    NKI path but the runtime is not configured for it. Computation proceeds
+    with round-to-nearest-even."""
+    global _sr_warning_emitted
+    if _sr_warning_emitted or sr_runtime_enabled():
+        return
+    _sr_warning_emitted = True
+    warnings.warn(
+        'trntensor: precision="sr" requested on the NKI path, but stochastic '
+        f"rounding requires {SR_ENV_VAR}=1 in the environment at process start "
+        "(it is a Neuron Runtime setting read once at init, not a per-kernel "
+        "option on NKI 0.7+). Without it, results are round-to-nearest. Note "
+        "that with it set, ALL downcasts in the process round stochastically, "
+        'including precision="fast". This warning is shown once per process.',
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 # FLOP thresholds for NKI dispatch.
@@ -257,6 +302,11 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
     it (single-N-tile path skips padding). Result is sliced back to the
     original ``(M, N)``. Falls back to ``torch.matmul`` on any kernel
     failure unless ``TRNTENSOR_REQUIRE_NKI=1``.
+
+    ``use_sr=True`` on the native NKI path rounds stochastically only when
+    ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1`` was set at process start; otherwise
+    a one-time ``RuntimeWarning`` is emitted and the result is
+    round-to-nearest-even. The CPU fallback emulates SR in software.
     """
     if not (_use_nki() and HAS_NKI):
         result = torch.matmul(A, B)
@@ -278,6 +328,9 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
     K_pad = _round_up(K, TILE_K)
     N_pad = N if N <= TILE_N else _round_up(N, TILE_N)
     needs_pad = (M_pad != M) or (K_pad != K) or (N_pad != N)
+
+    if use_sr and not _use_simulator():
+        _warn_if_sr_unavailable()
 
     try:
         if needs_pad:
@@ -441,6 +494,10 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
     and N to tile multiples per slice; batch dim is passed through
     unchanged. Falls back to ``torch.bmm`` on any kernel failure
     unless ``TRNTENSOR_REQUIRE_NKI=1``.
+
+    ``use_sr`` follows the same runtime rule as :func:`nki_matmul`: SR needs
+    ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1`` at process start, else a one-time
+    ``RuntimeWarning`` and round-to-nearest-even.
     """
     if not (_use_nki() and HAS_NKI):
         return torch.bmm(A, B)
@@ -458,6 +515,9 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
     K_pad = _round_up(K, TILE_K)
     N_pad = N if N <= TILE_N else _round_up(N, TILE_N)
     needs_pad = (M_pad != M) or (K_pad != K) or (N_pad != N)
+
+    if use_sr and not _use_simulator():
+        _warn_if_sr_unavailable()
 
     try:
         if needs_pad:

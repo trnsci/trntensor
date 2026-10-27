@@ -82,6 +82,14 @@ def einsum(
             argument. See :func:`~trntensor.select_precision_for_error` for
             the exact error bounds used.
 
+    Note:
+        On Trainium (NKI 0.7+) stochastic rounding — ``precision="sr"``,
+        or ``"sr"`` chosen by ``target_forward_error`` — is a process-wide
+        Neuron Runtime setting. Set ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1``
+        before the process starts. Without it, trntensor emits a one-time
+        ``RuntimeWarning`` and the result is round-to-nearest. With it, every
+        downcast in the process rounds stochastically, including ``"fast"``.
+
     Examples:
         # Matrix multiply
         einsum("ij,jk->ik", A, B)
@@ -544,6 +552,8 @@ def multi_einsum(
             ``"fast"`` (default), ``"kahan"``, ``"sr"``, or ``"dd"``.
             Homogeneous batching is only attempted for ``"fast"`` and
             ``"sr"``; other modes fall through to the per-contraction loop.
+            On Trainium, ``"sr"`` requires ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1``
+            at process start (see :func:`einsum`).
         target_forward_error: Optional relative forward error bound. When set,
             trntensor selects the cheapest precision mode per contraction.
             For homogeneous batching the mode is resolved from the first

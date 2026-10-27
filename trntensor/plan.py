@@ -157,6 +157,11 @@ def plan_contraction(
             in the NKI matmul kernel — reduces accumulation bias for long
             K-reductions in BF16 (correctness requirement for K ≥ ~300).
             Only affects the ``matmul`` strategy; other strategies use fast rounding.
+            On Trainium (NKI 0.7+) SR is a process-wide Neuron Runtime setting:
+            it requires ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1`` at process start.
+            Without it a one-time ``RuntimeWarning`` is emitted and results are
+            round-to-nearest; with it, *all* downcasts in the process round
+            stochastically, including ``"fast"``.
             ``"dd"`` double-double accumulation via Ogita–Rump–Oishi error-free
             split: splits each FP32 operand into two BF16-precision summands,
             computes four BF16-precision matmuls, sums in FP32.
@@ -387,6 +392,12 @@ def select_precision_for_error(dtype: torch.dtype, K: int, target_forward_error:
 
     ``"sr"`` and ``"dd"`` are only considered for BF16 and FP16 inputs —
     those are the dtypes where NKI SR and Ozaki splitting are meaningful.
+
+    The ``"sr"`` bound assumes stochastic rounding actually happens. On the
+    Trainium NKI path that requires ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1`` at
+    process start; when ``"sr"`` is selected without it, execution emits a
+    one-time ``RuntimeWarning`` and rounds to nearest, so the effective bound
+    is the ``"fast"`` one (K · u).
     """
     u = _UNIT_ROUNDOFF.get(dtype, _UNIT_ROUNDOFF[torch.float32])
     u_f64 = _UNIT_ROUNDOFF[torch.float64]

@@ -43,7 +43,11 @@ if HAS_NKI:
         When ``use_sr=True``, the PSUM→SBUF downcast runs on the Scalar
         Engine (``nisa.activation(op=nl.copy)``) instead of
         ``nisa.tensor_copy``. NKI 0.7 has no per-instruction rounding-mode
-        argument, so stochastic rounding there is a runtime setting (#41). This is a correctness requirement for BF16
+        argument, so stochastic rounding there is a runtime setting (#41):
+        it happens only when ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1`` is set at
+        process start, and then for every downcast in the process, including
+        ``use_sr=False``. The dispatcher warns once when SR is requested
+        without it. SR is a correctness requirement for BF16
         dot products with K ≥ ~300 (Connolly–Higham–Mary, SIAM J. Sci.
         Comput. 2021): stochastic rounding replaces Wilkinson's n·u
         worst-case bias with a mean-zero √n·u bound.
@@ -95,9 +99,11 @@ if HAS_NKI:
 
         Caller pads (M, K, N) the same way as ``matmul_kernel``. The
         batch dim is iterated with ``nl.affine_range``; each slice
-        reuses the stationary-A tile layout. ``use_sr`` applies
-        stochastic rounding at the PSUM→SBUF downcast (see
-        ``matmul_kernel`` for the correctness motivation).
+        reuses the stationary-A tile layout. ``use_sr`` routes the
+        PSUM→SBUF downcast through the Scalar Engine; it rounds
+        stochastically only under ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1``
+        (see ``matmul_kernel`` for the runtime rule and the correctness
+        motivation).
         """
         B, M, K = a.shape
         _, _, N = b.shape

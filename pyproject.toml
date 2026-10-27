@@ -84,6 +84,9 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.pytest.ini_options]
-markers = ["neuron: requires Neuron hardware"]
+markers = [
+    "neuron: requires Neuron hardware",
+    "neuron_sr: stochastic-rounding hardware test; needs NEURON_RT_STOCHASTIC_ROUNDING_EN=1 at process start",
+]
 testpaths = ["tests"]
 python_files = ["test_*.py", "bench_*.py"]

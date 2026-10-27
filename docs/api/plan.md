@@ -15,7 +15,7 @@ plan.batch_indices        # list of batch indices
 plan.output_indices       # list of output indices in order
 plan.transA, plan.transB  # whether to pre-transpose before matmul
 plan.contraction_path     # [(i,j), ...] for "path" strategy
-plan.precision            # "fast" | "kahan" | "dd"
+plan.precision            # "fast" | "kahan" | "dd" | "sr"
 ```
 
 Results are cached by `(subscripts, operand shapes, precision)`. Repeated
@@ -29,6 +29,7 @@ Call `clear_plan_cache()` to invalidate (e.g. after a backend change).
 | `"fast"` | Default; NKI kernels eligible for matmul/bmm strategies |
 | `"kahan"` | Signals fp64 promotion at execution time; plan is still computed but `einsum` will use `torch.einsum` in fp64 regardless of strategy |
 | `"dd"` | Raises `NotImplementedError` at execution time (trnblas#22 pending) |
+| `"sr"` | Stochastic rounding at the PSUM→SBUF downcast for matmul/bmm strategies. On Trainium requires `NEURON_RT_STOCHASTIC_ROUNDING_EN=1` at process start, otherwise one-time `RuntimeWarning` and round-to-nearest; see [einsum](einsum.md#stochastic-rounding-on-trainium-is-a-runtime-setting) |
 
 ```python
 plan_fast  = trntensor.plan_contraction("ij,jk->ik", A, B, precision="fast")
@@ -53,7 +54,7 @@ the planner returns.
 | `output_indices` | `list[str]` | Output index order |
 | `estimated_flops` | `int` | Multiply-add estimate |
 | `contraction_path` | `list[tuple[int,int]]` | Greedy pair order for `"path"` strategy (opt_einsum convention) |
-| `precision` | `str` | `"fast"` \| `"kahan"` \| `"dd"` |
+| `precision` | `str` | `"fast"` \| `"kahan"` \| `"dd"` \| `"sr"` |
 
 ### Strategy selection
 

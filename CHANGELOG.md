@@ -34,6 +34,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stochastic-rounding runtime guard (#41).** On NKI 0.7 (Neuron SDK
+  2.33) the `use_sr` flag no longer chooses the rounding mode. On Trn2,
+  with `NEURON_RT_STOCHASTIC_ROUNDING_EN` unset or `0`, both
+  `use_sr=True` and `use_sr=False` round to nearest even and are
+  deterministic. With `=1`, both round stochastically. The Neuron Runtime
+  sets the mode for the whole process when it initializes.
+  `nki_matmul` / `nki_batched_matmul` now emit a one-time `RuntimeWarning`
+  when SR is requested on the native NKI path without
+  `NEURON_RT_STOCHASTIC_ROUNDING_EN=1`, then still compute
+  (round-to-nearest). This covers `precision="sr"` in `einsum` /
+  `multi_einsum` and `target_forward_error=` when it picks `"sr"`. The CPU
+  fallback and `nki.simulate` paths are unaffected. New
+  `trntensor.nki.dispatch.sr_runtime_enabled()`.
+  - Docs (`docs/api/einsum.md`, `docs/api/plan.md`) and docstrings explain
+    that the variable has to be set at process start, and that with it set
+    *every* downcast in the process rounds stochastically, including
+    `precision="fast"`.
+  - Tests: `tests/test_sr_runtime.py` (CPU, native path stubbed);
+    hardware `TestStochasticRoundingRuntime` in `tests/test_nki_kernels.py`
+    (markers `neuron` + `neuron_sr`), gated by the `sr_runtime` fixture.
+    The fixture skips unless the variable was `1` at process start.
 - `tests/test_nki_compile.py` (`nki_simulator` marker): runs the NKI
   frontend (trace → MLIR → verify) on CPU for every kernel at trn1, trn2,
   and trn2 lnc=2. Catches the verifier errors `nki.simulate` misses.
