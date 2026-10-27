@@ -351,14 +351,25 @@ def _nki_mp2_energy(
         B_feed = B_p.contiguous()
         ev_feed = ev_p.contiguous()
 
+    # Kernel layout (#41): B as (nocc, naux, nvir) so every (P, a) tile is a
+    # plain DMA (no load_transpose2d), and the ε_i / ε_b operands
+    # pre-broadcast across the TILE_M partitions so the denominator is built
+    # without any partition-dim broadcast or reshape on chip.
+    B_feed = B_feed.transpose(1, 2).contiguous()
+    eo_b = eo_feed.reshape(1, -1).expand(TILE_M, -1).contiguous()
+    ev_b = ev_feed.reshape(1, -1).expand(TILE_M, -1).contiguous()
+
     if _use_simulator():
         out_np = nki.simulate(mp2_energy_kernel)(
-            B_feed.cpu().numpy(), eo_feed.cpu().numpy(), ev_feed.cpu().numpy()
+            B_feed.cpu().numpy(),
+            eo_b.cpu().numpy(),
+            ev_feed.cpu().numpy(),
+            ev_b.cpu().numpy(),
         )
         return torch.from_numpy(np.asarray(out_np)).to(B.device).sum()
 
-    (b, eo, ev), orig_device = _to_xla(B_feed, eo_feed, ev_feed)
-    partial = mp2_energy_kernel(b, eo, ev)
+    (b, eo, ev, evb), orig_device = _to_xla(B_feed, eo_b, ev_feed, ev_b)
+    partial = mp2_energy_kernel(b, eo, ev, evb)
     return partial.to(orig_device).sum()
 
 
@@ -385,12 +396,11 @@ def _nki_ao_to_mo_transform(
     nocc = C_occ.shape[1]
     nvir = C_vir.shape[1]
 
-    # Pad nbasis to a TILE_N (512) multiple — the kernel's step-1 ν-tile and
-    # step-2 K-tile loops both require this. TILE_N = 4×TILE_K, so TILE_N
-    # alignment implies TILE_K alignment for the inner k_mu/k_nu loops.
+    # Pad nbasis to a TILE_K (128) multiple — the kernel's step-1 ν-tile and
+    # μ/ν K-tile loops are all TILE_K-wide (#41).
     # Pad nvir to a TILE_N multiple — the kernel's step-2 a-tile loop requires
     # this. Slice the result back to (nocc, nvir, naux) after kernel returns.
-    nbasis_pad = _round_up(nbasis, TILE_N)
+    nbasis_pad = _round_up(nbasis, TILE_K)
     nvir_pad = _round_up(nvir, TILE_N)
     needs_pad = nbasis_pad != nbasis or nvir_pad != nvir
 

@@ -145,9 +145,9 @@ def ao_to_mo_transform(
     if _use_nki() and HAS_NKI:
         from .nki.dispatch import _nki_ao_to_mo_transform
 
-        # N-tiled over ν (step 1) and a (step 2); K-tiled over μ/ν.
-        # nbasis and nvir are padded to TILE_N multiples by the dispatcher.
-        # NOCC ≤ 128: stationary M dim of both nc_matmul calls; M-tiling
+        # Tiled over ν (step 1) and a (step 2); K-tiled over μ/ν. The
+        # dispatcher pads nbasis to a TILE_K and nvir to a TILE_N multiple.
+        # NOCC ≤ 128: stationary M dim of the step-2 nc_matmul; M-tiling
         # not yet implemented.
         if nocc > 128:
             raise NotImplementedError(

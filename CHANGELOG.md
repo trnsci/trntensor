@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **NKI 0.7 / neuronx-cc 2.28 kernel compile on Trn2 (#41).**
+  - `ao_to_mo_transform_kernel`: step 1 now computes the intermediate
+    already transposed (`eri` tile as the stationary operand, ν-major
+    scratch), so step 2 loads its stationary tile with a plain DMA. The
+    former `nl.load_transpose2d` of a strided HBM slice was rejected by the
+    BIR verifier (`checkDMATranspose`: "transposing dimensions should be
+    continuous"). The ν loop is now `TILE_K`-wide, so the dispatcher pads
+    `nbasis` to a multiple of 128 instead of 512.
+  - `mp2_energy_kernel`: removed the `(128, 1) → (1, 128)` reshape
+    ("Partition dim size must be preserved") and the cross-partition
+    `nl.sum(axis=(0, 1))`. The dispatcher now passes `B` as
+    `(nocc, naux, nvir)` (plain loads, no DMA transposes) and ε_occ / ε_vir
+    pre-broadcast across the 128 partitions; the kernel row-reduces per
+    lane and finishes with a `accᵀ · ones` matmul on the Tensor Engine.
+  - `matmul_kernel` / `batched_matmul_kernel` `use_sr=True`: NKI 0.7's
+    `nisa.activation` has no `out_dtype` / `round_mode` kwargs; the
+    downcast now calls `nisa.activation(dst=..., op=nl.copy, data=psum)`.
+    Stochastic rounding is a runtime setting on this toolchain, not a
+    per-instruction one.
+- `tests/test_nki_kernels.py`: replaced the stale `test_oversize_raises`
+  (nvir > 128 no longer raises since M-tiling landed) with a correctness
+  check at nvir = 200.
+
+### Added
+
+- `tests/test_nki_compile.py` (`nki_simulator` marker): runs the NKI
+  frontend (trace → MLIR → verify) on CPU for every kernel at trn1, trn2,
+  and trn2 lnc=2. Catches the verifier errors `nki.simulate` misses.
+
 ## [0.16.0] — 2026-04-29
 
 ### Added

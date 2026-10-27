@@ -40,9 +40,10 @@ if HAS_NKI:
         is either ≤ ``TILE_N`` or a clean multiple of ``TILE_N``. PSUM
         accumulates over K-tiles before the single store per (m, n) pair.
 
-        When ``use_sr=True``, the PSUM→SBUF downcast uses
-        ``nisa.activation(..., round_mode="stochastic")`` instead of
-        ``nisa.tensor_copy``. This is a correctness requirement for BF16
+        When ``use_sr=True``, the PSUM→SBUF downcast runs on the Scalar
+        Engine (``nisa.activation(op=nl.copy)``) instead of
+        ``nisa.tensor_copy``. NKI 0.7 has no per-instruction rounding-mode
+        argument, so stochastic rounding there is a runtime setting (#41). This is a correctness requirement for BF16
         dot products with K ≥ ~300 (Connolly–Higham–Mary, SIAM J. Sci.
         Comput. 2021): stochastic rounding replaces Wilkinson's n·u
         worst-case bias with a mean-zero √n·u bound.
@@ -74,14 +75,11 @@ if HAS_NKI:
                 # the HBM store.
                 c_sbuf = nl.ndarray((tile_m, tile_n), dtype=a.dtype, buffer=nl.sbuf)
                 if use_sr:
-                    nisa.activation(
-                        psum,
-                        bias=None,
-                        scale=1.0,
-                        out_dtype=a.dtype,
-                        round_mode="stochastic",
-                        dst=c_sbuf,
-                    )
+                    # NKI 0.7 dropped activation's ``out_dtype`` / ``round_mode``
+                    # kwargs (#41); the dtype comes from ``dst``. Downcast on the
+                    # Scalar Engine; whether it rounds stochastically is a
+                    # runtime setting, not a per-instruction one.
+                    nisa.activation(dst=c_sbuf, op=nl.copy, data=psum)
                 else:
                     nisa.tensor_copy(src=psum, dst=c_sbuf)
                 nl.store(
@@ -128,14 +126,7 @@ if HAS_NKI:
 
                     c_sbuf = nl.ndarray((tile_m, tile_n), dtype=a.dtype, buffer=nl.sbuf)
                     if use_sr:
-                        nisa.activation(
-                            psum,
-                            bias=None,
-                            scale=1.0,
-                            out_dtype=a.dtype,
-                            round_mode="stochastic",
-                            dst=c_sbuf,
-                        )
+                        nisa.activation(dst=c_sbuf, op=nl.copy, data=psum)
                     else:
                         nisa.tensor_copy(src=psum, dst=c_sbuf)
                     nl.store(
@@ -146,12 +137,13 @@ if HAS_NKI:
         return c
 
     @nki.jit
-    def mp2_energy_kernel(B, eps_occ, eps_vir):
+    def mp2_energy_kernel(B_T, eps_occ_b, eps_vir, eps_vir_b):
         """Fully fused DF-MP2 correlation energy with K/M tiling.
 
-        Lifts the single-tile ``nvir ≤ 128`` / ``naux ≤ 128`` constraints.
         NVIR and NAUX must be multiples of ``TILE_M`` / ``TILE_K``; the
-        dispatch layer pads both before entry.
+        dispatch layer pads both before entry and lays the inputs out so
+        that every load is a plain (non-transposing) DMA and every Vector
+        Engine op keeps its partition dim (#41).
 
         For each ``(i, j)`` pair this program tiles over the ``(a, b)``
         virtual-orbital block (M-tiling, TILE_M=128 per side) and over the
@@ -160,11 +152,15 @@ if HAS_NKI:
         1. For each ``(m_tile, n_tile)`` block:
            K-accumulate ``T[m,n] = Σ_P B[i,m,P] B[j,n,P]`` and
            ``T.T[m,n] = Σ_P B[j,m,P] B[i,n,P]`` in PSUM;
-        2. PSUM → SBUF; build the ``(TILE_M, TILE_M)`` denominator
-           ``Δ_ab = ε_i + ε_j - ε_a - ε_b`` on the Vector Engine;
-        3. Fold ``Σ_ab T*(2T-T.T)/Δ`` into the ``(1,1)`` pair accumulator.
+        2. PSUM → SBUF; build ``-Δ_ab = ε_a + ε_b - ε_i - ε_j`` as a
+           ``(TILE_M, TILE_M)`` tile: per-partition column
+           ``ε_a - ε_i - ε_j`` plus the pre-broadcast row ``ε_b``;
+        3. Row-reduce ``T*(2T-T.T)/(-Δ)`` along the free axis and subtract
+           into a ``(TILE_M, 1)`` per-partition accumulator.
 
-        One HBM store per ``(i, j)`` — same as the original single-tile kernel.
+        The final cross-partition sum is a ``(TILE_M, 1)ᵀ · ones`` matmul on
+        the Tensor Engine (the Vector Engine cannot reduce across
+        partitions). One HBM store per ``(i, j)``.
 
         T.T tile correctness:
         ``nc_matmul(stationary=Bj_m, moving=Bi_n)[da, db]``
@@ -175,88 +171,86 @@ if HAS_NKI:
 
         Inputs
         ------
-        B       : (nocc, nvir, naux) — DF coefficients; nvir % TILE_M == 0,
-                                       naux % TILE_K == 0 (dispatcher pads).
-        eps_occ : (nocc, 1)         — occupied orbital energies (2D for NKI
-                                       load hygiene regardless of residency).
-        eps_vir : (nvir, 1)         — virtual orbital energies (2D, same).
+        B_T       : (nocc, naux, nvir) — DF coefficients with the aux index
+                                         ahead of the virtual index, so a
+                                         ``(P, a)`` tile is a plain load;
+                                         nvir % TILE_M == 0, naux % TILE_K == 0.
+        eps_occ_b : (TILE_M, nocc)     — occupied energies broadcast across
+                                         the 128 partitions.
+        eps_vir   : (nvir, 1)          — virtual energies as a column (ε_a).
+        eps_vir_b : (TILE_M, nvir)     — virtual energies broadcast across
+                                         the 128 partitions (ε_b row).
 
         Returns
         -------
         (nocc, nocc) float32 partial tensor. Host sums to scalar.
         """
-        NOCC, NVIR, NAUX = B.shape
+        NOCC, NAUX, NVIR = B_T.shape
         partial = nl.ndarray((NOCC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
+        ones = nl.ones((TILE_M, 1), dtype=nl.float32, buffer=nl.sbuf)
 
         for i in nl.affine_range(NOCC):
-            eo_i = nl.load(eps_occ[i : i + 1, 0:1])  # (1, 1)
+            eo_i = nl.load(eps_occ_b[0:TILE_M, i : i + 1])  # (TILE_M, 1)
 
             for j in nl.affine_range(NOCC):
-                eo_j = nl.load(eps_occ[j : j + 1, 0:1])  # (1, 1)
-                eo_sum = nl.add(eo_i, eo_j)  # (1, 1)
+                eo_j = nl.load(eps_occ_b[0:TILE_M, j : j + 1])  # (TILE_M, 1)
+                eo_sum = nl.add(eo_i, eo_j)  # (TILE_M, 1), ε_i + ε_j per lane
 
-                # Persistent (1,1) SBUF accumulator for this (i,j) pair.
-                acc = nl.zeros((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                # Per-partition (TILE_M, 1) accumulator for this (i, j) pair;
+                # loop-carried, so the tile loops are sequential.
+                acc = nl.zeros((TILE_M, 1), dtype=nl.float32, buffer=nl.sbuf)
 
-                for m_tile in nl.affine_range(NVIR // TILE_M):
+                for m_tile in nl.sequential_range(NVIR // TILE_M):
                     m_off = m_tile * TILE_M
-                    # eps_vir slice for the a-dimension; reused for all n_tile.
                     ev_m = nl.load(eps_vir[m_off : m_off + TILE_M, 0:1])  # (TILE_M, 1)
+                    col = nl.subtract(ev_m, eo_sum)  # ε_a - ε_i - ε_j
 
-                    for n_tile in nl.affine_range(NVIR // TILE_M):
+                    for n_tile in nl.sequential_range(NVIR // TILE_M):
                         n_off = n_tile * TILE_M
-                        ev_n = nl.load(eps_vir[n_off : n_off + TILE_M, 0:1])  # (TILE_M, 1)
+                        ev_n = nl.load(eps_vir_b[0:TILE_M, n_off : n_off + TILE_M])  # ε_b
 
                         psum_T = nl.zeros((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
                         psum_Tt = nl.zeros((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
 
                         for k_p in nl.affine_range(NAUX // TILE_K):
                             p_off = k_p * TILE_K
+                            # (TILE_K, TILE_M) tiles: partition = P chunk.
+                            Bi_m = nl.load(B_T[i, p_off : p_off + TILE_K, m_off : m_off + TILE_M])
+                            Bj_n = nl.load(B_T[j, p_off : p_off + TILE_K, n_off : n_off + TILE_M])
+                            Bj_m = nl.load(B_T[j, p_off : p_off + TILE_K, m_off : m_off + TILE_M])
+                            Bi_n = nl.load(B_T[i, p_off : p_off + TILE_K, n_off : n_off + TILE_M])
                             # T[m,n] = Σ_P B[i,m,P] * B[j,n,P]
-                            # load_transpose2d: (TILE_M, TILE_K) → (TILE_K, TILE_M) in SBUF
-                            Bi_m = nl.load_transpose2d(
-                                B[i, m_off : m_off + TILE_M, p_off : p_off + TILE_K]
-                            )
-                            Bj_n = nl.load_transpose2d(
-                                B[j, n_off : n_off + TILE_M, p_off : p_off + TILE_K]
-                            )
                             nisa.nc_matmul(
                                 dst=psum_T, stationary=Bi_m, moving=Bj_n, accumulate=True
                             )
                             # T.T[m,n] = T[n,m] = Σ_P B[j,m,P] * B[i,n,P]
-                            Bj_m = nl.load_transpose2d(
-                                B[j, m_off : m_off + TILE_M, p_off : p_off + TILE_K]
-                            )
-                            Bi_n = nl.load_transpose2d(
-                                B[i, n_off : n_off + TILE_M, p_off : p_off + TILE_K]
-                            )
                             nisa.nc_matmul(
                                 dst=psum_Tt, stationary=Bj_m, moving=Bi_n, accumulate=True
                             )
 
-                        # PSUM → SBUF: NKI 0.3.0 requires an explicit tensor_copy
-                        # into a fresh SBUF tile for downstream Vector Engine ops.
-                        t = nl.ndarray((TILE_M, TILE_M), dtype=B.dtype, buffer=nl.sbuf)
-                        t_T = nl.ndarray((TILE_M, TILE_M), dtype=B.dtype, buffer=nl.sbuf)
+                        t = nl.ndarray((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.sbuf)
+                        t_T = nl.ndarray((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.sbuf)
                         nisa.tensor_copy(src=psum_T, dst=t)
                         nisa.tensor_copy(src=psum_Tt, dst=t_T)
 
-                        # Δ_ab = (ε_i + ε_j) - ε_a - ε_b for this (m_tile, n_tile) block.
-                        # ev_m: (TILE_M, 1) — a-dimension energies
-                        # ev_n: (TILE_M, 1) — b-dimension energies
-                        denom_rows = nl.subtract(eo_sum, ev_m)  # (TILE_M, 1)
-                        denom = nl.subtract(
-                            denom_rows, ev_n.reshape((1, TILE_M))
-                        )  # (TILE_M, TILE_M)
+                        # -Δ_ab = ε_b + (ε_a - ε_i - ε_j): (TILE_M, TILE_M) + (TILE_M, 1)
+                        neg_denom = nl.add(ev_n, col)
 
-                        # term = T * (2T - T.T) / Δ. NKI 0.3.0 drops tensor-tensor
-                        # nl.divide; use multiply × reciprocal.
+                        # term = T * (2T - T.T) / Δ = -T * (2T - T.T) / (-Δ).
+                        # Multiply by the reciprocal (tensor-tensor divide is not
+                        # available), reduce the free axis per lane, subtract.
                         two_t_minus_tT = nl.subtract(nl.multiply(t, 2.0), t_T)
                         numerator = nl.multiply(t, two_t_minus_tT)
-                        term = nl.multiply(numerator, nl.reciprocal(denom))
-                        acc[...] = nl.add(acc, nl.sum(term, axis=(0, 1)))
+                        q = nl.multiply(numerator, nl.reciprocal(neg_denom))
+                        row = nl.sum(q, axis=1, keepdims=True)  # (TILE_M, 1)
+                        acc[...] = nl.subtract(acc, row)
 
-                nl.store(partial[i : i + 1, j : j + 1], value=acc)
+                # Cross-partition sum: accᵀ · ones → (1, 1).
+                psum_r = nl.zeros((1, 1), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=psum_r, stationary=acc, moving=ones, accumulate=True)
+                e_ij = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum_r, dst=e_ij)
+                nl.store(partial[i : i + 1, j : j + 1], value=e_ij)
 
         return partial
 
@@ -268,11 +262,16 @@ if HAS_NKI:
         Computes ``B[i, a, P] = Σ_{μ,ν} C_occ[μ, i] · C_vir[ν, a] · eri[μ, ν, P]``
         as one NKI program. Per auxiliary index P:
 
-        1. **Step 1** (K-tiled over μ, N-tiled over ν):
-           ``intermediate(i, ν) = Σ_μ C_occ(μ,i) · eri(μ,ν,P)``
-           — ν is partitioned into ``TILE_N=512``-wide tiles; within each ν-tile, μ
-           is K-tiled in ``TILE_K=128`` chunks. PSUM per ν-tile; result
-           ``(NOCC, TILE_N)`` written to kernel-scratch HBM.
+        1. **Step 1** (K-tiled over μ, M-tiled over ν):
+           ``interᵀ(ν, i) = Σ_μ eri(μ,ν,P) · C_occ(μ,i)``
+           — the eri tile is the stationary operand, so ν is partitioned into
+           ``TILE_K=128``-row tiles; within each ν-tile, μ is K-tiled in
+           ``TILE_K`` chunks. PSUM per ν-tile; result ``(TILE_K, NOCC)``
+           (ν-major) written to kernel-scratch HBM. Computing the
+           intermediate already transposed replaces the former
+           ``load_transpose2d`` of a strided HBM slice, which the trn2 BIR
+           verifier rejects ("transposing dimensions should be continuous",
+           #41).
         2. **Step 2** (K-tiled over ν, N-tiled over a):
            ``B(i, a) = Σ_ν intermediate(ν,i) · C_vir(ν,a)``
            — a is partitioned into ``TILE_N``-wide tiles; ν is K-tiled as before.
@@ -282,15 +281,14 @@ if HAS_NKI:
         it is never a user-visible tensor.
 
         Constraints (enforced at the dispatch boundary, not here):
-        - NBASIS must be a multiple of ``TILE_N`` (=512); dispatcher pads.
-          (Implies TILE_K alignment since TILE_N = 4×TILE_K.)
+        - NBASIS must be a multiple of ``TILE_K`` (=128); dispatcher pads.
         - NVIR must be a multiple of ``TILE_N``; dispatcher pads and slices.
-        - NOCC ≤ 128 (stationary M dim of both nc_matmul calls).
+        - NOCC ≤ 128 (stationary M dim of the step-2 nc_matmul).
 
         Inputs
         ------
         eri   : (nbasis, nbasis, naux) — AO-basis density-fitted ERIs;
-                nbasis is a multiple of TILE_N (dispatcher pads).
+                nbasis is a multiple of TILE_K (dispatcher pads).
         C_occ : (nbasis, nocc)         — occupied MO coefficients.
         C_vir : (nbasis, nvir)         — virtual MO coefficients;
                 nvir is a multiple of TILE_N (dispatcher pads).
@@ -304,32 +302,35 @@ if HAS_NKI:
         _, NVIR = C_vir.shape
 
         B_out = nl.ndarray((NOCC, NVIR, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
-        # Kernel-scratch HBM: holds the post-step-1 intermediate (NOCC, NBASIS) for
-        # each P. Written in TILE_N-wide ν-chunks; reloaded in TILE_K-wide slices.
-        inter_hbm = nl.ndarray((NOCC, NBASIS, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
+        # Kernel-scratch HBM: holds the post-step-1 intermediate, ν-major
+        # (NBASIS, NOCC) for each P. Written and reloaded in TILE_K-row ν-chunks.
+        inter_hbm = nl.ndarray((NBASIS, NOCC, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
 
         for p in nl.affine_range(NAUX):
             # ------------------------------------------------------------------
-            # Step 1: intermediate(i, ν) = Σ_μ C_occ(μ,i) · eri(μ,ν,P)
-            # N-tiled over ν (TILE_N=512 chunks); K-tiled over μ (TILE_K=128).
-            # psum_1 accumulates one (NOCC, TILE_N) ν-block at a time.
+            # Step 1: interᵀ(ν, i) = Σ_μ eri(μ,ν,P) · C_occ(μ,i)
+            # Tiled over ν (TILE_K=128 chunks, the stationary free-dim limit);
+            # K-tiled over μ (TILE_K). The eri tile is the stationary operand,
+            # so PSUM comes out already ν-major — exactly the (partition=ν,
+            # free=i) layout step 2 needs as its stationary operand. No
+            # transposing DMA anywhere (#41).
             # ------------------------------------------------------------------
-            for v_tile in nl.affine_range(NBASIS // TILE_N):
-                v_off = v_tile * TILE_N
-                psum_1 = nl.zeros((NOCC, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            for v_tile in nl.affine_range(NBASIS // TILE_K):
+                v_off = v_tile * TILE_K
+                psum_1 = nl.zeros((TILE_K, NOCC), dtype=nl.float32, buffer=nl.psum)
                 for k_mu in nl.affine_range(NBASIS // TILE_K):
                     k_off = k_mu * TILE_K
+                    # eri tile: (TILE_K, TILE_K) — partition=μ_chunk, free=ν_chunk
+                    eri_tile = nl.load(eri[k_off : k_off + TILE_K, v_off : v_off + TILE_K, p])
                     # C_occ tile: (TILE_K, NOCC) — partition=μ_chunk, free=i
                     C_occ_tile = nl.load(C_occ[k_off : k_off + TILE_K, 0:NOCC])
-                    # eri tile: (TILE_K, TILE_N) — partition=μ_chunk, free=ν_chunk
-                    eri_tile = nl.load(eri[k_off : k_off + TILE_K, v_off : v_off + TILE_N, p])
                     nisa.nc_matmul(
-                        dst=psum_1, stationary=C_occ_tile, moving=eri_tile, accumulate=True
+                        dst=psum_1, stationary=eri_tile, moving=C_occ_tile, accumulate=True
                     )
                 # PSUM → SBUF → kernel-scratch HBM for this ν-chunk.
-                inter_sbuf = nl.ndarray((NOCC, TILE_N), dtype=eri.dtype, buffer=nl.sbuf)
+                inter_sbuf = nl.ndarray((TILE_K, NOCC), dtype=eri.dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(src=psum_1, dst=inter_sbuf)
-                nl.store(inter_hbm[0:NOCC, v_off : v_off + TILE_N, p], value=inter_sbuf)
+                nl.store(inter_hbm[v_off : v_off + TILE_K, 0:NOCC, p], value=inter_sbuf)
 
             # ------------------------------------------------------------------
             # Step 2: B(i, a) = Σ_ν intermediate(ν,i) · C_vir(ν,a)
@@ -341,9 +342,8 @@ if HAS_NKI:
                 psum_2 = nl.zeros((NOCC, TILE_N), dtype=nl.float32, buffer=nl.psum)
                 for k_nu in nl.affine_range(NBASIS // TILE_K):
                     k_off = k_nu * TILE_K
-                    # Load (NOCC, TILE_K) slice and transpose → (TILE_K, NOCC)
-                    # so partition=ν_chunk, free=i.
-                    inter_tile = nl.load_transpose2d(inter_hbm[0:NOCC, k_off : k_off + TILE_K, p])
+                    # interᵀ tile: (TILE_K, NOCC) — partition=ν_chunk, free=i.
+                    inter_tile = nl.load(inter_hbm[k_off : k_off + TILE_K, 0:NOCC, p])
                     # C_vir tile: (TILE_K, TILE_N) — partition=ν_chunk, free=a_chunk
                     C_vir_tile = nl.load(C_vir[k_off : k_off + TILE_K, a_off : a_off + TILE_N])
                     nisa.nc_matmul(

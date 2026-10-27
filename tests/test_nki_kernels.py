@@ -257,15 +257,17 @@ class TestAoToMoTransformKTiling:
         e_ref = _cpu_mp2_energy(B_ref, eps_occ, eps_vir)
         torch.testing.assert_close(e, e_ref, atol=1e-3, rtol=1e-4)
 
-    def test_oversize_raises(self, nki_backend):
-        """nvir > 128 or naux > 128 should raise until K/M tiling lands."""
-        import pytest
-
+    def test_mp2_nvir_over_128_tiles(self, nki_backend):
+        """nvir > 128 used to raise; the M-tiled MP2 kernel now pads 200 → 256
+        and runs two m/n tiles per side."""
         import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
 
-        B = torch.randn(2, 200, 50)
-        with pytest.raises(NotImplementedError, match="nvir.*≤.*128"):
-            trntensor.mp2_energy(B, torch.randn(2), torch.randn(200))
+        B = torch.randn(2, 200, 50) * 0.1
+        eps_occ = -torch.sort(torch.rand(2))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(200))[0] + 0.1
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(e, _cpu_mp2_energy(B, eps_occ, eps_vir), atol=1e-3, rtol=1e-4)
 
 
 class TestXlaResidency:
