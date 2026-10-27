@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Precision promises (Trn2 spike B5, #42).**
+  - `precision="kahan"` on Neuron-device (or other non-fp64) operands now
+    contracts on the host in true fp64 and moves the result back. Before,
+    the "fp64" einsum ran on the device, which has no fp64 datapath. On Trn2
+    fp32 results measured ~1.4 ulp (max componentwise 8.4e-8 at N=128),
+    above the K·2⁻⁵³ + u bound that a real fp64 accumulation plus one
+    rounding satisfies. The bound was right; the extra rounding was the bug.
+  - Error bounds now include the final rounding of the result to its dtype
+    (`u_out`): `"fast"` K·u + u_out, `"sr"` √K·u + u_out, `"dd"` K·u² + u_out,
+    `"kahan"` K·2⁻⁵³ + u_out. `select_precision_for_error` selects on these
+    bounds. When the target is below the floor (≈ 3.9e-3 for bf16 results,
+    6.0e-8 for fp32), it emits a one-time `RuntimeWarning` and returns
+    `"kahan"` instead of silently missing the target. It does not raise.
+    Targets below K·2⁻⁵³ still raise `ValueError`. Because of the `u_out`
+    term, some bf16 targets near 2⁻⁸ now select a more accurate mode than
+    before.
+
 - **NKI 0.7 / neuronx-cc 2.28 kernel compile on Trn2 (#41).**
   - `ao_to_mo_transform_kernel`: step 1 now computes the intermediate
     already transposed (`eri` tile as the stationary operand, ν-major
@@ -34,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `trntensor.forward_error_bound(mode, dtype, K)`: the componentwise error
+  bound each precision mode promises, including output rounding (#42).
 - **Stochastic-rounding runtime guard (#41).** On NKI 0.7 (Neuron SDK
   2.33) the `use_sr` flag no longer chooses the rounding mode. On Trn2,
   with `NEURON_RT_STOCHASTIC_ROUNDING_EN` unset or `0`, both

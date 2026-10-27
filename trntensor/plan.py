@@ -14,6 +14,7 @@ where many contractions share operands.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, field
 
 import torch
@@ -362,33 +363,98 @@ _UNIT_ROUNDOFF: dict = {
 _SR_DD_DTYPES = (torch.bfloat16, torch.float16)
 
 
+_output_floor_warning_emitted = False
+
+
+def _warn_target_below_output_floor(
+    dtype: torch.dtype, K: int, target_forward_error: float, floor: float
+) -> None:
+    """One-time ``RuntimeWarning``: target is below what the result dtype can hold."""
+    global _output_floor_warning_emitted
+    if _output_floor_warning_emitted:
+        return
+    _output_floor_warning_emitted = True
+    warnings.warn(
+        f"trntensor: target_forward_error={target_forward_error:.2e} is below the "
+        f"achievable floor {floor:.2e} for {dtype} results (K={K}). The result is "
+        f"returned in {dtype}, so its final rounding alone contributes up to the "
+        f"unit roundoff u={_UNIT_ROUNDOFF.get(dtype, _UNIT_ROUNDOFF[torch.float32]):.2e} "
+        "per element regardless of how the accumulation is done. Using the most "
+        "accurate mode ('kahan'); pass float32/float64 operands (or dtype=) or "
+        "loosen the target to meet it. This warning is shown once per process.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def forward_error_bound(mode: str, dtype: torch.dtype, K: int) -> float:
+    """Componentwise forward error bound promised for ``mode`` on ``dtype`` results.
+
+    The bound is on ``max_ij |C - C_exact|_ij / (|A| |B|)_ij`` with the exact
+    product taken over the operands as given, and is the accumulation term
+    plus the final rounding of the result to ``dtype`` (unit roundoff
+    ``u_out``)::
+
+        "fast":  K · u   + u_out
+        "sr":    √K · u  + u_out   (expected value, not worst case)
+        "dd":    K · u²  + u_out
+        "kahan": K · 2⁻⁵³ + u_out
+
+    Here ``u`` is the operand unit roundoff; the result is returned in the
+    operand dtype, so ``u_out == u``. ``u_out`` is the floor no mode can beat.
+    """
+    u = _UNIT_ROUNDOFF.get(dtype, _UNIT_ROUNDOFF[torch.float32])
+    if mode == "fast":
+        accum = K * u
+    elif mode == "sr":
+        accum = K**0.5 * u
+    elif mode == "dd":
+        accum = K * u * u
+    elif mode == "kahan":
+        accum = K * _UNIT_ROUNDOFF[torch.float64]
+    else:
+        raise ValueError(f"unknown precision mode {mode!r}")
+    return accum + u
+
+
 def select_precision_for_error(dtype: torch.dtype, K: int, target_forward_error: float) -> str:
     """Select the cheapest precision mode whose forward error bound ≤ target.
 
     Selects from ``"fast"`` → ``"sr"`` → ``"dd"`` → ``"kahan"`` in order of
-    increasing cost. Returns the first mode whose theoretical error bound
-    satisfies ``target_forward_error``.
+    increasing cost. Returns the first mode whose error bound (see
+    :func:`forward_error_bound`) satisfies ``target_forward_error``.
 
     Args:
-        dtype: Operand dtype. Determines unit roundoff u.
+        dtype: Operand dtype (= result dtype). Determines unit roundoff u.
         K: Product of all contracted dimension sizes.
-        target_forward_error: Desired upper bound on relative forward error
-            per output element.
+        target_forward_error: Desired upper bound on componentwise relative
+            forward error per output element.
 
     Returns:
         ``"fast"``, ``"sr"``, ``"dd"``, or ``"kahan"``.
 
     Raises:
-        ValueError: If even ``"kahan"`` (K · u_f64) cannot achieve the target.
+        ValueError: If even an exact FP64 accumulation (K · u_f64) cannot
+            achieve the target.
 
-    Error bounds (Higham 2002 §3, Connolly–Higham–Mary SIAM 2021):
+    Warns:
+        RuntimeWarning: Once per process, when the target is below the
+            result dtype's floor (``"kahan"``'s bound, ≈ u of ``dtype``):
+            the result is rounded to ``dtype`` at the end, so no accumulation
+            mode can meet the target. ``"kahan"`` (the most accurate mode) is
+            returned anyway.
+
+    Error bounds (Higham 2002 §3, Connolly–Higham–Mary SIAM 2021), with
+    u_out the unit roundoff of the result dtype:
 
     .. code-block:: text
 
-        "fast":  K · u              Wilkinson worst-case, round-to-nearest
-        "sr":    √K · u             Expected; mean-zero bias — statistical, not worst-case
-        "dd":    K · u²             Ozaki-2 worst-case
-        "kahan": K · 2⁻⁵³          FP64 Wilkinson worst-case
+        "fast":  K · u   + u_out    Wilkinson worst-case, round-to-nearest
+        "sr":    √K · u  + u_out    Expected; mean-zero bias — statistical, not worst-case
+        "dd":    K · u²  + u_out    Ozaki-2 worst-case
+        "kahan": K · 2⁻⁵³ + u_out   FP64 accumulation, one final rounding
+
+    For BF16 the floor is u_out = 2⁻⁸ ≈ 3.9e-3; for FP32, 2⁻²⁴ ≈ 6.0e-8.
 
     ``"sr"`` and ``"dd"`` are only considered for BF16 and FP16 inputs —
     those are the dtypes where NKI SR and Ozaki splitting are meaningful.
@@ -397,21 +463,24 @@ def select_precision_for_error(dtype: torch.dtype, K: int, target_forward_error:
     Trainium NKI path that requires ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1`` at
     process start; when ``"sr"`` is selected without it, execution emits a
     one-time ``RuntimeWarning`` and rounds to nearest, so the effective bound
-    is the ``"fast"`` one (K · u).
+    is the ``"fast"`` one (K · u + u_out).
     """
-    u = _UNIT_ROUNDOFF.get(dtype, _UNIT_ROUNDOFF[torch.float32])
     u_f64 = _UNIT_ROUNDOFF[torch.float64]
 
-    if K * u <= target_forward_error:
+    if forward_error_bound("fast", dtype, K) <= target_forward_error:
         return "fast"
-    if dtype in _SR_DD_DTYPES and K**0.5 * u <= target_forward_error:
+    if dtype in _SR_DD_DTYPES and forward_error_bound("sr", dtype, K) <= target_forward_error:
         return "sr"
-    if dtype in _SR_DD_DTYPES and K * u * u <= target_forward_error:
+    if dtype in _SR_DD_DTYPES and forward_error_bound("dd", dtype, K) <= target_forward_error:
         return "dd"
-    if K * u_f64 <= target_forward_error:
-        return "kahan"
-    raise ValueError(
-        f"Cannot achieve target_forward_error={target_forward_error:.2e} for "
-        f"K={K}, dtype={dtype}. "
-        f"Best available: 'kahan' (K·u_f64 ≈ {K * u_f64:.2e})."
-    )
+    if K * u_f64 > target_forward_error:
+        raise ValueError(
+            f"Cannot achieve target_forward_error={target_forward_error:.2e} for "
+            f"K={K}, dtype={dtype}. "
+            f"Best available: 'kahan' (K·u_f64 ≈ {K * u_f64:.2e}, plus the "
+            f"{dtype} output rounding)."
+        )
+    floor = forward_error_bound("kahan", dtype, K)
+    if floor > target_forward_error:
+        _warn_target_below_output_floor(dtype, K, target_forward_error, floor)
+    return "kahan"

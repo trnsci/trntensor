@@ -538,10 +538,11 @@ class TestTargetForwardError:
         assert result.shape == (8, 8)
 
     def test_tight_target_selects_dd(self):
-        """K=64 BF16 with target=0.003 selects 'dd' (64·u_bf² ≈ 0.00098 < 0.003)."""
+        """K=64 BF16 with target=0.006 selects 'dd' (64·u_bf² + u_bf ≈ 0.0049 < 0.006)."""
+        assert trntensor.select_precision_for_error(torch.bfloat16, 64, 0.006) == "dd"
         A = torch.randn(16, 64, dtype=torch.bfloat16)
         B = torch.randn(64, 16, dtype=torch.bfloat16)
-        result = trntensor.einsum("ij,jk->ik", A, B, target_forward_error=0.003)
+        result = trntensor.einsum("ij,jk->ik", A, B, target_forward_error=0.006)
         assert result.shape == (16, 16)
 
     def test_very_tight_selects_kahan(self):
@@ -676,3 +677,112 @@ class TestMultiEinsumBatched:
         assert len(results) == 2
         np.testing.assert_allclose(results[0].numpy(), (A @ B).numpy(), atol=1e-5)
         np.testing.assert_allclose(results[1].item(), (A * A).sum().item(), atol=1e-5)
+
+
+def _componentwise_err(C, A, B):
+    """max |C - C64| / (|A||B|), the metric the precision bounds are stated in."""
+    A64, B64 = A.double(), B.double()
+    return ((C.double() - A64 @ B64).abs() / (A64.abs() @ B64.abs())).max().item()
+
+
+class TestPrecisionPromises:
+    """Bounds include the output-dtype rounding; targets below it warn (Trn2 B5)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_floor_warning(self, monkeypatch):
+        import trntensor.plan
+
+        monkeypatch.setattr(trntensor.plan, "_output_floor_warning_emitted", False)
+
+    def test_bounds_include_output_rounding(self):
+        u_bf, u32, u64 = 2**-8, 2**-24, 2**-53
+        feb = trntensor.forward_error_bound
+        assert feb("fast", torch.bfloat16, 128) == 128 * u_bf + u_bf
+        assert feb("sr", torch.bfloat16, 64) == 8 * u_bf + u_bf
+        assert feb("dd", torch.bfloat16, 64) == 64 * u_bf**2 + u_bf
+        assert feb("kahan", torch.float32, 128) == 128 * u64 + u32
+        with pytest.raises(ValueError, match="unknown precision"):
+            feb("nope", torch.float32, 4)
+
+    @pytest.mark.parametrize(
+        "dtype,target", [(torch.bfloat16, 1e-4), (torch.bfloat16, 1e-6), (torch.float32, 1e-8)]
+    )
+    def test_target_below_floor_warns_and_returns_kahan(self, dtype, target):
+        with pytest.warns(RuntimeWarning, match="below the achievable floor"):
+            assert trntensor.select_precision_for_error(dtype, 128, target) == "kahan"
+
+    def test_floor_warning_once_per_process(self):
+        import warnings
+
+        with pytest.warns(RuntimeWarning):
+            trntensor.select_precision_for_error(torch.bfloat16, 128, 1e-4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            trntensor.select_precision_for_error(torch.bfloat16, 128, 1e-4)
+
+    def test_achievable_target_does_not_warn(self):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            # fp32, K=128: kahan bound ≈ 6.0e-8 ≤ 1e-7
+            assert trntensor.select_precision_for_error(torch.float32, 128, 1e-7) == "kahan"
+            assert trntensor.select_precision_for_error(torch.float32, 4, 1e-6) == "fast"
+            assert trntensor.select_precision_for_error(torch.bfloat16, 4, 0.1) == "fast"
+
+    def test_impossible_target_still_raises(self):
+        with pytest.raises(ValueError, match="kahan"):
+            trntensor.select_precision_for_error(torch.float32, 128, 1e-20)
+
+    def test_einsum_below_floor_warns_but_returns(self):
+        torch.manual_seed(0)
+        A = torch.randn(32, 128, dtype=torch.bfloat16)
+        B = torch.randn(128, 32, dtype=torch.bfloat16)
+        with pytest.warns(RuntimeWarning, match="bfloat16"):
+            C = trntensor.einsum("ij,jk->ik", A, B, target_forward_error=1e-4)
+        assert C.dtype == torch.bfloat16
+        assert _componentwise_err(C, A, B) <= trntensor.forward_error_bound(
+            "kahan", torch.bfloat16, 128
+        )
+
+    def test_multi_einsum_below_floor_warns(self):
+        A = torch.randn(16, 64)
+        Bs = [torch.randn(64, 16) for _ in range(3)]
+        with pytest.warns(RuntimeWarning, match="float32"):
+            outs = trntensor.multi_einsum(
+                *[("ij,jk->ik", A, b) for b in Bs], target_forward_error=1e-8
+            )
+        assert len(outs) == 3
+
+    @pytest.mark.parametrize("n", [128, 256])
+    def test_kahan_fp32_within_one_ulp(self, n):
+        """precision='kahan' fp32 meets K·2⁻⁵³ + u_fp32 (B5 measured 1.4 ulp on Trn2)."""
+        g = torch.Generator().manual_seed(n)
+        A = torch.randn(n, n, generator=g, dtype=torch.float64).float()
+        B = torch.randn(n, n, generator=g, dtype=torch.float64).float()
+        C = trntensor.einsum("ij,jk->ik", A, B, precision="kahan")
+        assert _componentwise_err(C, A, B) <= trntensor.forward_error_bound(
+            "kahan", torch.float32, n
+        )
+
+    def test_kahan_contracts_on_host_for_non_fp64_device(self, monkeypatch):
+        """Operands on a device without fp64 are contracted on the host in fp64."""
+        import sys
+
+        te = sys.modules["trntensor.einsum"]
+
+        monkeypatch.setattr(te, "_FP64_DEVICE_TYPES", ())
+        calls = []
+        real_einsum = torch.einsum
+
+        def spy(sub, *ops):
+            calls.append([(op.device.type, op.dtype) for op in ops])
+            return real_einsum(sub, *ops)
+
+        monkeypatch.setattr(te.torch, "einsum", spy)
+        A = torch.randn(16, 32)
+        B = torch.randn(32, 8)
+        C = trntensor.einsum("ij,jk->ik", A, B, precision="kahan")
+        assert calls == [[("cpu", torch.float64), ("cpu", torch.float64)]]
+        assert C.dtype == torch.float32 and C.device.type == "cpu"
+        torch.testing.assert_close(C, (A.double() @ B.double()).float())
