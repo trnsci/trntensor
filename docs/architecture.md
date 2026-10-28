@@ -67,10 +67,13 @@ A third pattern — **user-level operand residency** — exposes that same data-
 - **`"fast"`** (default) — native operand dtype; NKI kernels accumulate in fp32
   via PSUM, result returned in operand dtype. No overhead.
 - **`"kahan"`** — promotes all operands to fp64 before contracting (via
-  `torch.einsum`), casts result back to original dtype. Provides ~15.9
-  significant digits of accumulation accuracy. Bypasses NKI dispatch so it
-  works on CPU without Trainium hardware. Useful for DF-MP2/CCSD energy
-  convergence where fp32's ~7.2 digits are insufficient.
+  `torch.einsum`), casts result back to original dtype. The accumulation is
+  fp64-accurate (error K·2⁻⁵³), but the result carries one final rounding to
+  its dtype (u_out), so an fp32 result is good to ~1 ulp of fp32, not 16
+  digits. Bypasses NKI dispatch; operands on the Neuron device are
+  contracted on the host, since Trainium has no fp64 datapath. Useful for
+  DF-MP2/CCSD reductions (e.g. a large sum into a scalar) where fp32
+  accumulation error, K·u, would dominate.
 - **`"dd"`** — double-double accumulation via trnblas Phase 2 fused GEMM kernel.
   Not yet available; raises `NotImplementedError`. Tracked in trnblas#22.
 

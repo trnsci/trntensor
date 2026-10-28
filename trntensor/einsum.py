@@ -80,7 +80,10 @@ def einsum(
             error bound satisfies the target: ``"fast"`` → ``"sr"`` → ``"dd"``
             → ``"kahan"``. Cannot be combined with an explicit ``precision=``
             argument. See :func:`~trntensor.select_precision_for_error` for
-            the exact error bounds used.
+            the exact error bounds used. The result is returned in the operand
+            dtype, whose unit roundoff is a floor no mode can beat (bf16
+            ≈ 3.9e-3, fp32 ≈ 6.0e-8); a target below it emits a one-time
+            ``RuntimeWarning`` and runs ``"kahan"``.
 
     Note:
         On Trainium (NKI 0.7+) stochastic rounding — ``precision="sr"``,
@@ -362,12 +365,36 @@ def _execute_sharded(
     return _mock_allreduce(partials)
 
 
+# Device types whose kernels compute genuine IEEE fp64. Anything else (the
+# TorchNeuron "neuron" device, XLA, MPS) has no fp64 datapath — Trainium
+# engines top out at fp32 — so a float64 contraction there is not a true
+# fp64 accumulation. On Trn2 (SDK 2.33) precision="kahan" on device operands
+# measured ~1.4 ulp of fp32 componentwise error, which an fp64 accumulation
+# followed by one rounding cannot produce (it is bounded by 1 ulp + K·2⁻⁵³).
+_FP64_DEVICE_TYPES = ("cpu", "cuda")
+
+
+def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
+    """Contract in true fp64 and round once to the operand dtype.
+
+    Operands on a device without native fp64 are contracted on the host and
+    the result is moved back, so the only rounding beyond the fp64
+    accumulation is the final cast to the operand dtype (``u_out``).
+    """
+    orig_dtype = operands[0].dtype if operands else torch.float32
+    orig_device = operands[0].device if operands else torch.device("cpu")
+    if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
+        result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
+        return result.to(orig_dtype)
+    host = (op.to(device="cpu", dtype=torch.float64) for op in operands)
+    result = torch.einsum(subscripts, *host).to(orig_dtype)
+    return result.to(orig_device)
+
+
 def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
     """Execute contraction according to plan."""
     if plan.precision == "kahan":
-        orig_dtype = operands[0].dtype if operands else torch.float32
-        result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
-        return result.to(orig_dtype)
+        return _einsum_fp64(subscripts, operands)
     elif plan.precision == "dd":
         from .nki.dispatch import HAS_NKI, _ozaki_matmul_cpu
 
@@ -387,9 +414,7 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
             return result.to(A.dtype)
         if plan.strategy == "path":
             return _execute_path(subscripts, operands, plan)
-        orig_dtype = operands[0].dtype if operands else torch.float32
-        result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
-        return result.to(orig_dtype)
+        return _einsum_fp64(subscripts, operands)
     if plan.strategy == "torch":
         return torch.einsum(subscripts, *operands)
     elif plan.strategy == "bmm":

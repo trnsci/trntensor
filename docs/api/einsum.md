@@ -87,7 +87,7 @@ result = trntensor.einsum("ij,jk->ik", A, B, dtype=torch.float16)
 | Value | Behavior |
 |-------|----------|
 | `"fast"` | Native operand dtype; NKI kernels accumulate in fp32 via PSUM |
-| `"kahan"` | Promotes operands to fp64 before contracting, casts back to original dtype; ~15.9 significant digits; bypasses NKI dispatch (runs on CPU) |
+| `"kahan"` | Contracts in fp64 and rounds once back to the operand dtype; bypasses NKI dispatch. Operands on a device without native fp64 (the Neuron device, XLA) are contracted on the host and the result moved back. Error ≤ K·2⁻⁵³ + u_out, so the result is as accurate as its dtype allows (~1 ulp), not ~16 digits, unless the operands are float64 |
 | `"sr"` | Stochastic rounding at the PSUM→SBUF downcast (BF16/FP16); mean-zero √K·u error instead of K·u. On Trainium requires `NEURON_RT_STOCHASTIC_ROUNDING_EN=1` at process start (see below) |
 | `"dd"` | Double-double accumulation via trnblas Phase 2 — raises `NotImplementedError` until trnblas#22 lands |
 
@@ -95,6 +95,30 @@ result = trntensor.einsum("ij,jk->ik", A, B, dtype=torch.float16)
 # High-precision DF-MP2 energy accumulation
 E_corr = trntensor.einsum("ijab,ijab->", T, T2, precision="kahan")
 ```
+
+#### Error bounds and the output-dtype floor
+
+Every mode's promise is a componentwise bound on
+`max |C − C_exact| / (|A||B|)`, with `u` the operand unit roundoff and
+`u_out` the unit roundoff of the result dtype (the result is returned in the
+operand dtype, so `u_out = u`):
+
+| Mode | Bound |
+|------|-------|
+| `"fast"` | K·u + u_out |
+| `"sr"` | √K·u + u_out (expected value) |
+| `"dd"` | K·u² + u_out |
+| `"kahan"` | K·2⁻⁵³ + u_out |
+
+`trntensor.forward_error_bound(mode, dtype, K)` returns these values.
+The `u_out` term is the final rounding of the result and is a **floor no
+accumulation mode can beat**: about 3.9e-3 for bf16 results and 6.0e-8 for
+fp32. `target_forward_error=` uses these bounds to pick the cheapest mode.
+When the target is below the floor (e.g. `1e-4` on bf16 inputs, `1e-8` on
+fp32 inputs), `einsum` / `multi_einsum` emit a one-time `RuntimeWarning`
+and still run the most accurate mode, `"kahan"`. To actually meet such a
+target, pass float32 or float64 operands (or `dtype=`), or loosen the
+target. A target below K·2⁻⁵³ raises `ValueError`.
 
 #### Stochastic rounding on Trainium is a runtime setting
 
