@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reduce-parallel sharding on real multi-rank all-reduce (Phase 4 prototype).**
+  Before this change, reduce-parallel and mixed output/reduce-parallel einsums
+  raised `NotImplementedError` whenever `HAS_NKI` was true.
+  - Under an initialized `torch.distributed` group with
+    `world_size == n_shards > 1`, rank `r` now computes only shard `r`'s
+    partial on its own device. The partials are combined with a real
+    all-reduce. Single-process runs keep `_mock_allreduce`.
+  - The backend is chosen by `trntensor.parallel.allreduce_backend`. `auto`
+    selects `nki` under a `"neuron"` process group, `torch` under any other
+    group, and `mock` otherwise. Override it with
+    `TRNTENSOR_ALLREDUCE=mock|torch|nki|auto` or `parallel.set_allreduce_backend()`.
+    An explicit `torch`/`nki` request that cannot be honored raises
+    `RuntimeError`; it never falls back to replicated compute.
+  - `trntensor.nki.collectives.nki_all_reduce_sum` is an `@nki.jit` kernel
+    using `nki.collectives.all_reduce(op=add)` on named `shared_hbm` buffers,
+    invoked via `torch_neuronx.wrap_nki(k)[(lnc,)]`. This is the pattern
+    measured bit-exact on Trn2 (SDK 2.33, NKI 0.7.0, LNC=2) in trnsci spike B4.
+    `private_hbm` gave wrong values at LNC=2.
+  - `scripts/run_reduce_parallel_multirank.py` runs multi-rank checks: one
+    process per rank, core pinning, hard timeouts, and per-rank logs. It
+    checks `ij,jk->ik` with `j` sharded at n = 512–2048 against the
+    single-device result (fp32 rel err ≤ 1e-5) and requires all ranks to
+    agree. It also reports bit-exactness against a fixed-order sum, plus
+    timings. Pass `--cpu` for a gloo pre-flight. Rank cores must be an
+    aligned pair or quad (0-1, 2-3, 0-3).
+
 ### Fixed
 
 - **Precision promises (Trn2 spike B5, #42).**

@@ -7,10 +7,29 @@ operands and dispatches each shard independently, enabling output-parallel
 contractions where each shard's result is fully independent (no cross-shard
 communication required).
 
-Reduce-parallel sharding (contracting the sharded dimension across cores)
-requires all-reduce collective operations (``nki.collectives``). This is
-blocked on Neuron SDK 2.30+; those patterns raise ``NotImplementedError``
-until then with a clear upgrade note.
+Reduce-parallel sharding (contracting the sharded dimension) produces one
+partial result per shard; the partials are summed by an all-reduce. The
+backend is chosen by :func:`allreduce_backend`:
+
+- ``"mock"``: single process. Every shard's partial is computed locally and
+  summed with :func:`_mock_allreduce` (a torch sum). This is the CPU path and
+  the fallback when no multi-rank process group is active.
+- ``"torch"``: multi-rank. ``torch.distributed`` is initialized with
+  ``world_size > 1`` and ``n_shards == world_size``. Rank ``r`` computes only
+  shard ``r``'s partial on its own device and the partials are combined with
+  ``torch.distributed.all_reduce(SUM)``. Works for any c10d backend (gloo,
+  TorchNeuron's ``"neuron"``).
+- ``"nki"``: same rank-local compute, combined by an NKI kernel calling
+  ``nki.collectives.all_reduce(op=add)`` on ``shared_hbm`` buffers (see
+  :mod:`trntensor.nki.collectives`). Needs TorchNeuron and a ``"neuron"``
+  process group.
+
+``auto`` (the default) picks ``"nki"`` under a ``"neuron"`` process group,
+``"torch"`` under any other multi-rank group, and ``"mock"`` otherwise. Set
+``TRNTENSOR_ALLREDUCE=mock|torch|nki|auto`` to override, or call
+:func:`set_allreduce_backend`. A rank-local backend still accepts a
+ShardedTensor holding every chunk; only chunk ``rank`` is read, so the other
+chunks may stay on the host.
 
 Usage::
 
@@ -28,6 +47,9 @@ Usage::
 """
 
 from __future__ import annotations
+
+import os
+from collections.abc import Callable
 
 import torch
 
@@ -170,9 +192,9 @@ def shard_boundaries(st: ShardedTensor) -> list[tuple[int, int]]:
 def _mock_allreduce(partials: list[torch.Tensor]) -> torch.Tensor:
     """Mock all-reduce for CPU testing: sum partial contractions across simulated shards.
 
-    On Trainium, this operation maps to ``nki.collectives.allreduce`` (arriving
-    in Neuron SDK 2.30+). This torch-based implementation enables reduce-parallel
-    sharding to be tested on CPU without hardware.
+    Used when no multi-rank process group is active (see
+    :func:`allreduce_backend`). All partials live in this process; the sum is
+    a single ``torch.stack(...).sum(0)``.
 
     Args:
         partials: Per-shard partial contraction results, all of identical shape.
@@ -181,3 +203,125 @@ def _mock_allreduce(partials: list[torch.Tensor]) -> torch.Tensor:
         Element-wise sum of all partials — the all-reduced result.
     """
     return torch.stack(partials).sum(dim=0)
+
+
+# --------------------------------------------------------------------------- #
+# All-reduce backend selection for reduce-parallel contractions                 #
+# --------------------------------------------------------------------------- #
+
+ALLREDUCE_ENV_VAR = "TRNTENSOR_ALLREDUCE"
+_ALLREDUCE_CHOICES = ("auto", "mock", "torch", "nki")
+_allreduce_override: str | None = None
+
+
+def set_allreduce_backend(backend: str | None) -> None:
+    """Force the reduce-parallel all-reduce backend for this process.
+
+    Args:
+        backend: ``"auto"``, ``"mock"``, ``"torch"``, ``"nki"``, or ``None``
+            to clear the override (then ``TRNTENSOR_ALLREDUCE`` or ``auto``
+            applies). Takes precedence over the environment variable.
+    """
+    global _allreduce_override
+    if backend is not None and backend not in _ALLREDUCE_CHOICES:
+        raise ValueError(f"allreduce backend must be one of {_ALLREDUCE_CHOICES}, got {backend!r}")
+    _allreduce_override = backend
+
+
+def _requested_allreduce() -> str:
+    if _allreduce_override is not None:
+        return _allreduce_override
+    req = os.environ.get(ALLREDUCE_ENV_VAR, "auto").strip().lower() or "auto"
+    if req not in _ALLREDUCE_CHOICES:
+        raise ValueError(f"{ALLREDUCE_ENV_VAR}={req!r}; expected one of {_ALLREDUCE_CHOICES}")
+    return req
+
+
+def _process_group() -> tuple[int, int, str] | None:
+    """``(rank, world_size, backend)`` of the default process group, or None."""
+    try:
+        import torch.distributed as dist
+    except ImportError:  # pragma: no cover - torch built without distributed
+        return None
+    if not (dist.is_available() and dist.is_initialized()):
+        return None
+    return dist.get_rank(), dist.get_world_size(), str(dist.get_backend()).lower()
+
+
+def allreduce_backend(n_shards: int) -> str:
+    """Resolve the all-reduce backend for a reduce-parallel contraction.
+
+    Rank-local backends (``"torch"``, ``"nki"``) need an initialized
+    ``torch.distributed`` process group with ``world_size > 1`` equal to
+    ``n_shards``: shard ``r`` belongs to rank ``r``. Under ``auto``, any other
+    situation (no group, ``world_size == 1``, or a shard count that does not
+    match the world) falls back to ``"mock"``, where each rank computes the
+    full sum itself. An explicit ``"torch"``/``"nki"`` request that cannot be
+    honored raises ``RuntimeError`` instead of silently running replicated.
+
+    Args:
+        n_shards: Number of reduce-parallel shards in the contraction.
+
+    Returns:
+        ``"mock"``, ``"torch"``, or ``"nki"``.
+    """
+    req = _requested_allreduce()
+    if req == "mock":
+        return "mock"
+    pg = _process_group()
+    usable = pg is not None and pg[1] > 1 and pg[1] == n_shards
+    if req == "auto":
+        if not usable:
+            return "mock"
+        return "nki" if pg[2] == "neuron" else "torch"
+    if not usable:
+        state = (
+            "no torch.distributed process group is initialized"
+            if pg is None
+            else f"world_size={pg[1]} but the contraction has n_shards={n_shards}"
+        )
+        raise RuntimeError(
+            f"{ALLREDUCE_ENV_VAR}={req!r} needs a multi-rank process group with "
+            f"world_size == n_shards > 1; {state}. Use 'auto' or 'mock' for a "
+            "single-process run."
+        )
+    if req == "nki" and pg[2] != "neuron":
+        raise RuntimeError(
+            f"{ALLREDUCE_ENV_VAR}='nki' needs a 'neuron' process group "
+            f"(TorchNeuron); the active backend is {pg[2]!r}."
+        )
+    return req
+
+
+def _dist_allreduce(t: torch.Tensor) -> torch.Tensor:
+    """Sum ``t`` across all ranks with ``torch.distributed.all_reduce``."""
+    import torch.distributed as dist
+
+    y = t.contiguous().clone()
+    dist.all_reduce(y, op=dist.ReduceOp.SUM)
+    return y
+
+
+def reduce_partials(compute_partial: Callable[[int], torch.Tensor], n_shards: int) -> torch.Tensor:
+    """Compute and all-reduce the per-shard partials of a reduce-parallel contraction.
+
+    Args:
+        compute_partial: ``compute_partial(i)`` returns shard ``i``'s partial
+            contraction (full output shape).
+        n_shards: Number of reduce-parallel shards.
+
+    Returns:
+        The summed result. Under a rank-local backend every rank returns the
+        same tensor on its own device, having computed only its own partial.
+    """
+    backend = allreduce_backend(n_shards)
+    if backend == "mock":
+        return _mock_allreduce([compute_partial(i) for i in range(n_shards)])
+    import torch.distributed as dist
+
+    local = compute_partial(dist.get_rank())
+    if backend == "torch":
+        return _dist_allreduce(local)
+    from .nki.collectives import nki_all_reduce_sum
+
+    return nki_all_reduce_sum(local)
