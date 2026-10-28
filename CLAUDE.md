@@ -24,7 +24,10 @@ trntensor/
 │   ├── decompose.py     # cp_decompose, tucker_decompose (HOSVD)
 │   └── nki/
 │       ├── __init__.py
-│       └── dispatch.py  # Fused contraction kernels
+│       ├── _kernels.py  # @nki.jit kernels
+│       ├── _native.py   # TorchNeuron custom ops (nki_op), loaded lazily
+│       ├── collectives.py  # nki.collectives all-reduce (reduce-parallel)
+│       └── dispatch.py  # host wrappers, dispatch-path selection, _launch
 ├── tests/
 │   ├── test_einsum.py   # Matmul, bmm, 4-index transform, DF-MP2 pattern
 │   └── test_decompose.py # CP rank-1/low-rank, Tucker orthogonality

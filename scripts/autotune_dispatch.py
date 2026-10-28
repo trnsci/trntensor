@@ -15,6 +15,14 @@ Run on trn1 (via SSM or directly):
     TRNTENSOR_FORCE_BACKEND=nki python scripts/autotune_dispatch.py
     TRNTENSOR_FORCE_BACKEND=nki python scripts/autotune_dispatch.py --write-cache
 
+The script is dispatch-path aware. On TorchNeuron (native, Trn2/Trn3) it
+launches the ``trntensor::matmul`` op on the ``neuron`` device and reports /
+writes the native threshold (TRNTENSOR_MIN_NKI_FLOPS_NATIVE,
+cache key ``trntensor_min_nki_flops_native``); on the XLA lineage it times
+the kernel on the XLA device and writes ``trntensor_min_nki_flops`` as
+before. An existing cache file is updated, not replaced, so one file can
+hold both paths' values.
+
 The --write-cache flag writes the recommendation to
 /var/tmp/trntensor-autotune/threshold.json so dispatch.py can read it
 on next start (pass TRNTENSOR_AUTOTUNE_CACHE to override the path).
@@ -69,8 +77,28 @@ def time_pytorch(A: torch.Tensor, B: torch.Tensor) -> float:
     return sum(times) / len(times)
 
 
+def _native() -> bool:
+    from trntensor.nki.dispatch import _get_dispatch_path
+
+    return _get_dispatch_path() == "native"
+
+
 def time_nki(A: torch.Tensor, B: torch.Tensor) -> float:
     """Return mean wall-clock seconds for nki_matmul over REPEATS runs."""
+    if _native():
+        from trntensor.nki.dispatch import _get_native_ops
+
+        op = _get_native_ops()["matmul"]
+        a_n, b_n = A.contiguous().to("neuron"), B.contiguous().to("neuron")
+        for _ in range(WARMS):
+            _ = op(a_n, b_n).cpu()
+        times = []
+        for _ in range(REPEATS):
+            t0 = time.perf_counter()
+            _ = op(a_n, b_n).cpu()
+            times.append(time.perf_counter() - t0)
+        return sum(times) / len(times)
+
     from trntensor.nki.dispatch import _to_xla
 
     (a_x, b_x), orig = _to_xla(A.contiguous(), B.contiguous())
@@ -203,10 +231,16 @@ def main() -> None:
     magnitude = 10 ** int(math.log10(recommended))
     recommended = (recommended // magnitude + 1) * magnitude
 
-    current = int(os.environ.get("TRNTENSOR_MIN_NKI_FLOPS", "2000000000"))
+    from trntensor.nki import dispatch
+
+    native = _native()
+    env_var = "TRNTENSOR_MIN_NKI_FLOPS_NATIVE" if native else "TRNTENSOR_MIN_NKI_FLOPS"
+    cache_key = "trntensor_min_nki_flops_native" if native else "trntensor_min_nki_flops"
+    current = dispatch._MIN_NKI_FLOPS_NATIVE if native else dispatch._MIN_NKI_FLOPS
+    print(f"Dispatch path:           {'native' if native else 'xla'}")
     print(f"First NKI win at:        {first_nki_win_flops:,d} FLOPs")
     print(f"Recommended threshold:   {recommended:,d} FLOPs")
-    print(f"Current TRNTENSOR_MIN_NKI_FLOPS: {current:,d}")
+    print(f"Current {env_var}: {current:,d}")
     if recommended != current:
         delta_pct = (recommended - current) / current * 100
         sign = "+" if delta_pct > 0 else ""
@@ -215,15 +249,22 @@ def main() -> None:
         print("  → matches current value (no change needed)")
 
     print()
-    print(f"To apply:  export TRNTENSOR_MIN_NKI_FLOPS={recommended}")
+    print(f"To apply:  export {env_var}={recommended}")
 
     if args.write_cache:
-        cache = {
-            "trntensor_min_nki_flops": recommended,
-            "first_nki_win_flops": first_nki_win_flops,
-            "shapes_measured": rows,
-        }
         cache_path = Path(os.environ.get("TRNTENSOR_AUTOTUNE_CACHE", args.cache_path))
+        suffix = "_native" if native else ""
+        try:
+            cache = json.loads(cache_path.read_text())
+        except (OSError, ValueError):
+            cache = {}
+        cache.update(
+            {
+                cache_key: recommended,
+                f"first_nki_win_flops{suffix}": first_nki_win_flops,
+                f"shapes_measured{suffix}": rows,
+            }
+        )
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(cache, indent=2))
         print(f"Wrote calibration cache to: {cache_path}")

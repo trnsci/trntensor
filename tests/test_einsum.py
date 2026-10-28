@@ -194,7 +194,7 @@ class TestPathExecution:
         On CPU-only installs (HAS_NKI=False) this degrades to a correctness check.
         """
         from trntensor.nki import HAS_NKI
-        from trntensor.nki.dispatch import _MIN_NKI_FLOPS
+        from trntensor.nki.dispatch import _nki_flop_threshold
 
         # Both binary steps are 512×512×512 → well above default _MIN_NKI_FLOPS
         torch.manual_seed(3)
@@ -210,7 +210,7 @@ class TestPathExecution:
         trntensor.clear_plan_cache()
         step_plan = trntensor.plan_contraction("ij,jk->ik", A, B)
         assert step_plan.strategy == "matmul"
-        if HAS_NKI and _MIN_NKI_FLOPS <= 512 * 512 * 512:
+        if HAS_NKI and _nki_flop_threshold(pinned=False) <= 512 * 512 * 512:
             assert step_plan.backend == "nki"
 
 

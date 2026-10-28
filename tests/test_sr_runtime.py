@@ -24,6 +24,9 @@ def native_path(monkeypatch):
     monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
     monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS", 0)
     monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_PINNED", 0)
+    # Launches take the XLA branch of dispatch._launch, with the transfer
+    # stubbed out, so the stand-in kernels below run on CPU tensors.
+    monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
     monkeypatch.setattr(dispatch, "_to_xla", lambda *ts: (ts, ts[0].device))
     monkeypatch.setattr(_kernels, "matmul_kernel", lambda a, b, use_sr=False: a @ b, raising=False)
     monkeypatch.setattr(

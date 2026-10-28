@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native PyTorch dispatch on TorchNeuron (#41, trnsci/trnsci#35).** On
+  TorchNeuron (Neuron SDK 2.33+, `torch-neuronx` 2.14, PyTorch 2.14,
+  Trn2/Trn3) every host-wrapper NKI kernel is a PyTorch custom op registered
+  with `torch_neuronx.nki_op` and launched on `device="neuron"`, with no
+  `torch_xla` import: `trntensor::matmul`, `batched_matmul`, `mp2_energy`,
+  `ao_to_mo_transform`. Kernel bodies are unchanged. The PyTorch/XLA path
+  (Trn1) is unchanged.
+  - The dispatch path is detected on the first kernel launch, not at
+    import: native when `torch_neuronx` exports `nki_op` and
+    `torch_neuronx.device_count() > 0`, XLA when `torch_xla` is installed,
+    otherwise none. `TRNSCI_NKI_DISPATCH=auto|native|xla` (suite-wide)
+    forces a path; forcing an unavailable one raises.
+  - The ops are registered lazily (`trntensor/nki/_native.py` is imported
+    only on the native path). Every launch goes through one helper,
+    `dispatch._launch`. That covers `einsum` (matmul/bmm/path steps),
+    `multi_einsum` (batched and per-contraction), `ao_to_mo_transform`,
+    `mp2_energy`, and `precision="sr"` (which passes `use_sr=True` to the op).
+    `precision="kahan"` stays a host fp64 contraction, and `"dd"` still
+    raises on NKI hosts (trnblas#22). The reduce-parallel `nki.collectives`
+    all-reduce from Phase 4 is unchanged.
+  - New `to_device` / `from_device` place tensors on the active path's
+    device (`neuron` or XLA). `to_xla` / `from_xla` stay public. On the
+    native path `to_xla` places on `neuron`, so existing residency code keeps
+    working. `multi_einsum` pre-pins shared operands on either device.
+  - FLOP dispatch thresholds are path-aware. The XLA values are unchanged
+    (2 GFLOPs unpinned, 1 GFLOPs pinned). The native path uses provisional
+    1 GFLOPs / 128 MFLOPs, because eager native dispatch costs about 0.2 ms
+    per launch. Override them with `TRNTENSOR_MIN_NKI_FLOPS_NATIVE[_PINNED]`
+    or the `trntensor_min_nki_flops_native[_pinned]` autotune cache keys.
+    `scripts/autotune_dispatch.py` measures and writes the native keys on a
+    TorchNeuron host.
+  - Dormant deprecation hook: with `TRNSCI_XLA_DEPRECATION=1` (off by
+    default), selecting the XLA path and calling `to_xla` / `from_xla` each
+    emit a one-time `DeprecationWarning`. Migration: replace `to_xla` with
+    `to_device` and `from_xla` with `from_device` (docs/api/nki.md).
+  - The `mp2_energy` CPU fallback copies `neuron`-resident operands to the
+    host before its scalar loop, then moves the result back.
+  - New extras: `[torchneuron]` (`torch>=2.14`, `torch-neuronx>=2.14`,
+    `nki>=0.6`) and `[neuron]` for the XLA lineage (`torch-neuronx>=2.9`,
+    `nki>=0.3.0`).
+  - Tests: `tests/conftest.py` sets `NKI_ENABLE_TRACE_CACHE=0` by default.
+    New CPU tests in `tests/test_native_dispatch.py` cover path selection,
+    launch routing for every entry point, lazy registration, op schemas,
+    fake shapes, thresholds, and the deprecation hook. New
+    `@pytest.mark.neuron` tests in `tests/test_nki_native.py` have not yet
+    run on hardware. `TestXlaResidency::test_matmul_stays_on_xla` is now
+    path-aware: it expects `neuron` on TorchNeuron and `xla` on Trn1, and
+    still checks residency.
+
 - **Reduce-parallel sharding on real multi-rank all-reduce (Phase 4 prototype).**
   Before this change, reduce-parallel and mixed output/reduce-parallel einsums
   raised `NotImplementedError` whenever `HAS_NKI` was true.

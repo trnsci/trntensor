@@ -17,7 +17,7 @@ from .decompose import (
 )
 from .einsum import einsum, multi_einsum
 from .nki import HAS_NKI, get_backend, set_backend
-from .nki.dispatch import from_xla, to_xla
+from .nki.dispatch import from_device, from_xla, to_device, to_xla
 from .parallel import ShardedTensor, gather, scatter
 from .plan import (
     ContractionPlan,
@@ -49,6 +49,8 @@ __all__ = [
     "HAS_NKI",
     "set_backend",
     "get_backend",
+    "to_device",
+    "from_device",
     "to_xla",
     "from_xla",
     "mp2_energy",
