@@ -180,7 +180,9 @@ class TestAoToMoTransformSimulator:
             C_vir = torch.randn(nbasis, nvir)
             got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
             ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
-            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+            # 640x640 contraction: fp32 sums of ~4e5 terms reach |ref| ~ 1e2, so an
+            # absolute 1e-3 is below accumulation-order roundoff. Scale atol by |ref|.
+            torch.testing.assert_close(got, ref, atol=1e-5 * ref.abs().max().item(), rtol=RTOL)
         finally:
             trntensor.set_backend("auto")
 
