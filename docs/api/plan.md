@@ -9,13 +9,13 @@ Inspect the dispatch decision without executing.
 
 ```python
 plan = trntensor.plan_contraction("ij,jk->ik", A, B)
-plan.strategy             # "matmul" | "bmm" | "torch" | "path"
+plan.strategy  # "matmul" | "bmm" | "torch" | "path"
 plan.contraction_indices  # list of indices being summed over
-plan.batch_indices        # list of batch indices
-plan.output_indices       # list of output indices in order
+plan.batch_indices  # list of batch indices
+plan.output_indices  # list of output indices in order
 plan.transA, plan.transB  # whether to pre-transpose before matmul
-plan.contraction_path     # [(i,j), ...] for "path" strategy
-plan.precision            # "fast" | "kahan" | "dd" | "sr"
+plan.contraction_path  # [(i,j), ...] for "path" strategy
+plan.precision  # "fast" | "kahan" | "dd" | "sr"
 ```
 
 Results are cached by `(subscripts, operand shapes, precision)`. Repeated
@@ -32,7 +32,7 @@ Call `clear_plan_cache()` to invalidate (e.g. after a backend change).
 | `"sr"` | Stochastic rounding at the PSUM→SBUF downcast for matmul/bmm strategies. On Trainium requires `NEURON_RT_STOCHASTIC_ROUNDING_EN=1` at process start, otherwise one-time `RuntimeWarning` and round-to-nearest; see [einsum](einsum.md#stochastic-rounding-on-trainium-is-a-runtime-setting) |
 
 ```python
-plan_fast  = trntensor.plan_contraction("ij,jk->ik", A, B, precision="fast")
+plan_fast = trntensor.plan_contraction("ij,jk->ik", A, B, precision="fast")
 plan_kahan = trntensor.plan_contraction("ij,jk->ik", A, B, precision="kahan")
 # Two distinct cache entries — plan_fast is not plan_kahan
 ```

@@ -115,8 +115,7 @@ def einsum(
     if target_forward_error is not None:
         if precision != "fast":
             raise ValueError(
-                "Cannot specify both 'precision' and 'target_forward_error'. "
-                "Use one or the other."
+                "Cannot specify both 'precision' and 'target_forward_error'. Use one or the other."
             )
         from .plan import _parse_subscripts, select_precision_for_error
 
@@ -570,7 +569,7 @@ def multi_einsum(
     """
     if target_forward_error is not None and precision != "fast":
         raise ValueError(
-            "Cannot specify both 'precision' and 'target_forward_error'. " "Use one or the other."
+            "Cannot specify both 'precision' and 'target_forward_error'. Use one or the other."
         )
     from .nki.dispatch import HAS_NKI, _use_nki
 

@@ -24,7 +24,7 @@ nocc, nvir, naux = 5, 19, 72
 torch.manual_seed(42)
 B = torch.randn(nocc, nvir, naux) * 0.1
 eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
-eps_vir =  torch.sort(torch.rand(nvir))[0] + 0.1
+eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
 ```
 
 ## Inspecting the plan
@@ -42,9 +42,7 @@ print(plan.strategy, plan.backend, plan.estimated_flops)
 For a *large* matmul, the planner routes the same code path through NKI automatically:
 
 ```python
-plan = trntensor.plan_contraction(
-    "ij,jk->ik", torch.randn(2048, 2048), torch.randn(2048, 2048)
-)
+plan = trntensor.plan_contraction("ij,jk->ik", torch.randn(2048, 2048), torch.randn(2048, 2048))
 print(plan.backend)
 # nki   (on Trainium; "pytorch" elsewhere)
 ```

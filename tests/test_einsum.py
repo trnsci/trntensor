@@ -601,9 +601,9 @@ class TestPrecisionDD:
         )
         dd_err = (trntensor.einsum("ij,jk->ik", A, B, precision="dd") - expected).abs().mean()
 
-        assert (
-            dd_err < fast_err
-        ), f"DD error {dd_err:.4f} should be less than fast BF16 error {fast_err:.4f}"
+        assert dd_err < fast_err, (
+            f"DD error {dd_err:.4f} should be less than fast BF16 error {fast_err:.4f}"
+        )
 
     def test_dd_nki_still_raises(self, monkeypatch):
         """On NKI hardware, precision='dd' raises NotImplementedError (trnblas#22)."""

@@ -168,7 +168,7 @@ class TestGreedyPathSearch:
     def test_path_length_matches_operand_count(self):
         """N operands → N-1 binary steps."""
         for n in range(3, 7):
-            inputs = [f"i{k}i{k+1}" for k in range(n)]
+            inputs = [f"i{k}i{k + 1}" for k in range(n)]
             size_map = {f"i{k}": 4 for k in range(n + 1)}
             output = f"i0i{n}"
             path = _greedy_path_search(inputs, output, size_map)
