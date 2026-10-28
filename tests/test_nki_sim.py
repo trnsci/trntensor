@@ -115,7 +115,7 @@ class TestAoToMoTransformSimulator:
             trntensor.set_backend("auto")
 
     def test_k_tiled_nbasis_non_multiple(self):
-        """nbasis=200 is not a multiple of TILE_K; dispatch pads to 256.
+        """nbasis=200 is not a multiple of TILE_K; dispatch pads to 512.
         Padded zeros must not corrupt the result.
         """
         import trntensor
@@ -133,6 +133,59 @@ class TestAoToMoTransformSimulator:
         finally:
             trntensor.set_backend("auto")
 
+    def test_n_tiled_nbasis(self):
+        """N-tiling path for ν: nbasis=640 > TILE_N=512, padded to 1024 = 2 ν-tiles."""
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(20)
+            nbasis, nocc, nvir, naux = 640, 4, 8, 4
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_n_tiled_nvir(self):
+        """N-tiling path for a: nvir=600 > TILE_N=512, padded to 1024 = 2 a-tiles."""
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(21)
+            nbasis, nocc, nvir, naux = 128, 4, 600, 4
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_both_n_tiled(self):
+        """N-tiling for both ν and a: nbasis=640, nvir=600 — both exceed TILE_N=512."""
+        import trntensor
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(22)
+            nbasis, nocc, nvir, naux = 640, 4, 600, 4
+            eri = torch.randn(nbasis, nbasis, naux) * 0.1
+            C_occ = torch.randn(nbasis, nocc)
+            C_vir = torch.randn(nbasis, nvir)
+            got = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+            ref = torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+            # 640x640 contraction: fp32 sums of ~4e5 terms reach |ref| ~ 1e2, so an
+            # absolute 1e-3 is below accumulation-order roundoff. Scale atol by |ref|.
+            torch.testing.assert_close(got, ref, atol=1e-5 * ref.abs().max().item(), rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
 
 class TestMp2EnergySimulator:
     def test_demo_shape(self):
@@ -143,6 +196,63 @@ class TestMp2EnergySimulator:
         try:
             torch.manual_seed(42)
             nocc, nvir, naux = 5, 19, 72
+            B = torch.randn(nocc, nvir, naux) * 0.1
+            eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+            eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+            got = trntensor.mp2_energy(B, eps_occ, eps_vir)
+            expected = _cpu_mp2_energy(B, eps_occ, eps_vir)
+            torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_naux_tiled(self):
+        """K-tiling path: naux=256 = 2×TILE_K, nvir padded to TILE_M."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(43)
+            nocc, nvir, naux = 4, 32, 256
+            B = torch.randn(nocc, nvir, naux) * 0.1
+            eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+            eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+            got = trntensor.mp2_energy(B, eps_occ, eps_vir)
+            expected = _cpu_mp2_energy(B, eps_occ, eps_vir)
+            torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_nvir_tiled(self):
+        """M-tiling path: nvir=256 = 2×TILE_M, naux padded to TILE_K."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(44)
+            nocc, nvir, naux = 4, 256, 64
+            B = torch.randn(nocc, nvir, naux) * 0.1
+            eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
+            eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
+
+            got = trntensor.mp2_energy(B, eps_occ, eps_vir)
+            expected = _cpu_mp2_energy(B, eps_occ, eps_vir)
+            torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
+        finally:
+            trntensor.set_backend("auto")
+
+    def test_both_tiled(self):
+        """K+M tiling: nvir=256 = 2×TILE_M and naux=256 = 2×TILE_K."""
+        import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
+
+        trntensor.set_backend("nki")
+        try:
+            torch.manual_seed(45)
+            nocc, nvir, naux = 4, 256, 256
             B = torch.randn(nocc, nvir, naux) * 0.1
             eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
             eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1

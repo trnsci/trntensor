@@ -35,7 +35,7 @@ the pattern maps to a 2-index matmul, the kernel in
 | `beta` | `0.0` | Scalar multiplier on `out` before accumulation |
 | `out` | `None` | Accumulation tensor; result is `α·contract + β·out` |
 | `dtype` | `None` | Cast all operands to this dtype before contracting; result is returned in this dtype. Accepts `torch.dtype` or strings: `"bf16"`, `"bfloat16"`, `"fp16"`, `"float16"`, `"f32"`, `"float32"` |
-| `precision` | `"fast"` | Accumulation precision: `"fast"`, `"kahan"`, or `"dd"` (see below) |
+| `precision` | `"fast"` | Accumulation precision: `"fast"`, `"kahan"`, `"sr"`, or `"dd"` (see below) |
 
 ### Basic examples
 
@@ -88,11 +88,40 @@ result = trntensor.einsum("ij,jk->ik", A, B, dtype=torch.float16)
 |-------|----------|
 | `"fast"` | Native operand dtype; NKI kernels accumulate in fp32 via PSUM |
 | `"kahan"` | Promotes operands to fp64 before contracting, casts back to original dtype; ~15.9 significant digits; bypasses NKI dispatch (runs on CPU) |
+| `"sr"` | Stochastic rounding at the PSUM→SBUF downcast (BF16/FP16); mean-zero √K·u error instead of K·u. On Trainium requires `NEURON_RT_STOCHASTIC_ROUNDING_EN=1` at process start (see below) |
 | `"dd"` | Double-double accumulation via trnblas Phase 2 — raises `NotImplementedError` until trnblas#22 lands |
 
 ```python
 # High-precision DF-MP2 energy accumulation
 E_corr = trntensor.einsum("ijab,ijab->", T, T2, precision="kahan")
+```
+
+#### Stochastic rounding on Trainium is a runtime setting
+
+On NKI 0.7+ (Neuron SDK 2.33) the kernel cannot pick its own rounding mode;
+the Neuron Runtime picks one for the whole process at init from
+`NEURON_RT_STOCHASTIC_ROUNDING_EN`
+([AWS: rounding modes](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-features/rounding-modes.html)).
+
+| `NEURON_RT_STOCHASTIC_ROUNDING_EN` | `precision="sr"` | `precision="fast"` |
+|---|---|---|
+| unset or `0` | round-to-nearest-even + one-time `RuntimeWarning` | round-to-nearest-even |
+| `1` | stochastic | **also stochastic** |
+
+- Set the variable **before the process starts** (or at least before the
+  first Neuron device access). Setting it later from Python has no effect
+  on rounding.
+- With it set, *every* FP32→BF16/FP16 downcast in the process rounds
+  stochastically, including `"fast"` contractions and other libraries'
+  kernels. Results are not bitwise reproducible run to run.
+- Without it, `"sr"` still computes but gives round-to-nearest results, so
+  the √K·u bound does not apply. This also covers `target_forward_error=`
+  when it selects `"sr"`.
+- The CPU fallback (no Neuron hardware) emulates SR in software and is not
+  affected by the variable.
+
+```bash
+NEURON_RT_STOCHASTIC_ROUNDING_EN=1 python my_bf16_job.py
 ```
 
 ---
@@ -108,8 +137,8 @@ before executing the loop, eliminating redundant host↔device transfers.
 
 ```python
 results = trntensor.multi_einsum(
-    ("ap,bp->ab", B_i, B_j),   # Coulomb term
-    ("ap,bp->ab", B_i, B_k),   # exchange term — B_i pinned once
+    ("ap,bp->ab", B_i, B_j),  # Coulomb term
+    ("ap,bp->ab", B_i, B_k),  # exchange term — B_i pinned once
 )
 ```
 

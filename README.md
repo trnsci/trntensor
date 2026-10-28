@@ -37,9 +37,9 @@ import torch
 import trntensor
 
 # Einsum — drop-in for torch.einsum with contraction planning
-C = trntensor.einsum("ij,jk->ik", A, B)           # matmul
-T = trntensor.einsum("ap,bp->ab", B_i, B_j)       # DF-MP2 contraction
-X = trntensor.einsum("mi,mnP->inP", C_occ, eri)   # AO→MO transform
+C = trntensor.einsum("ij,jk->ik", A, B)  # matmul
+T = trntensor.einsum("ap,bp->ab", B_i, B_j)  # DF-MP2 contraction
+X = trntensor.einsum("mi,mnP->inP", C_occ, eri)  # AO→MO transform
 
 # Contraction planning
 plan = trntensor.plan_contraction("ij,jk->ik", A, B)

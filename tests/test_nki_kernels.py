@@ -257,15 +257,17 @@ class TestAoToMoTransformKTiling:
         e_ref = _cpu_mp2_energy(B_ref, eps_occ, eps_vir)
         torch.testing.assert_close(e, e_ref, atol=1e-3, rtol=1e-4)
 
-    def test_oversize_raises(self, nki_backend):
-        """nvir > 128 or naux > 128 should raise until K/M tiling lands."""
-        import pytest
-
+    def test_mp2_nvir_over_128_tiles(self, nki_backend):
+        """nvir > 128 used to raise; the M-tiled MP2 kernel now pads 200 → 256
+        and runs two m/n tiles per side."""
         import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
 
-        B = torch.randn(2, 200, 50)
-        with pytest.raises(NotImplementedError, match="nvir.*≤.*128"):
-            trntensor.mp2_energy(B, torch.randn(2), torch.randn(200))
+        B = torch.randn(2, 200, 50) * 0.1
+        eps_occ = -torch.sort(torch.rand(2))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(200))[0] + 0.1
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(e, _cpu_mp2_energy(B, eps_occ, eps_vir), atol=1e-3, rtol=1e-4)
 
 
 class TestXlaResidency:
@@ -375,3 +377,48 @@ class TestXlaResidency:
             f"residency speedup {speedup:.2f}× below 3× floor "
             f"(cold={t_cold * 1e3:.1f}ms, hot={t_hot * 1e3:.1f}ms)"
         )
+
+
+@pytest.mark.neuron_sr
+class TestStochasticRoundingRuntime:
+    """SR on NKI 0.7+ is process-wide, from ``NEURON_RT_STOCHASTIC_ROUNDING_EN``
+    at runtime init (#41). Run in a process launched with the variable set::
+
+        NEURON_RT_STOCHASTIC_ROUNDING_EN=1 pytest tests/test_nki_kernels.py -m neuron_sr
+
+    BF16 output of an FP32-accumulated matmul: under SR most elements vary
+    run to run and the signed error is mean-zero; under RNE every run is
+    identical. Measured on Trn2 (SDK 2.33): ~77% of elements vary.
+    """
+
+    RUNS = 8
+
+    def _runs(self, precision):
+        import warnings
+
+        import trntensor
+
+        torch.manual_seed(0)
+        A = torch.randn(128, 128).bfloat16()
+        B = torch.randn(128, 512).bfloat16()
+        exact = A.double() @ B.double()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)  # guard must stay quiet
+            outs = [
+                trntensor.einsum("ij,jk->ik", A, B, precision=precision) for _ in range(self.RUNS)
+            ]
+        stack = torch.stack([o.double() for o in outs])
+        varying = (stack != stack[0]).any(dim=0).double().mean().item()
+        err = stack - exact
+        return varying, err.mean().item(), err.abs().mean().item()
+
+    def test_sr_rounds_stochastically(self, sr_runtime, nki_backend):
+        varying, mean_err, mean_abs = self._runs("sr")
+        assert varying > 0.25, f"only {varying:.1%} of elements vary run to run"
+        assert abs(mean_err) < 0.1 * mean_abs, (mean_err, mean_abs)
+
+    def test_fast_is_also_stochastic_under_sr_runtime(self, sr_runtime, nki_backend):
+        """Documents the process-wide caveat: with the variable set, even
+        ``precision="fast"`` downcasts round stochastically."""
+        varying, _, _ = self._runs("fast")
+        assert varying > 0.25, f"only {varying:.1%} of elements vary run to run"

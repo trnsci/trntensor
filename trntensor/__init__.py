@@ -5,7 +5,7 @@ Einstein summation, contraction planning, and tensor decompositions
 for scientific computing. Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.16.0"
 
 from .decompose import (
     cp_decompose,
@@ -18,12 +18,14 @@ from .decompose import (
 from .einsum import einsum, multi_einsum
 from .nki import HAS_NKI, get_backend, set_backend
 from .nki.dispatch import from_xla, to_xla
+from .parallel import ShardedTensor, gather, scatter
 from .plan import (
     ContractionPlan,
     clear_plan_cache,
     estimate_flops,
     plan_cache_info,
     plan_contraction,
+    select_precision_for_error,
 )
 from .quantum import ao_to_mo_transform, mp2_energy
 
@@ -35,6 +37,7 @@ __all__ = [
     "estimate_flops",
     "clear_plan_cache",
     "plan_cache_info",
+    "select_precision_for_error",
     "cp_decompose",
     "cp_reconstruct",
     "tucker_decompose",
@@ -48,4 +51,7 @@ __all__ = [
     "from_xla",
     "mp2_energy",
     "ao_to_mo_transform",
+    "ShardedTensor",
+    "scatter",
+    "gather",
 ]

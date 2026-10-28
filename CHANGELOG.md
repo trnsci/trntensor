@@ -7,7 +7,389 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **NKI 0.7 / neuronx-cc 2.28 kernel compile on Trn2 (#41).**
+  - `ao_to_mo_transform_kernel`: step 1 now computes the intermediate
+    already transposed (`eri` tile as the stationary operand, ν-major
+    scratch), so step 2 loads its stationary tile with a plain DMA. The
+    former `nl.load_transpose2d` of a strided HBM slice was rejected by the
+    BIR verifier (`checkDMATranspose`: "transposing dimensions should be
+    continuous"). The ν loop is now `TILE_K`-wide, so the dispatcher pads
+    `nbasis` to a multiple of 128 instead of 512.
+  - `mp2_energy_kernel`: removed the `(128, 1) → (1, 128)` reshape
+    ("Partition dim size must be preserved") and the cross-partition
+    `nl.sum(axis=(0, 1))`. The dispatcher now passes `B` as
+    `(nocc, naux, nvir)` (plain loads, no DMA transposes) and ε_occ / ε_vir
+    pre-broadcast across the 128 partitions; the kernel row-reduces per
+    lane and finishes with a `accᵀ · ones` matmul on the Tensor Engine.
+  - `matmul_kernel` / `batched_matmul_kernel` `use_sr=True`: NKI 0.7's
+    `nisa.activation` has no `out_dtype` / `round_mode` kwargs; the
+    downcast now calls `nisa.activation(dst=..., op=nl.copy, data=psum)`.
+    Stochastic rounding is a runtime setting on this toolchain, not a
+    per-instruction one.
+- `tests/test_nki_kernels.py`: replaced the stale `test_oversize_raises`
+  (nvir > 128 no longer raises since M-tiling landed) with a correctness
+  check at nvir = 200.
+
 ### Added
+
+- **Stochastic-rounding runtime guard (#41).** On NKI 0.7 (Neuron SDK
+  2.33) the `use_sr` flag no longer chooses the rounding mode. On Trn2,
+  with `NEURON_RT_STOCHASTIC_ROUNDING_EN` unset or `0`, both
+  `use_sr=True` and `use_sr=False` round to nearest even and are
+  deterministic. With `=1`, both round stochastically. The Neuron Runtime
+  sets the mode for the whole process when it initializes.
+  `nki_matmul` / `nki_batched_matmul` now emit a one-time `RuntimeWarning`
+  when SR is requested on the native NKI path without
+  `NEURON_RT_STOCHASTIC_ROUNDING_EN=1`, then still compute
+  (round-to-nearest). This covers `precision="sr"` in `einsum` /
+  `multi_einsum` and `target_forward_error=` when it picks `"sr"`. The CPU
+  fallback and `nki.simulate` paths are unaffected. New
+  `trntensor.nki.dispatch.sr_runtime_enabled()`.
+  - Docs (`docs/api/einsum.md`, `docs/api/plan.md`) and docstrings explain
+    that the variable has to be set at process start, and that with it set
+    *every* downcast in the process rounds stochastically, including
+    `precision="fast"`.
+  - Tests: `tests/test_sr_runtime.py` (CPU, native path stubbed);
+    hardware `TestStochasticRoundingRuntime` in `tests/test_nki_kernels.py`
+    (markers `neuron` + `neuron_sr`), gated by the `sr_runtime` fixture.
+    The fixture skips unless the variable was `1` at process start.
+- `tests/test_nki_compile.py` (`nki_simulator` marker): runs the NKI
+  frontend (trace → MLIR → verify) on CPU for every kernel at trn1, trn2,
+  and trn2 lnc=2. Catches the verifier errors `nki.simulate` misses.
+
+## [0.16.0] — 2026-04-29
+
+### Added
+
+- **`target_forward_error=` for `multi_einsum()`** — extends the automatic
+  precision contract from v0.15.0 to multi-contraction calls.
+
+  For the per-contraction fallback path, each ``einsum()`` call resolves its
+  own K independently, so heterogeneous contractions (different subscripts or
+  operand shapes) each get the cheapest mode that satisfies the target for
+  *their* K. For the homogeneous batching path (same subscript, same shapes),
+  the mode is resolved once from the first contraction's K and dtype — which
+  equals all others in the batch.
+
+  Mutually exclusive with explicit ``precision=``, same as ``einsum()``.
+
+## [0.15.0] — 2026-04-27
+
+### Added
+
+- **`target_forward_error=` kwarg for `einsum()`** — automatic precision
+  selection. Instead of specifying a precision mode manually, callers supply
+  a relative forward error bound and trntensor picks the cheapest mode whose
+  theoretical error bound satisfies it:
+
+  ```python
+  einsum("ij,jk->ik", A, B, target_forward_error=1e-4)
+  ```
+
+  Selection order (cheapest first): ``"fast"`` → ``"sr"`` → ``"dd"`` →
+  ``"kahan"``. Error bounds used (Higham 2002 §3, Connolly–Higham–Mary 2021):
+
+  - ``"fast"``:  K · u (Wilkinson worst-case)
+  - ``"sr"``:    √K · u (expected; mean-zero — statistical, not worst-case)
+  - ``"dd"``:    K · u² (Ozaki-2 worst-case)
+  - ``"kahan"``: K · u_f64 (FP64 Wilkinson worst-case)
+
+  Where K = product of contracted dimension sizes and u = unit roundoff for
+  the operand dtype (BF16: 2⁻⁸, FP16: 2⁻¹¹, FP32: 2⁻²⁴, FP64: 2⁻⁵³).
+  ``"sr"`` and ``"dd"`` are only considered for BF16 and FP16 inputs.
+
+  Raises ``ValueError`` when both ``precision=`` and ``target_forward_error=``
+  are given, or when no available mode can achieve the target.
+
+- **`select_precision_for_error(dtype, K, target_forward_error)`** — the
+  selector as a public API function (``trntensor.select_precision_for_error``).
+  Useful for inspecting which mode would be chosen without running the full
+  contraction.
+
+### Notes
+
+``target_forward_error=`` is a first step toward the suite-level
+``target_forward_error`` contract described in the architecture brief. The
+current implementation uses static bounds (Wilkinson/Connolly–Higham–Mary);
+adaptive error estimation (measuring actual residuals) is future work.
+
+## [0.14.0] — 2026-04-24
+
+### Added
+
+- **`precision="dd"` on CPU — Ozaki-2 splitting** — lifts the unconditional
+  ``NotImplementedError`` for double-double accumulation on CPU.
+
+  ``_ozaki_split_cpu(A, k)`` splits a FP32 tensor into ``k`` BF16-precision
+  summands using the Ogita–Rump–Oishi error-free split: at each step,
+  ``s = round_bfloat16(remainder)`` and ``remainder -= s`` (exact by Sterbenz's
+  lemma since ``|remainder|/|s| ∈ [0.5, 2]``). ``_ozaki_matmul_cpu(A, B, k=2)``
+  computes ``k²`` FP32 matmuls of the summand pairs and sums in FP32, achieving
+  forward error O(K · u_bf² · |C|) vs O(K · u_bf · |C|) for a single BF16
+  matmul — substantially more accurate for large K.
+
+  On CPU (``HAS_NKI=False``): ``precision="dd"`` routes the ``matmul`` strategy
+  through ``_ozaki_matmul_cpu``; the ``path`` strategy propagates ``precision="dd"``
+  recursively so each binary matmul step uses Ozaki; ``bmm`` and ``torch``
+  strategies fall back to kahan (fp64 promotion).
+
+  On Trainium (``HAS_NKI=True``): ``NotImplementedError`` preserved — the fused
+  NKI version requires trnblas Phase 2 double-double GEMM kernels (trnblas#22),
+  which hold both the main and correction PSUM tiles simultaneously in one NKI
+  program rather than dispatching four separate kernel calls.
+
+  Same named-mock pattern as ``_stochastic_round_cpu`` (SR, v0.11.0) and
+  ``_mock_allreduce`` (reduce-parallel, v0.10.0).
+
+### Notes
+
+The remaining ``NotImplementedError`` for ``precision="dd"`` on Trainium gates
+on trnblas#22. The CPU contract is now fully testable.
+
+## [0.13.0] — 2026-04-22
+
+### Fixed
+
+- **`precision="sr"` now honored for the `bmm` strategy** — `_execute_bmm`
+  was calling ``nki_batched_matmul(A, B)`` without ``use_sr``, ignoring
+  ``plan.precision``. The NKI kernel already supported ``use_sr`` since
+  v0.11.0; the dispatch layer just didn't thread it through.
+
+### Added
+
+- **`precision=` kwarg for `multi_einsum()`** — all contractions in a
+  ``multi_einsum`` call now share the same precision mode. The homogeneous
+  batching path (``_try_batched_multi_einsum``) passes ``use_sr`` to
+  ``nki_batched_matmul`` when ``precision="sr"``; ``"kahan"`` and ``"dd"``
+  fall through to the per-contraction loop which handles them correctly.
+
+### Notes
+
+``precision=`` is now uniformly honored across all dispatch paths: single
+matmul (`einsum` → `_execute_matmul`), batched matmul (`einsum` →
+`_execute_bmm`), path execution (`einsum` → `_execute_path` → recursive
+`einsum`), and multi-contraction (`multi_einsum`).
+
+## [0.12.0] — 2026-04-22
+
+### Added
+
+- **Mixed output-parallel + reduce-parallel sharding** — ``einsum()`` now
+  supports einsums where some ``ShardedTensor`` operands are partitioned along
+  an output dimension (output-parallel) and others along a contracted dimension
+  (reduce-parallel) in the same call.
+
+  The dispatch uses a nested loop: for each output shard ``s``, partial
+  contractions over all reduce shards are accumulated via
+  :func:`~trntensor.parallel._mock_allreduce` and the result becomes output
+  chunk ``s``. The return value is a ``ShardedTensor`` partitioned along the
+  output dimension.
+
+  Operands that are neither sharded but share the contracted index are
+  co-partitioned automatically (same behavior as pure reduce-parallel).
+  Output-parallel operand chunks are also co-partitioned along the contracted
+  index when they span it.
+
+  On Trainium (``HAS_NKI=True``) the gate is unchanged — the inner all-reduce
+  still requires ``nki.collectives`` (Neuron SDK 2.30+).
+
+  3-operand and higher chains work naturally: the inner recursive ``einsum()``
+  call receives dense operands and dispatches through the normal path.
+
+### Notes
+
+Mixed output-parallel + reduce-parallel with ``HAS_NKI=True`` raises
+``NotImplementedError`` with the same ``nki.collectives`` message as pure
+reduce-parallel. SDK 2.30+ unblocks both simultaneously.
+
+## [0.11.0] — 2026-04-21
+
+### Added
+
+- **`precision="sr"` — stochastic rounding at the PSUM→SBUF boundary** —
+  adds a fourth precision mode to ``einsum()`` and ``plan_contraction()``.
+
+  On Trainium, ``matmul_kernel`` and ``batched_matmul_kernel`` replace the
+  ``nisa.tensor_copy(psum → c_sbuf)`` downcast with
+  ``nisa.activation(..., round_mode="stochastic")``. This rounds each FP32
+  PSUM element to its upper or lower BF16 neighbor with probability
+  proportional to the fractional distance — mean rounding error is zero
+  (Connolly–Higham–Mary, *SIAM J. Sci. Comput.*, 2021), replacing Wilkinson's
+  worst-case n·u bias with a √n·u bound.
+
+  On CPU (``HAS_NKI=False``), ``_stochastic_round_cpu`` applies the same
+  rounding to the ``torch.matmul`` output, enabling ``precision="sr"`` to be
+  tested in CPU-only CI. This mirrors the ``_mock_allreduce`` pattern from
+  v0.10.0: a named, documented stand-in that makes the hardware path testable
+  without hardware.
+
+  ``"sr"`` applies only to the ``matmul`` strategy. For ``"bmm"``,
+  ``"torch"``, and ``"path"`` strategies, ``precision="sr"`` is accepted
+  without error and uses fast (round-nearest) rounding.
+
+  **Correctness note**: for BF16 dot products with K ≥ ~300, stochastic
+  rounding is a *correctness requirement* for convergent Krylov iteration
+  (without SR, BF16 Krylov stagnates). Use ``precision="sr"`` when K is
+  large or accumulation bias matters.
+
+### Notes
+
+Mixed output-parallel + reduce-parallel operands in the same einsum remain
+deferred to v0.12.0.
+
+## [0.10.0] — 2026-04-21
+
+### Added
+
+- **Reduce-parallel sharding on CPU** — the ``NotImplementedError`` gate for
+  contracted-dimension sharding is now conditional on ``HAS_NKI``. On CPU
+  (``HAS_NKI=False``) reduce-parallel contractions dispatch through a mock
+  all-reduce (torch-based sum of per-shard partial results), making the full
+  sharding API testable in CI without hardware.
+
+  On Trainium (``HAS_NKI=True``) the gate is unchanged — ``nki.collectives``
+  is required for production reduce-parallel, arriving in Neuron SDK 2.30+.
+
+- **Co-partitioning of plain-tensor operands** — when a reduce-parallel
+  ``ShardedTensor`` operand partitions along a contracted index, ``einsum()``
+  automatically slices any non-sharded operand that shares that index along
+  the matching dimension per shard. No API change required; callers can mix
+  sharded and dense operands in the same reduce-parallel einsum.
+
+- **``shard_boundaries(st)``** in ``trntensor.parallel`` — returns the
+  ``(start, end)`` slice pairs for each shard. Used internally by the dispatch
+  layer; also useful for callers that need to manually co-partition ancillary
+  data structures.
+
+- **``_mock_allreduce(partials)``** in ``trntensor.parallel`` — sums a list of
+  same-shape tensors element-wise. Named and documented to clearly identify the
+  operation that ``nki.collectives.allreduce`` will replace on hardware.
+
+### Notes
+
+Mixed output-parallel + reduce-parallel operands in the same einsum are not
+yet supported and raise ``NotImplementedError``. This covers an edge case not
+present in the DF-MP2 patterns; deferred to v0.11.0.
+
+## [0.9.0] — 2026-04-18
+
+### Added
+
+- **`trntensor.parallel` module** — Phase 4 foundation for output-parallel tensor
+  contractions. Introduces ``ShardedTensor``, ``scatter``, and ``gather``:
+  - ``ShardedTensor``: wraps a list of dense chunk tensors split along a single
+    ``partition_dim``. Carries the partition spec so ``einsum()`` can detect it
+    and classify the sharding mode.
+  - ``scatter(tensor, dim, n_shards)``: splits a dense tensor evenly along
+    ``dim``; last shard absorbs any remainder.
+  - ``gather(st)``: reconstructs the dense tensor via ``torch.cat``.
+
+- **Output-parallel sharding in ``einsum()``**: when any operand is a
+  ``ShardedTensor``, ``einsum()`` checks whether the partition dimension maps to
+  an output index (output-parallel). If so, each shard's contraction is dispatched
+  independently (no cross-shard communication) and the result is returned as a
+  ``ShardedTensor``. Works for all subscript patterns handled by the existing
+  planner (matmul, bmm, torch, path) and propagates through multi-operand chains.
+
+- **Reduce-parallel gate**: if the partition dimension is a contraction index
+  (not in the output), ``einsum()`` raises ``NotImplementedError`` with a clear
+  explanation: reduce-parallel sharding requires ``nki.collectives`` all-reduce,
+  arriving in Neuron SDK 2.30+. The gate prevents silent wrong results.
+
+### Notes
+
+``nki.collectives`` (all-reduce, all-gather) is not available in NKI 0.3.0
+Stable. Reduce-parallel sharding (contracted-dimension sharding) is gated until
+SDK 2.30+. This sprint covers the output-parallel subset, which handles the
+common row-parallel and column-parallel matmul patterns used in DF-MP2
+AO→MO transform with large basis sets (nbasis > 3000 across chips).
+
+## [0.8.0] — 2026-04-18
+
+### Fixed
+
+- **`_execute_path` now routes binary steps through `einsum()`** — multi-operand
+  contractions (3+ tensors via the greedy path planner) previously called
+  `torch.einsum` directly for each binary step, bypassing the entire trntensor
+  dispatch layer (plan cache, FLOP thresholds, NKI routing). The fix is a
+  one-line change: each step now calls `einsum(sub, a, b, precision=plan.precision)`,
+  so matmul-shaped steps dispatch to NKI when operand size clears the threshold.
+  All correctness tests are unaffected; top-level `ContractionPlan.backend` for
+  strategy `"path"` remains `"pytorch"` (accurate: no single NKI kernel spans
+  an arbitrary path). (#18 follow-up)
+
+## [0.7.0] — 2026-04-17
+
+### Added
+
+- **N-tiled `ao_to_mo_transform_kernel`** — lifts `nbasis ≤ 512` and
+  `nvir ≤ 512` single-N-tile constraints. Step 1 now tiles the ν (basis)
+  dimension in ``TILE_N=512``-wide chunks; step 2 tiles the virtual-orbital
+  a dimension similarly. Enables full DF-MP2 AO→MO transform for large basis
+  sets: cc-pVTZ on naphthalene (nbasis≈572), aug-cc-pVTZ virtual spaces
+  (nvir > 512). Dispatcher pads both `nbasis` and `nvir` to ``TILE_N``
+  multiples (zero-fill); result sliced back to `(nocc, nvir, naux)`.
+
+- **Simulator tests for N-tiled shapes** (`tests/test_nki_sim.py`,
+  `TestAoToMoTransformSimulator`) — three new cases: `test_n_tiled_nbasis`
+  (nbasis=640 > TILE_N), `test_n_tiled_nvir` (nvir=600 > TILE_N),
+  `test_both_n_tiled` (nbasis=640, nvir=600). Each verifies against the
+  CPU einsum reference.
+
+### Changed
+
+- **`ao_to_mo_transform` gates removed** — `NotImplementedError` for
+  `nbasis > 512` and `nvir > 512` removed; both constraints are now handled
+  by the tiled kernel + dispatcher. The `nocc > 128` gate remains (M-tiling
+  not yet implemented).
+- **`_nki_ao_to_mo_transform` padding** — `nbasis` now padded to
+  `_round_up(nbasis, TILE_N)` instead of `_round_up(nbasis, TILE_K)`.
+  TILE_N alignment is stricter (multiples of 512 vs 128), but implies
+  TILE_K alignment (TILE_N = 4×TILE_K). `nvir` padding added.
+
+## [0.6.0] — 2026-04-17
+
+### Added
+
+- **Tiled `mp2_energy_kernel`** — lifts `nvir ≤ 128` and `naux ≤ 128`
+  single-tile constraints. The kernel now M-tiles over the virtual-orbital
+  dimensions (TILE_M=128 per side) and K-tiles over the auxiliary index P
+  (TILE_K=128), enabling arbitrary `nvir` and `naux` (dispatcher pads to
+  tile multiples with zero-fill). Typical real-molecule sizes now supported:
+  aug-cc-pVDZ (naux≈300+), cc-pVTZ (nvir≈200+). Both `nvir=256` + `naux=256`
+  benchmarked at the same correctness tolerance as the single-tile path.
+
+- **NVIR/NAUX padding in `_nki_mp2_energy` dispatch** — `_nki_mp2_energy`
+  now pads `B` to `(nocc, nvir_pad, naux_pad)` and `eps_vir` to
+  `(nvir_pad, 1)` before kernel entry. Zero-padding is safe: padded B
+  entries are 0, so tile contributions to `T*(2T-T.T)/Δ` are 0 regardless
+  of Δ.
+
+- **Simulator tests for tiled shapes** (`tests/test_nki_sim.py`,
+  `TestMp2EnergySimulator`) — three new cases: `test_naux_tiled`
+  (nocc=4, nvir=32, naux=256), `test_nvir_tiled` (nocc=4, nvir=256,
+  naux=64), `test_both_tiled` (nocc=4, nvir=256, naux=256). Each verifies
+  against `_cpu_mp2_energy` via the NKI CPU simulator.
+
+### Changed
+
+- **`mp2_energy` gate removed** — the `NotImplementedError` for
+  `nvir > 128 or naux > 128` is gone. The NKI path now handles all sizes
+  ≥ TILE_M / TILE_K via the tiled kernel; smaller sizes (padded up) are
+  handled identically to the original single-tile path.
+
+## [0.5.0] — 2026-04-17
+
+### Added
+
+- **`multi_einsum` homogeneous batching** (#33 Phase 3) — when all contractions
+  share the same subscript, operand shapes, and resolve to a 2D matmul, they are
+  stacked and dispatched as a single `nki_batched_matmul` call instead of N
+  independent ones. Amortizes the ~0.67 ms fixed XLA dispatch overhead across the
+  batch (nocc²=4096 pair contractions: 2.7 s → 0.67 ms dispatch overhead). Falls
+  through to the per-contraction loop for heterogeneous sets.
 
 - **`_MIN_NKI_FLOPS_PINNED` dispatch threshold** (#33) — second FLOP gate for
   when operands are already XLA-resident (`to_xla` pre-applied). Profiler data
@@ -19,6 +401,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`docs/design/matmul_dispatch_findings.md`** — full per-step timing analysis
   documenting XLA dispatch latency (~0.67 ms fixed overhead), transfer costs, and
   the unpinned vs pre-pinned crossover. Raw JSON timing data included.
+
+- **`docs/design/matmul_kernel_profile.md`** — Tensor Engine utilization profile
+  for `matmul_kernel` on trn1.2xlarge. Captures TE/VE split, DMA transfer
+  breakdown, and PSUM accumulation efficiency at medium (1024²) and large (2048²)
+  matrix sizes.
+
+- **`infra/terraform/terraform.tfvars`** — VPC/subnet/region values for
+  `trntensor-ci-trn1` (us-east-1, vpc-cd49bfb0, subnet-1bd24d15).
+
+### Changed
+
+- **`infra/terraform/main.tf`** — default `aws_region` corrected from `us-west-2`
+  to `us-east-1` to match the existing VPC/subnet. Running `terraform apply`
+  without overrides now selects the correct region.
 
 ## [0.4.0] — 2026-04-16
 
