@@ -9,7 +9,6 @@ registration, no torch_xla, direct op calls, torch.compile, and residency
 on the ``neuron`` device.
 """
 
-import os
 import subprocess
 import sys
 
@@ -63,22 +62,37 @@ def nki_backend(monkeypatch):
 
 class TestNativeDispatch:
     def test_native_path_never_imports_torch_xla(self):
+        """Path selection and op registration in a fresh interpreter never
+        import torch_xla.
+
+        The subprocess deliberately stops before any kernel launch: inside
+        the suite the parent pytest already holds the visible NeuronCore, so
+        a launch in a child process fails in ``nrt_init`` (NRT_FAILURE).
+        The launch half of the check runs in-process in
+        ``test_launch_does_not_import_torch_xla``.
+        """
         code = (
             "import sys, torch, trntensor; "
-            "from trntensor.nki.dispatch import _get_dispatch_path; "
-            "a = torch.randn(128, 128); b = torch.randn(128, 256); "
-            "c = trntensor.einsum('ij,jk->ik', a, b); "
-            "assert _get_dispatch_path() == 'native'; "
-            "assert 'trntensor.nki._native' in sys.modules, 'kernel did not launch'; "
-            "assert 'torch_xla' not in sys.modules"
+            "from trntensor.nki import dispatch as d; "
+            "assert d._dispatch_path is None; "
+            "d._dispatch_path = 'native'; "  # skip the device probe: no runtime init
+            "d._get_native_ops(); "
+            "assert 'trntensor.nki._native' in sys.modules; "
+            "assert hasattr(torch.ops.trntensor, 'matmul'); "
+            "assert 'torch_xla' not in sys.modules, 'torch_xla imported'"
         )
-        env = dict(
-            os.environ,
-            TRNTENSOR_FORCE_BACKEND="nki",
-            TRNTENSOR_MIN_NKI_FLOPS_NATIVE="0",
-            TRNTENSOR_REQUIRE_NKI="1",
-        )
-        subprocess.run([sys.executable, "-c", code], check=True, env=env)
+        subprocess.run([sys.executable, "-c", code], check=True)
+
+    def test_launch_does_not_import_torch_xla(self, nki_backend):
+        import trntensor
+
+        if "torch_xla" in sys.modules:
+            pytest.skip("torch_xla was imported by another test in this process")
+        a, b = torch.randn(128, 128), torch.randn(128, 256)
+        out = trntensor.einsum("ij,jk->ik", a, b)
+        torch.testing.assert_close(out, a @ b, atol=ATOL, rtol=RTOL)
+        assert "trntensor.nki._native" in sys.modules, "kernel did not launch"
+        assert "torch_xla" not in sys.modules
 
     def test_ops_registered_in_torch_ops(self):
         _ops()
