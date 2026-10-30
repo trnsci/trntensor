@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Native dispatch thresholds are now measured (#41).** They were measured
+  on trn2.3xlarge (SDK 2.33, NKI 0.7.0) with `scripts/bench_native_einsum.py`
+  and `scripts/autotune_dispatch.py`.
+  - On device-resident operands, aten `torch.matmul` / `torch.bmm` beat the
+    NKI matmul and batched-matmul kernels at every size (128³ to 4096³, fp32
+    and bf16). The native pinned threshold now defaults to `never`, so
+    device work runs as aten on `neuron`.
+  - Host operands at or above `TRNTENSOR_MIN_NKI_FLOPS_NATIVE` (now
+    500 M multiply-adds, previously a provisional 1 G) are offloaded to
+    aten on the device instead of to the NKI kernel.
+  - Thresholds accept `never` / `inf`.
+  - The XLA path is unchanged.
+- **Native `"auto"` runs the fused quantum primitives as aten.** This covers
+  `mp2_energy` and `ao_to_mo_transform`. On Trn2 the AO→MO kernel measured
+  6–20× slower than aten, and the MP2 kernel 1.0–1.5× slower.
+  `set_backend("nki")` still runs both kernels, and the XLA path is
+  unchanged.
+- **`mp2_energy` reference path is vectorized.** Without NKI it now uses
+  aten ops chunked over `i` instead of a nocc² Python loop. That is 10–40×
+  faster on device. On an Apple M-series CPU it is 3× faster at small sizes
+  and about even (±10%) at `nocc=32, nvir=128, naux=512`.
+- **`ao_to_mo_transform` reference path** is now two explicit binary
+  contractions.
+
+### Fixed
+
+- **Greedy contraction path no longer starts with an outer product.** For
+  example, `einsum("mi,na,mnP->iaP")` used to contract `mi,na` first,
+  building a 4-index intermediate. Pairs that share an index are now
+  preferred.
+- **`scripts/autotune_dispatch.py` now reports M·K·N**, the quantity dispatch
+  compares, where it used to report 2·M·K·N. On the native path it now
+  derives both thresholds: host vs device offload, and NKI vs aten on device.
+
 ## [0.17.0] — 2026-10-28
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device) — see trnsci/trnsci#35.

@@ -124,11 +124,10 @@ def native_host(monkeypatch):
         "ao_to_mo_transform_kernel",
     ):
         monkeypatch.setattr(_kernels, kname, no_raw_kernel, raising=False)
-    # quantum.py imported HAS_NKI / _use_nki by name.
-    import trntensor.quantum as quantum
-
-    monkeypatch.setattr(quantum, "HAS_NKI", True)
-    monkeypatch.setattr(quantum, "_use_nki", lambda: True)
+    # Force NKI: under "auto" the native path runs the fused quantum
+    # kernels as aten (measured faster on Trn2), and these tests check the
+    # kernel launch itself.
+    monkeypatch.setattr(dispatch, "_backend", "nki")
     monkeypatch.setenv("TRNTENSOR_REQUIRE_NKI", "1")
     monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
     calls: list[tuple[str, dict]] = []
@@ -442,8 +441,17 @@ class TestPathAwareThresholds:
             monkeypatch.delenv(v, raising=False)
         monkeypatch.setenv("TRNTENSOR_AUTOTUNE_CACHE", str(tmp_path / "missing.json"))
         assert dispatch._load_min_nki_flops() == (2_000_000_000, 1_000_000_000)
-        unpinned, pinned = dispatch._load_min_nki_flops_native()
-        assert pinned < unpinned < 2_000_000_000
+        # Measured on Trn2 (#41): offload host work from 500 M multiply-adds;
+        # the NKI kernels never beat aten on the device.
+        assert dispatch._load_min_nki_flops_native() == (500_000_000, dispatch.NKI_NEVER)
+
+    def test_never_parses(self, monkeypatch, tmp_path):
+        cache = tmp_path / "threshold.json"
+        cache.write_text('{"trntensor_min_nki_flops_native_pinned": "never"}')
+        monkeypatch.setenv("TRNTENSOR_AUTOTUNE_CACHE", str(cache))
+        monkeypatch.delenv("TRNTENSOR_MIN_NKI_FLOPS_NATIVE_PINNED", raising=False)
+        monkeypatch.setenv("TRNTENSOR_MIN_NKI_FLOPS_NATIVE", "inf")
+        assert dispatch._load_min_nki_flops_native() == (dispatch.NKI_NEVER, dispatch.NKI_NEVER)
 
     def test_native_env_and_cache_overrides(self, monkeypatch, tmp_path):
         cache = tmp_path / "threshold.json"
@@ -465,8 +473,77 @@ class TestPathAwareThresholds:
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
         monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS", 10**12)
         monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE", 64**3)
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE_PINNED", 64**3)
         plan = trntensor.plan_contraction("ij,jk->ik", torch.empty(64, 64), torch.empty(64, 64))
         assert plan.backend == "nki"
+        # Default pinned threshold (NKI never beats aten): offload is aten.
+        trntensor.clear_plan_cache()
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE_PINNED", dispatch.NKI_NEVER)
+        plan = trntensor.plan_contraction("ij,jk->ik", torch.empty(64, 64), torch.empty(64, 64))
+        assert plan.backend == "pytorch"
+
+
+class TestNativeRoute:
+    """Executor choice on the native path (_route), measured policy (#41)."""
+
+    @pytest.fixture(autouse=True)
+    def _native(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE", 1000)
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE_PINNED", dispatch.NKI_NEVER)
+
+    def test_host_small_stays_on_host(self):
+        assert dispatch._route(999, pinned=False) == "host"
+
+    def test_host_large_offloads_to_aten(self):
+        assert dispatch._route(1000, pinned=False) == "aten"
+        assert dispatch._route(10**15, pinned=False) == "aten"
+
+    def test_device_operands_run_aten_on_device(self):
+        assert dispatch._route(10**15, pinned=True) == "host"
+
+    def test_pinned_threshold_reenables_nki(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE_PINNED", 5000)
+        assert dispatch._route(5000, pinned=True) == "nki"
+        assert dispatch._route(4999, pinned=True) == "host"
+        assert dispatch._route(5000, pinned=False) == "nki"
+        assert dispatch._route(4999, pinned=False) == "aten"
+
+    def test_xla_path_unchanged(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        assert dispatch._route(dispatch._MIN_NKI_FLOPS, pinned=False) == "nki"
+        assert dispatch._route(dispatch._MIN_NKI_FLOPS - 1, pinned=False) == "host"
+
+    def test_matmul_offload_uses_aten_not_kernel(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+
+        def no_launch(*a, **k):
+            raise AssertionError("NKI kernel must not launch below the pinned threshold")
+
+        monkeypatch.setattr(dispatch, "_launch", no_launch)
+        moved = []
+        monkeypatch.setattr(dispatch, "_aten_on_device", lambda fn, *t: moved.append(fn) or fn(*t))
+        A, B = torch.randn(16, 16), torch.randn(16, 16)
+        torch.testing.assert_close(dispatch.nki_matmul(A, B), A @ B)
+        torch.testing.assert_close(
+            dispatch.nki_batched_matmul(A[None], B[None]), torch.bmm(A[None], B[None])
+        )
+        assert moved == [torch.matmul, torch.bmm]
+
+    def test_fused_quantum_kernels_off_under_auto(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.delenv("TRNTENSOR_FORCE_BACKEND", raising=False)
+        assert dispatch._use_fused_kernel() is False
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._use_fused_kernel() is True
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        assert dispatch._use_fused_kernel() is True
 
 
 class TestResidency:

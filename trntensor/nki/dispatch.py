@@ -115,22 +115,34 @@ def _warn_if_sr_unavailable() -> None:
 #   _MIN_NKI_FLOPS        — operands on CPU (default: 2 GFLOPs)
 #   _MIN_NKI_FLOPS_PINNED — operands already on XLA (default: 1 GFLOPs)
 #
-# Native path (TorchNeuron, Trn2/Trn3). An eager launch of a registered
-# ``trntensor::`` op costs ~0.2 ms, well under the XLA path's per-dispatch
-# floor, so the fixed-overhead part of the crossover shrinks. Host↔device
-# transfer costs the same on both paths, so the unpinned crossover moves
-# less than the pinned one. These defaults are estimates from those two
-# numbers, not measurements; re-measure on Trn2 with
-# scripts/autotune_dispatch.py (which writes the *_native cache keys there):
-#   _MIN_NKI_FLOPS_NATIVE        — operands on CPU (default: 1 GFLOPs)
-#   _MIN_NKI_FLOPS_NATIVE_PINNED — operands already on "neuron" (default: 128 MFLOPs)
+# Native path (TorchNeuron, Trn2/Trn3). Measured on trn2.3xlarge, SDK 2.33 /
+# NKI 0.7.0, one NeuronCore, warm latency, 2026-10-30
+# (scripts/bench_native_einsum.py, scripts/autotune_dispatch.py; #41):
+#   - aten ``torch.matmul`` / ``torch.bmm`` on device-resident ``neuron``
+#     tensors beat the trntensor NKI matmul / batched-matmul kernels at every
+#     measured size, fp32 and bf16, 128³ to 4096³ (e.g. 4096³ bf16: 1.38 ms
+#     aten vs 6.82 ms NKI; 1024³ fp32: 0.20 ms vs 0.55 ms). The eager aten
+#     launch floor is ~0.13 ms, the NKI custom-op floor ~0.24 ms.
+#   - For host operands, offloading to aten on the device (upload, matmul,
+#     download) beats host torch from ~0.5 G multiply-adds (M·K·N) and beats
+#     NKI-with-transfer at every size.
+# So on the native path the two thresholds mean:
+#   _MIN_NKI_FLOPS_NATIVE        — host operands: M·K·N at which the work leaves
+#                                  the host for the device (default 500 M).
+#   _MIN_NKI_FLOPS_NATIVE_PINNED — M·K·N at which the NKI kernel replaces aten
+#                                  on the device (default: never, NKI_NEVER).
+# Below the pinned threshold, device work runs as aten on ``neuron``. See
+# _native_route. Set either to a number (env / cache) to re-enable NKI.
 #
-# _min_nki_flops(*operands) returns the threshold for the active path.
-# Override with env vars or scripts/autotune_dispatch.py --write-cache.
+# Thresholds compare the multiply-add count M·K·N (B·M·K·N for bmm).
+# _nki_flop_threshold(pinned) returns the threshold for the active path.
+# Override with env vars or scripts/autotune_dispatch.py --write-cache; the
+# value "never" (or "inf") disables a threshold.
+NKI_NEVER = 2**63 - 1
 _DEFAULT_MIN_NKI_FLOPS = 2_000_000_000
 _DEFAULT_MIN_NKI_FLOPS_PINNED = 1_000_000_000
-_DEFAULT_MIN_NKI_FLOPS_NATIVE = 1_000_000_000
-_DEFAULT_MIN_NKI_FLOPS_NATIVE_PINNED = 128_000_000
+_DEFAULT_MIN_NKI_FLOPS_NATIVE = 500_000_000
+_DEFAULT_MIN_NKI_FLOPS_NATIVE_PINNED = NKI_NEVER
 
 
 def _load_threshold_cache() -> dict:
@@ -147,13 +159,20 @@ def _load_threshold_cache() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _parse_threshold(value) -> int:
+    """int, or ``NKI_NEVER`` for "never" / "inf" (NKI disabled)."""
+    if isinstance(value, str) and value.strip().lower() in ("never", "inf", "infinity"):
+        return NKI_NEVER
+    return int(value)
+
+
 def _threshold(env_var: str, cache: dict, cache_key: str, default: int) -> int:
     env = os.environ.get(env_var, "")
     if env:
-        return int(env)
+        return _parse_threshold(env)
     try:
         cached = cache.get(cache_key)
-        return int(cached) if cached else default
+        return _parse_threshold(cached) if cached else default
     except (TypeError, ValueError):
         return default
 
@@ -217,6 +236,43 @@ def _min_nki_flops(*operands: torch.Tensor) -> int:
     return _nki_flop_threshold(pinned=all(t.device.type == device_type for t in operands))
 
 
+def _route(flops: int, pinned: bool) -> str:
+    """Executor for an ``M·K·N``-sized matmul/bmm: "nki", "aten" or "host".
+
+    "host" is torch on the operands' own device (CPU operands stay on CPU,
+    device operands run aten on the device). "aten" (native path only) moves
+    host operands to the ``neuron`` device, runs aten there and brings the
+    result back. "nki" launches the trntensor kernel.
+
+    XLA path / simulator: "nki" at or above the residency-specific threshold,
+    else "host" (unchanged). Native path: device-resident operands use "nki"
+    at or above the pinned threshold, else "host" (aten on device); host
+    operands stay on the host below the unpinned (offload) threshold and
+    otherwise go to the device, as "nki" at or above the pinned threshold and
+    as "aten" below it.
+    """
+    if not _on_native_path():
+        return "nki" if flops >= _nki_flop_threshold(pinned) else "host"
+    nki_ok = flops >= _MIN_NKI_FLOPS_NATIVE_PINNED
+    if pinned:
+        return "nki" if nki_ok else "host"
+    if flops < _MIN_NKI_FLOPS_NATIVE:
+        return "host"
+    return "nki" if nki_ok else "aten"
+
+
+def _route_for(flops: int, *operands: torch.Tensor) -> str:
+    """:func:`_route` for these operands' residency."""
+    device_type = _NEURON_DEVICE if _on_native_path() else "xla"
+    return _route(flops, pinned=all(t.device.type == device_type for t in operands))
+
+
+def _aten_on_device(fn, *tensors: torch.Tensor) -> torch.Tensor:
+    """Run ``fn`` (an aten op) on the ``neuron`` device; result on the caller's device."""
+    orig = tensors[0].device
+    return fn(*(t.to(_NEURON_DEVICE) for t in tensors)).to(orig)
+
+
 _backend = "auto"
 
 
@@ -232,6 +288,31 @@ def set_backend(backend: str):
 
 def get_backend() -> str:
     return _backend
+
+
+def _nki_forced() -> bool:
+    """True when the caller explicitly asked for NKI (``set_backend("nki")`` or
+    ``TRNTENSOR_FORCE_BACKEND=nki``), as opposed to ``"auto"``."""
+    forced = os.environ.get("TRNTENSOR_FORCE_BACKEND", "").lower()
+    if forced:
+        return forced == "nki"
+    return _backend == "nki"
+
+
+def _use_fused_kernel() -> bool:
+    """Whether the fused quantum-chemistry kernels (``mp2_energy``,
+    ``ao_to_mo_transform``) should run under the current settings.
+
+    On the native TorchNeuron path, ``"auto"`` uses the aten formulation:
+    on Trn2 the fused kernels measured slower than aten on the device
+    (AO→MO 6-20x; MP2 energy 1.0-1.5x, parity at best). They still run when
+    NKI is forced. Other paths keep the kernels under ``"auto"``.
+    """
+    if not (_use_nki() and HAS_NKI):
+        return False
+    if _on_native_path():
+        return _nki_forced()
+    return True
 
 
 def _use_nki() -> bool:
@@ -599,10 +680,13 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
 
     M, K = A.shape
     _, N = B.shape
-    # Use a lower threshold when operands are already on the device — no
-    # host→device transfer cost. Path-aware: see _min_nki_flops.
-    flop_threshold = _min_nki_flops(A, B)
-    if flop_threshold > M * K * N:
+    # Residency- and path-aware executor choice: see _route.
+    route = _route_for(M * K * N, A, B)
+    if route != "nki":
+        if use_sr and (route == "aten" or _is_device_tensor(A)):
+            _warn_if_sr_unavailable()
+        if route == "aten":
+            return _aten_on_device(torch.matmul, A, B)
         result = torch.matmul(A, B)
         return _stochastic_round_cpu(result, A.dtype) if use_sr else result
 
@@ -785,8 +869,10 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
 
     Bsz, M, K = A.shape
     _, _, N = B.shape
-    flop_threshold = _min_nki_flops(A, B)
-    if Bsz * M * K * N < flop_threshold:
+    route = _route_for(Bsz * M * K * N, A, B)
+    if route == "aten":
+        return _aten_on_device(torch.bmm, A, B)
+    if route != "nki":
         return torch.bmm(A, B)
 
     from ._kernels import batched_matmul_kernel
