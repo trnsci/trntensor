@@ -80,7 +80,10 @@ class TestPlanStrategy:
         plan_path = trntensor.plan_contraction(
             "ij,jk,kl->il", torch.randn(3, 4), torch.randn(4, 5), torch.randn(5, 2)
         )
-        assert plan_big.backend == ("nki" if HAS_NKI else "pytorch")
+        from trntensor.nki.dispatch import _route
+
+        big_nki = HAS_NKI and _route(2048**3, pinned=False) == "nki"
+        assert plan_big.backend == ("nki" if big_nki else "pytorch")
         assert plan_small.backend == "pytorch"
         assert plan_path.backend == "pytorch"
 
@@ -164,6 +167,19 @@ class TestGreedyPathSearch:
         path = _greedy_path_search(["ij", "jk", "kl", "lm"], "im", size_map)
         # Cheapest first pair should be (2,3) = C@D
         assert path[0] == (2, 3), f"expected (2,3) got {path[0]}"
+
+    def test_greedy_avoids_outer_product(self):
+        """DF-MP2 AO->MO "mi,na,mnP->iaP": (mi, na) share no index, and its
+        union cost (m·i·n·a) is the smallest, but contracting it first builds
+        the 4-index outer product. Greedy must contract a shared index first."""
+        size_map = {"m": 128, "n": 128, "i": 16, "a": 112, "P": 256}
+        path = _greedy_path_search(["mi", "na", "mnP"], "iaP", size_map)
+        assert path[0] == (0, 2), f"expected (0,2) got {path[0]}"
+
+    def test_greedy_outer_product_when_unavoidable(self):
+        size_map = {"i": 3, "j": 4, "k": 5}
+        path = _greedy_path_search(["i", "j", "k"], "ijk", size_map)
+        assert len(path) == 2
 
     def test_path_length_matches_operand_count(self):
         """N operands → N-1 binary steps."""

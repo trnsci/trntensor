@@ -113,13 +113,48 @@ supported in maintenance mode."
 | `TRNTENSOR_REQUIRE_NKI=1` | Re-raise kernel exceptions instead of falling back to PyTorch. Useful in the validation loop to surface silent kernel breakage. |
 | `TRNTENSOR_MIN_NKI_FLOPS=<int>` | XLA path: override the FLOP threshold (M·K·N) below which dispatch skips NKI and uses `torch.matmul` / `torch.bmm` directly. Default: `2_000_000_000`. Set to `0` to force NKI for kernel validation. |
 | `TRNTENSOR_MIN_NKI_FLOPS_PINNED=<int>` | XLA path, operands already on the device. Default: `1_000_000_000`. |
-| `TRNTENSOR_MIN_NKI_FLOPS_NATIVE=<int>` | Native (TorchNeuron) path, operands on CPU. Default: `1_000_000_000` (provisional: native eager dispatch is ~0.2 ms per launch; re-measure with `scripts/autotune_dispatch.py`). |
-| `TRNTENSOR_MIN_NKI_FLOPS_NATIVE_PINNED=<int>` | Native path, operands already on `neuron`. Default: `128_000_000` (provisional). |
+| `TRNTENSOR_MIN_NKI_FLOPS_NATIVE=<int>` | Native (TorchNeuron) path, operands on CPU: M·K·N at which the work leaves the host for the `neuron` device. Below it, `torch.matmul` / `torch.bmm` run on the host. Above it, the operands are offloaded. The offload runs aten unless the pinned threshold below selects NKI. Default: `500_000_000` (measured on Trn2, see below). |
+| `TRNTENSOR_MIN_NKI_FLOPS_NATIVE_PINNED=<int>\|never` | Native path: M·K·N at which the NKI kernel replaces aten on the device. Below it, device-resident operands run `torch.matmul` / `torch.bmm` (aten) on `neuron`. Default: `never`, because on Trn2 aten beat the NKI kernels at every measured size. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Force the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. Emit the one-time XLA-path and `to_xla` / `from_xla` deprecation warnings. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting (not trntensor's). Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. Set it with `pip install -e`; the test suite sets it by default. |
 | `TRNTENSOR_FORCE_BACKEND=pytorch\|nki\|auto` | Override the backend selection at runtime without calling `set_backend()`. Used by benchmarks to sweep both paths on the same machine. |
 | `TRNTENSOR_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU instead of XLA → NEFF → hardware. Catches Python-trace-level errors without AWS round-trips. MLIR verifier errors remain hardware-only. |
+
+### Native thresholds: measured on Trn2
+
+These were measured on a trn2.3xlarge (Neuron SDK 2.33, NKI 0.7.0), using one
+NeuronCore and two host threads, with `scripts/bench_native_einsum.py` and
+`scripts/autotune_dispatch.py` (#41):
+
+- **Pinned operands: NKI never beats aten.** On device-resident operands,
+  aten `torch.matmul` / `torch.bmm` beat the trntensor NKI matmul and
+  batched-matmul kernels at every size from 128³ to 4096³, in both fp32 and
+  bf16. Examples:
+  - 4096³ bf16: 1.38 ms with aten, 6.82 ms with NKI.
+  - 1024³ fp32: 0.20 ms with aten, 0.55 ms with NKI.
+
+  The eager launch floor is about 0.13 ms for an aten op and about 0.24 ms for
+  an NKI custom op.
+- **Host operands: offload to aten from about 0.5 G multiply-adds.**
+  Offloading to aten (upload, run on device, download) beats offloading
+  through the NKI kernel at every size. It also beats host torch:
+  - fp32: from about 134 M multiply-adds (512³) when the host has two
+    threads.
+  - bf16: from about 0.5 to 1 G multiply-adds.
+
+  The default of 500 M sits between these. A host with more threads moves the
+  crossover up. Re-measure on your host with `scripts/autotune_dispatch.py`.
+
+Under `"auto"` on the native path, the fused quantum kernels (`mp2_energy`,
+`ao_to_mo_transform`) also run as aten, because both measured slower than
+aten on the device:
+
+- AO→MO was 6–20× slower.
+- MP2 energy was 1.0–1.5× slower, reaching parity at best.
+
+`set_backend("nki")` still runs the NKI kernels. The kernels are unchanged,
+and the XLA path keeps them under `"auto"`.
 
 ## Kernels (internal)
 

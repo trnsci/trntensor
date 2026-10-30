@@ -589,11 +589,19 @@ def multi_einsum(
 
     # Pre-pin shared tensors to the device once (only when NKI dispatch is
     # active). Path-aware: "neuron" on TorchNeuron, XLA on the XLA lineage.
+    # Every operand of a contraction that uses a pinned tensor is pinned too:
+    # a contraction must not mix host and device operands (aten raises
+    # "input tensor is on cpu device, expected neuron" on the native path).
     pinned_map: dict[int, torch.Tensor] = {}
     if HAS_NKI and _use_nki() and shared_ids:
         from .nki.dispatch import _to_device
 
-        pinned_map = {tid: _to_device(id_to_tensor[tid]) for tid in shared_ids}
+        pin_ids = set(shared_ids)
+        for c in contractions:
+            ids = [id(op) for op in c[1:]]
+            if any(tid in shared_ids for tid in ids):
+                pin_ids.update(ids)
+        pinned_map = {tid: _to_device(id_to_tensor[tid]) for tid in pin_ids}
 
     # Build substituted contraction list with pre-pinned operands applied
     subst = [(c[0], *(pinned_map.get(id(op), op) for op in c[1:])) for c in contractions]

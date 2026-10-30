@@ -40,9 +40,15 @@ print(f"E_MP2 = {E.item():.6f}")
 
 ### Backend behaviour
 
-- **CPU**: falls back to a Python loop over `(i, j)` pairs composing `torch.einsum`
-  and element-wise ops. Same as `examples/df_mp2_einsum.py`.
-- **Trainium (NKI)**: dispatches a single `@nki.jit` program that
+- **CPU, and native TorchNeuron under `"auto"`**: aten ops on the operands' device.
+  `T[i, j, a, b]` is contracted with `torch.einsum` in chunks over `i`, which
+  bounds peak memory to about 64 MiB of `T` at a time. The `T`-weighted sum is
+  vectorized. This replaces the former Python loop over `(i, j)` pairs, which
+  ran 10–40× slower on a Trainium device.
+  On Trn2 the aten form matched or beat the fused kernel. For example, with
+  `nocc=32, nvir=128, naux=512` it took 3.1 ms, against 4.5 ms for the
+  kernel (#41).
+- **Trainium (NKI): the PyTorch/XLA path, or `set_backend("nki")`**: dispatches a single `@nki.jit` program that
   - accumulates `T` in PSUM via `nisa.nc_matmul`,
   - builds `Δ` on the Vector Engine from SBUF-resident `ε` tiles,
   - folds the energy into a scalar accumulator in SBUF,
@@ -85,8 +91,12 @@ E = trntensor.mp2_energy(B, eps_occ, eps_vir)
 
 ### Backend behaviour
 
-- **CPU**: `torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)` — a single three-operand einsum.
-- **Trainium (NKI)**: dispatches a single `@nki.jit` program that
+- **CPU, and native TorchNeuron under `"auto"`**: two explicit aten steps,
+  `einsum("mi,mnP->inP")` then `einsum("na,inP->iaP")`, on the operands'
+  device. On Trn2 this was 6–20× faster than the fused kernel. For example,
+  with `nbasis=128, nocc=16, naux=256` it took 0.82 ms, against 16.4 ms for
+  the kernel (#41).
+- **Trainium (NKI): the PyTorch/XLA path, or `set_backend("nki")`**: dispatches a single `@nki.jit` program that
   - loads `C_occ` and `C_vir` once, SBUF-resident across all P iterations,
   - for each auxiliary index P: two sequential `nisa.nc_matmul` calls with the intermediate `(i, ν)` tile round-tripping through kernel-scratch HBM to handle the partition-dim change,
   - writes one `(nocc, nvir)` slice per P to the output HBM tensor.

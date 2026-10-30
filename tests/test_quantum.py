@@ -32,6 +32,18 @@ class TestMp2EnergyReference:
         got = _cpu_mp2_energy(B, eps_occ, eps_vir)
         torch.testing.assert_close(got, expected, atol=1e-6, rtol=1e-6)
 
+    def test_chunked_matches_unchunked(self, monkeypatch):
+        """Chunking over i (bounded T memory) gives the same energy."""
+        import trntensor.quantum as q
+
+        torch.manual_seed(3)
+        B = torch.randn(5, 6, 7, dtype=torch.float64) * 0.1
+        eps_occ = -torch.rand(5, dtype=torch.float64) - 0.5
+        eps_vir = torch.rand(6, dtype=torch.float64) + 0.1
+        full = q._cpu_mp2_energy(B, eps_occ, eps_vir)
+        monkeypatch.setattr(q, "_MP2_CHUNK_ELEMS", 2 * 5 * 6 * 6)  # chunk = 2 -> 2,2,1
+        torch.testing.assert_close(q._cpu_mp2_energy(B, eps_occ, eps_vir), full)
+
     def test_shape_errors(self):
         B3 = torch.randn(3, 4, 5)
         eps_occ = torch.randn(3)
@@ -91,6 +103,18 @@ class TestAoToMoTransformReference:
         e = trntensor.mp2_energy(B, eps_occ, eps_vir)
         assert e.shape == ()
         assert torch.isfinite(e)
+
+    def test_chunked_matches_unchunked(self, monkeypatch):
+        """Chunking over i (bounded T memory) gives the same energy."""
+        import trntensor.quantum as q
+
+        torch.manual_seed(3)
+        B = torch.randn(5, 6, 7, dtype=torch.float64) * 0.1
+        eps_occ = -torch.rand(5, dtype=torch.float64) - 0.5
+        eps_vir = torch.rand(6, dtype=torch.float64) + 0.1
+        full = q._cpu_mp2_energy(B, eps_occ, eps_vir)
+        monkeypatch.setattr(q, "_MP2_CHUNK_ELEMS", 2 * 5 * 6 * 6)  # chunk = 2 -> 2,2,1
+        torch.testing.assert_close(q._cpu_mp2_energy(B, eps_occ, eps_vir), full)
 
     def test_shape_errors(self):
         eri = torch.randn(6, 6, 8)

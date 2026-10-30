@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from .nki.dispatch import HAS_NKI, _use_nki
+from .nki.dispatch import _use_fused_kernel
 
 
 def mp2_energy(
@@ -34,12 +34,15 @@ def mp2_energy(
         T_{ijab}  = Σ_P B[i,a,P] B[j,b,P]
         Δ_{ijab}  = ε_i + ε_j - ε_a - ε_b
 
-    On Trainium the entire sum is one fused NKI dispatch: contraction
-    accumulates in PSUM, the spin-adapted numerator and denominator are
-    built in SBUF, and the final reduction folds into a scalar
-    accumulator — no intermediate ``T`` tensor is ever materialized to
-    HBM. On CPU the reference path falls back to a Python loop of
-    einsum calls (same as ``examples/df_mp2_einsum.py``).
+    The fused NKI kernel computes the entire sum in one dispatch:
+    contraction accumulates in PSUM, the spin-adapted numerator and
+    denominator are built in SBUF, and the final reduction folds into a
+    scalar accumulator — no intermediate ``T`` tensor is ever materialized
+    to HBM. It runs on the PyTorch/XLA path and whenever NKI is forced
+    (``set_backend("nki")``). On the native TorchNeuron path ``"auto"`` uses
+    the aten formulation on the operands' device instead, which measured as
+    fast or faster on Trn2 (#41). The aten formulation contracts ``T`` in
+    occupied-index chunks, so its peak memory is bounded.
 
     Parameters
     ----------
@@ -63,7 +66,7 @@ def mp2_energy(
     if eps_vir.shape != (nvir,):
         raise ValueError(f"eps_vir must have shape ({nvir},); got {tuple(eps_vir.shape)}")
 
-    if _use_nki() and HAS_NKI:
+    if _use_fused_kernel():
         from .nki.dispatch import _nki_mp2_energy
 
         try:
@@ -76,28 +79,36 @@ def mp2_energy(
     return _cpu_mp2_energy(B, eps_occ, eps_vir)
 
 
+# Elements of the per-chunk T block (chunk·nocc·nvir²) the aten MP2 path
+# materializes at once: 2²⁴ fp32 elements = 64 MiB.
+_MP2_CHUNK_ELEMS = 1 << 24
+
+
 def _cpu_mp2_energy(
     B: torch.Tensor,
     eps_occ: torch.Tensor,
     eps_vir: torch.Tensor,
 ) -> torch.Tensor:
-    """Reference implementation. Same loop as ``examples/df_mp2_einsum.py``.
+    """Reference implementation in aten ops, on ``B``'s device.
 
-    The loop indexes scalars (``eps_occ[i]``) nocc² times, which is
-    catastrophically slow on an eager Neuron device. Device-resident
-    operands are copied to the host for the loop and the 0-D result is moved
-    back to ``B``'s device.
+    Vectorized over ``(j, a, b)`` and chunked over ``i``:
+    ``T[i,j,a,b] = Σ_P B[i,a,P] B[j,b,P]`` for a chunk of ``i``, then
+    ``Σ T (2T - T_ijba) / Δ``. ``T_ijba`` is the last-two-dims transpose
+    of the same block, so each chunk is self-contained. Replaces the
+    former nocc² Python loop (``examples/df_mp2_einsum.py``), which on a
+    Trainium device ran 10-40x slower than this form (#41).
     """
-    if B.device.type == "neuron":
-        e = _cpu_mp2_energy(B.cpu(), eps_occ.cpu(), eps_vir.cpu())
-        return e.to(B.device)
-    nocc = B.shape[0]
+    nocc, nvir, _naux = B.shape
+    chunk = max(1, _MP2_CHUNK_ELEMS // max(1, nocc * nvir * nvir))
+    eps_occ = eps_occ.to(B.device)
+    eps_vir = eps_vir.to(B.device)
+    ev = eps_vir[:, None] + eps_vir[None, :]  # (a, b)
     e = B.new_zeros(())
-    for i in range(nocc):
-        for j in range(nocc):
-            T = torch.einsum("ap,bp->ab", B[i], B[j])
-            denom = eps_occ[i] + eps_occ[j] - eps_vir.unsqueeze(1) - eps_vir.unsqueeze(0)
-            e = e + (T * (2 * T - T.T) / denom).sum()
+    for i0 in range(0, nocc, chunk):
+        Bi = B[i0 : i0 + chunk]
+        T = torch.einsum("iap,jbp->ijab", Bi, B)
+        denom = (eps_occ[i0 : i0 + chunk, None] + eps_occ[None, :])[:, :, None, None] - ev
+        e = e + (T * (2 * T - T.transpose(2, 3)) / denom).sum()
     return e
 
 
@@ -115,8 +126,11 @@ def ao_to_mo_transform(
     as the canonical chemistry primitive. On Trainium, this is one NKI
     program: the first matmul's result lives in SBUF as an intermediate
     ``(i, ν)`` tile that feeds the second matmul directly — no
-    intermediate four-index tensor is materialized to HBM. On CPU the
-    fallback is ``torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)``.
+    intermediate four-index tensor is materialized to HBM. The kernel runs
+    on the PyTorch/XLA path and whenever NKI is forced; on the native
+    TorchNeuron path ``"auto"`` uses the two-step aten contraction below,
+    which measured 6-20x faster on Trn2 (#41). Without NKI the fallback is
+    the same two-step contraction.
 
     Composes with :func:`mp2_energy`: ``B = ao_to_mo_transform(eri, C_occ,
     C_vir)`` then ``E = mp2_energy(B, eps_occ, eps_vir)`` is the full
@@ -151,7 +165,7 @@ def ao_to_mo_transform(
     _, nocc = C_occ.shape
     _, nvir = C_vir.shape
 
-    if _use_nki() and HAS_NKI:
+    if _use_fused_kernel():
         from .nki.dispatch import _nki_ao_to_mo_transform
 
         # Tiled over ν (step 1) and a (step 2); K-tiled over μ/ν. The
@@ -178,5 +192,10 @@ def _cpu_ao_to_mo_transform(
     C_occ: torch.Tensor,
     C_vir: torch.Tensor,
 ) -> torch.Tensor:
-    """Reference: the fused 3-operand einsum form."""
-    return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+    """Reference: ``einsum("mi,na,mnP->iaP")`` as two explicit binary steps.
+
+    Contracting ``μ`` first (``inP``), then ``ν``, is the O(nbasis²·nocc·naux)
+    order; it never builds the 4-index ``C_occ ⊗ C_vir`` outer product.
+    """
+    half = torch.einsum("mi,mnP->inP", C_occ, eri)
+    return torch.einsum("na,inP->iaP", C_vir, half)

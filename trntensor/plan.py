@@ -51,7 +51,7 @@ def _backend_for(strategy: str, operands: tuple) -> str:
     """
     if strategy not in ("matmul", "bmm"):
         return "pytorch"
-    from .nki.dispatch import HAS_NKI, _nki_flop_threshold
+    from .nki.dispatch import HAS_NKI, _route
 
     if not HAS_NKI:
         return "pytorch"
@@ -63,10 +63,11 @@ def _backend_for(strategy: str, operands: tuple) -> str:
         Bsz, M, K = operands[0].shape
         _, _, N = operands[1].shape
         flops = Bsz * M * K * N
-    # Plans are cached by shape, not device, so report against the path-aware
-    # unpinned threshold; device-resident operands may still dispatch to NKI
-    # below it (nki_matmul applies the pinned threshold at run time).
-    return "nki" if flops >= _nki_flop_threshold(pinned=False) else "pytorch"
+    # Plans are cached by shape, not device, so report the host-operand route;
+    # device-resident operands may still dispatch differently (nki_matmul
+    # applies the pinned threshold at run time). On the native path the
+    # device executor below the pinned threshold is aten, i.e. "pytorch".
+    return "nki" if _route(flops, pinned=False) == "nki" else "pytorch"
 
 
 def _validate_subscripts(subscripts: str, operands: tuple[torch.Tensor, ...]) -> None:
@@ -228,7 +229,7 @@ def _greedy_path_search(
 
     while len(inputs) > 2:
         best_pair: tuple[int, int] = (0, 1)
-        best_cost = float("inf")
+        best_cost: tuple[bool, float] = (True, float("inf"))
         best_inter: set[str] = set()
 
         for i in range(len(inputs)):
@@ -243,10 +244,17 @@ def _greedy_path_search(
                 contracted = pair_union - surviving
                 intermediate = pair_union - contracted
 
-                # FLOPs ≈ product of all index sizes in the pair union
-                cost = 1
+                # FLOPs ≈ product of all index sizes in the pair union. Pairs
+                # that share no index are outer products: their union cost
+                # understates the work, because the (larger) intermediate
+                # makes every later step more expensive (e.g. "mi,na,mnP->iaP"
+                # would build the 4-index "mina" first). Rank them after every
+                # pair that shares an index.
+                flops = 1
                 for idx in pair_union:
-                    cost *= size_map.get(idx, 1)
+                    flops *= size_map.get(idx, 1)
+                outer = not (set(inputs[i]) & set(inputs[j]))
+                cost = (outer, flops)
 
                 if cost < best_cost:
                     best_cost = cost
