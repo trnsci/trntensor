@@ -9,10 +9,16 @@ can be tiled across (i,j) pairs with B slices loaded once to SBUF.
 On the Tensor Engine, each (a,b) block is a matmul: B[i] @ B[j]^T.
 Fusing the denominator division into the PSUM accumulation avoids
 a separate element-wise pass over the output.
+
+Every kernel launch goes through ``_launch``, which picks the native
+TorchNeuron custom op (``trntensor::<name>`` on ``device="neuron"``, see
+``_native.py``) or the PyTorch/XLA path (``_to_xla``), detected lazily on
+the first launch by ``_get_dispatch_path``.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import warnings
 
@@ -88,7 +94,8 @@ def _warn_if_sr_unavailable() -> None:
 
 # FLOP thresholds for NKI dispatch.
 #
-# Profiler findings (trn1.2xlarge, 2026-04-17, scripts/run_neuron_profile.sh):
+# XLA path (PyTorch/XLA lineage, Trn1). Profiler findings (trn1.2xlarge,
+# 2026-04-17, scripts/run_neuron_profile.sh):
 #   - XLA kernel submission latency: ~0.67 ms fixed overhead per dispatch
 #   - host→device transfer: ~3.5 MB/ms (scales with tensor size)
 #   - device→host transfer: ~5.5 MB/ms
@@ -104,34 +111,111 @@ def _warn_if_sr_unavailable() -> None:
 #   - 2048² wins (4.12 ms vs 23.3 ms = 5.65×)
 #   Crossover: ~1 GFLOPs
 #
-# Two thresholds:
+# XLA thresholds (unchanged):
 #   _MIN_NKI_FLOPS        — operands on CPU (default: 2 GFLOPs)
 #   _MIN_NKI_FLOPS_PINNED — operands already on XLA (default: 1 GFLOPs)
 #
+# Native path (TorchNeuron, Trn2/Trn3). An eager launch of a registered
+# ``trntensor::`` op costs ~0.2 ms, well under the XLA path's per-dispatch
+# floor, so the fixed-overhead part of the crossover shrinks. Host↔device
+# transfer costs the same on both paths, so the unpinned crossover moves
+# less than the pinned one. These defaults are estimates from those two
+# numbers, not measurements; re-measure on Trn2 with
+# scripts/autotune_dispatch.py (which writes the *_native cache keys there):
+#   _MIN_NKI_FLOPS_NATIVE        — operands on CPU (default: 1 GFLOPs)
+#   _MIN_NKI_FLOPS_NATIVE_PINNED — operands already on "neuron" (default: 128 MFLOPs)
+#
+# _min_nki_flops(*operands) returns the threshold for the active path.
 # Override with env vars or scripts/autotune_dispatch.py --write-cache.
-def _load_min_nki_flops() -> tuple[int, int]:
-    """Return (threshold_unpinned, threshold_pinned)."""
-    env_unpinned = os.environ.get("TRNTENSOR_MIN_NKI_FLOPS", "")
-    env_pinned = os.environ.get("TRNTENSOR_MIN_NKI_FLOPS_PINNED", "")
+_DEFAULT_MIN_NKI_FLOPS = 2_000_000_000
+_DEFAULT_MIN_NKI_FLOPS_PINNED = 1_000_000_000
+_DEFAULT_MIN_NKI_FLOPS_NATIVE = 1_000_000_000
+_DEFAULT_MIN_NKI_FLOPS_NATIVE_PINNED = 128_000_000
+
+
+def _load_threshold_cache() -> dict:
     cache_path = os.environ.get(
         "TRNTENSOR_AUTOTUNE_CACHE", "/var/tmp/trntensor-autotune/threshold.json"
     )
-    cache_unpinned = cache_pinned = None
     try:
         import json
 
         with open(cache_path) as f:
             data = json.load(f)
-        cache_unpinned = int(data.get("trntensor_min_nki_flops", 2_000_000_000))
-        cache_pinned = int(data.get("trntensor_min_nki_flops_pinned", 1_000_000_000))
     except (FileNotFoundError, KeyError, ValueError, OSError):
-        pass
-    unpinned = int(env_unpinned) if env_unpinned else (cache_unpinned or 2_000_000_000)
-    pinned = int(env_pinned) if env_pinned else (cache_pinned or 1_000_000_000)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _threshold(env_var: str, cache: dict, cache_key: str, default: int) -> int:
+    env = os.environ.get(env_var, "")
+    if env:
+        return int(env)
+    try:
+        cached = cache.get(cache_key)
+        return int(cached) if cached else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_min_nki_flops() -> tuple[int, int]:
+    """Return the XLA-path (threshold_unpinned, threshold_pinned)."""
+    cache = _load_threshold_cache()
+    unpinned = _threshold(
+        "TRNTENSOR_MIN_NKI_FLOPS", cache, "trntensor_min_nki_flops", _DEFAULT_MIN_NKI_FLOPS
+    )
+    pinned = _threshold(
+        "TRNTENSOR_MIN_NKI_FLOPS_PINNED",
+        cache,
+        "trntensor_min_nki_flops_pinned",
+        _DEFAULT_MIN_NKI_FLOPS_PINNED,
+    )
+    return unpinned, pinned
+
+
+def _load_min_nki_flops_native() -> tuple[int, int]:
+    """Return the native-path (threshold_unpinned, threshold_pinned)."""
+    cache = _load_threshold_cache()
+    unpinned = _threshold(
+        "TRNTENSOR_MIN_NKI_FLOPS_NATIVE",
+        cache,
+        "trntensor_min_nki_flops_native",
+        _DEFAULT_MIN_NKI_FLOPS_NATIVE,
+    )
+    pinned = _threshold(
+        "TRNTENSOR_MIN_NKI_FLOPS_NATIVE_PINNED",
+        cache,
+        "trntensor_min_nki_flops_native_pinned",
+        _DEFAULT_MIN_NKI_FLOPS_NATIVE_PINNED,
+    )
     return unpinned, pinned
 
 
 _MIN_NKI_FLOPS, _MIN_NKI_FLOPS_PINNED = _load_min_nki_flops()
+_MIN_NKI_FLOPS_NATIVE, _MIN_NKI_FLOPS_NATIVE_PINNED = _load_min_nki_flops_native()
+
+
+def _on_native_path() -> bool:
+    return not _use_simulator() and _get_dispatch_path() == "native"
+
+
+def _nki_flop_threshold(pinned: bool) -> int:
+    """FLOP threshold (M·K·N) below which a contraction stays on torch.
+
+    Path-aware: the native TorchNeuron path uses the native thresholds; the
+    XLA path, the simulator, and hosts without a device path use the XLA
+    values. ``pinned`` means the operands already live on the path's device.
+    """
+    if _on_native_path():
+        return _MIN_NKI_FLOPS_NATIVE_PINNED if pinned else _MIN_NKI_FLOPS_NATIVE
+    return _MIN_NKI_FLOPS_PINNED if pinned else _MIN_NKI_FLOPS
+
+
+def _min_nki_flops(*operands: torch.Tensor) -> int:
+    """:func:`_nki_flop_threshold` for these operands' residency."""
+    device_type = _NEURON_DEVICE if _on_native_path() else "xla"
+    return _nki_flop_threshold(pinned=all(t.device.type == device_type for t in operands))
+
 
 _backend = "auto"
 
@@ -194,27 +278,224 @@ def _to_xla(*tensors):
     return [t.to(device) for t in tensors], orig
 
 
+# ── Device dispatch path: native TorchNeuron vs XLA ──────────────────────────
+#
+# Two Neuron PyTorch lineages coexist:
+#   native  torch-neuronx 2.14+ (TorchNeuron, Trn2/Trn3): Trainium is a
+#           PyTorch `neuron` device; kernels are custom ops registered via
+#           `torch_neuronx.nki_op` (see `_native.py`).
+#   xla     torch-neuronx 2.9 lineage (PyTorch/XLA; Trn1 and Inf2 stay
+#           here): kernels dispatch on the torch_xla device via `_to_xla()`.
+# Anything else is "cpu": no device path, so a kernel launch outside the
+# simulator goes through `_to_xla` and fails there exactly as it did before
+# the native path existed (the host wrappers then fall back to torch unless
+# TRNTENSOR_REQUIRE_NKI=1). Detection runs on the first launch, not at
+# import, and the native probe never imports torch_xla.
+
+_NEURON_DEVICE = "neuron"
+_dispatch_path: str | None = None
+_native_ops: dict | None = None
+
+# Dormant XLA deprecation hook (trnsci/trnsci#35). Off unless the suite-wide
+# TRNSCI_XLA_DEPRECATION=1 is set; the suite turns it on at TorchNeuron GA.
+XLA_DEPRECATION_ENV_VAR = "TRNSCI_XLA_DEPRECATION"
+XLA_DEPRECATION_MESSAGE = (
+    "the PyTorch/XLA path is deprecated on Trn2/Trn3; use TorchNeuron (native). "
+    "Trn1/Inf2 remain supported in maintenance mode."
+)
+_xla_deprecation_emitted = False
+_api_deprecations_emitted: set[str] = set()
+
+
+def _xla_deprecation_enabled() -> bool:
+    return os.environ.get(XLA_DEPRECATION_ENV_VAR, "") == "1"
+
+
+def _warn_xla_path_deprecated() -> None:
+    global _xla_deprecation_emitted
+    if _xla_deprecation_emitted or not _xla_deprecation_enabled():
+        return
+    _xla_deprecation_emitted = True
+    warnings.warn(XLA_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=4)
+
+
+def _native_available() -> bool:
+    try:
+        import torch_neuronx
+    except Exception:
+        return False
+    # The XLA-lineage torch_neuronx has no `nki_op`.
+    if not hasattr(torch_neuronx, "nki_op"):
+        return False
+    try:
+        torch.device(_NEURON_DEVICE)  # torch_neuronx renames PrivateUse1 to "neuron"
+        return torch_neuronx.device_count() > 0
+    except Exception:
+        return False
+
+
+def _detect_dispatch_path() -> str:
+    # TRNSCI_NKI_DISPATCH=auto|native|xla is shared by every trnsci library, so
+    # one variable pins the whole suite on hosts that have both lineages.
+    forced = os.environ.get("TRNSCI_NKI_DISPATCH", "auto").strip().lower()
+    if forced == "native":
+        if not _native_available():
+            raise RuntimeError(
+                "TRNSCI_NKI_DISPATCH=native, but no TorchNeuron backend with a "
+                "'neuron' device is available"
+            )
+        return "native"
+    if forced == "xla":
+        if importlib.util.find_spec("torch_xla") is None:
+            raise RuntimeError("TRNSCI_NKI_DISPATCH=xla, but torch_xla is not installed")
+        return "xla"
+    if forced != "auto":
+        raise ValueError(f"TRNSCI_NKI_DISPATCH must be auto, native, or xla; got {forced!r}")
+    if _native_available():
+        return "native"
+    if importlib.util.find_spec("torch_xla") is not None:
+        return "xla"
+    return "cpu"
+
+
+def _get_dispatch_path() -> str:
+    """Return "native", "xla", or "cpu" (cached after the first call).
+
+    Selecting the XLA path emits the dormant one-time ``DeprecationWarning``
+    when ``TRNSCI_XLA_DEPRECATION=1`` is set.
+    """
+    global _dispatch_path
+    if _dispatch_path is None:
+        _dispatch_path = _detect_dispatch_path()
+    if _dispatch_path == "xla":
+        _warn_xla_path_deprecated()
+    return _dispatch_path
+
+
+def _get_native_ops() -> dict:
+    """Import `_native` (registering the trntensor:: custom ops) on first use."""
+    global _native_ops
+    if _native_ops is None:
+        from . import _native
+
+        _native_ops = _native.OPS
+    return _native_ops
+
+
+def _launch(kernel, op_name: str, *tensors: torch.Tensor, **consts) -> torch.Tensor:
+    """Run one kernel launch on the Neuron device; return it on the caller's device.
+
+    ``op_name`` is the ``trntensor::<op_name>`` custom op used on the native
+    path; the XLA path calls ``kernel`` directly on torch_xla tensors.
+    ``consts`` are compile-time kernel arguments (``use_sr``), passed by
+    keyword on both paths. The result comes back on the device of
+    ``tensors[0]``, so device-resident operands keep the result on the device.
+    """
+    if _get_dispatch_path() == "native":
+        orig = tensors[0].device
+        op = _get_native_ops()[op_name]
+        return op(*(t.to(_NEURON_DEVICE) for t in tensors), **consts).to(orig)
+    xs, orig = _to_xla(*tensors)
+    return kernel(*xs, **consts).to(orig)
+
+
+# Device types that count as "on Trainium" (either lineage).
+_DEVICE_TYPES = ("xla", _NEURON_DEVICE)
+
+
+def _is_device_tensor(t: torch.Tensor) -> bool:
+    """True if ``t`` already lives on a Neuron device (either lineage)."""
+    return t.device.type in _DEVICE_TYPES
+
+
+def _warn_api_deprecated(name: str, replacement: str) -> None:
+    if name in _api_deprecations_emitted or not _xla_deprecation_enabled():
+        return
+    _api_deprecations_emitted.add(name)
+    warnings.warn(
+        f"trntensor.{name} is deprecated; use trntensor.{replacement}, which works "
+        "on both the native TorchNeuron and PyTorch/XLA paths. " + XLA_DEPRECATION_MESSAGE,
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _require_nki(fn_name: str) -> None:
+    if not HAS_NKI:
+        raise RuntimeError(
+            f"{fn_name} requires the NKI runtime. Install trntensor on a Trainium "
+            "instance (AWS Deep Learning AMI) or use the CPU path."
+        )
+
+
+def _to_device(tensor: torch.Tensor) -> torch.Tensor:
+    """Place ``tensor`` on the active dispatch path's device (never warns)."""
+    if _is_device_tensor(tensor):
+        return tensor
+    _require_nki("to_device")
+    if _get_dispatch_path() == "native":
+        return tensor.to(_NEURON_DEVICE)
+    xla_tensors, _ = _to_xla(tensor)
+    return xla_tensors[0]
+
+
+def _from_device(tensor: torch.Tensor) -> torch.Tensor:
+    """Move ``tensor`` back to CPU (never warns). No-op if already on CPU."""
+    if tensor.device.type == "cpu":
+        return tensor
+    return tensor.to("cpu")
+
+
+def to_device(tensor: torch.Tensor) -> torch.Tensor:
+    """Move a tensor to the Trainium device of the active dispatch path.
+
+    On TorchNeuron (native, Trn2/Trn3) this is ``tensor.to("neuron")``. On
+    the PyTorch/XLA lineage (Trn1) it is the XLA device, exactly as
+    :func:`to_xla`. trntensor calls on device-resident operands return
+    device-resident results; pull them back with :func:`from_device`.
+
+    Pre-pinning operands and only pulling results back when needed
+    eliminates host↔device transfer cost from per-dispatch overhead. For
+    pipelines where the same operand is consumed by multiple trntensor
+    calls — DF-MP2 (same ``B`` into ``ao_to_mo_transform`` and
+    ``mp2_energy``), ``(i,j)`` loops reusing ``B_i``, any multi-step
+    workflow — residency is the practical fix for dispatch overhead.
+
+    Raises ``RuntimeError`` on hosts where ``nki`` isn't importable;
+    no-op when the tensor is already on a Neuron device.
+    """
+    return _to_device(tensor)
+
+
+def from_device(tensor: torch.Tensor) -> torch.Tensor:
+    """Move a tensor back to CPU. No-op if already on CPU."""
+    return _from_device(tensor)
+
+
 def to_xla(tensor: torch.Tensor) -> torch.Tensor:
-    """Move a tensor to the XLA (Trainium) device.
+    """Move a tensor to the Trainium device (PyTorch/XLA-era name).
+
+    Kept for compatibility; prefer :func:`to_device`. On the PyTorch/XLA
+    lineage (Trn1) this moves the tensor to the XLA device, unchanged. On
+    TorchNeuron (native, Trn2/Trn3) there is no XLA device, so placement is
+    automatic: the tensor goes to the ``neuron`` device and residency works
+    the same way.
 
     Pre-pinning operands via ``to_xla`` and only pulling results back
     with ``from_xla`` when needed eliminates host↔device transfer cost
-    from per-dispatch overhead. For pipelines where the same operand
-    is consumed by multiple trntensor calls — DF-MP2 (same ``B`` into
-    ``ao_to_mo_transform`` and ``mp2_energy``), ``(i,j)`` loops reusing
-    ``B_i``, any multi-step workflow — residency is the practical fix
-    for dispatch overhead.
+    from per-dispatch overhead.
 
     Raises ``RuntimeError`` on hosts where ``nki`` isn't importable;
-    no-op when the tensor is already on an XLA device.
+    no-op when the tensor is already on an XLA device. With
+    ``TRNSCI_XLA_DEPRECATION=1`` set, emits a one-time
+    ``DeprecationWarning`` pointing at :func:`to_device`.
     """
+    _warn_api_deprecated("to_xla", "to_device")
     if tensor.device.type == "xla":
         return tensor
-    if not HAS_NKI:
-        raise RuntimeError(
-            "to_xla requires the NKI runtime. Install trntensor on a Trainium "
-            "instance (AWS Deep Learning AMI) or use the CPU path."
-        )
+    _require_nki("to_xla")
+    if _get_dispatch_path() == "native":
+        return tensor.to(_NEURON_DEVICE)
     # Route through the internal _to_xla helper so residency uses exactly
     # the same path as per-kernel dispatch — keeps torch_xla initialization
     # consistent across entry points.
@@ -223,10 +504,14 @@ def to_xla(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def from_xla(tensor: torch.Tensor) -> torch.Tensor:
-    """Move a tensor back to CPU. No-op if already on CPU."""
-    if tensor.device.type == "cpu":
-        return tensor
-    return tensor.to("cpu")
+    """Move a tensor back to CPU. No-op if already on CPU.
+
+    Kept for compatibility; prefer :func:`from_device` (same behaviour on
+    either lineage). With ``TRNSCI_XLA_DEPRECATION=1`` set, emits a
+    one-time ``DeprecationWarning``.
+    """
+    _warn_api_deprecated("from_xla", "from_device")
+    return _from_device(tensor)
 
 
 def _stochastic_round_cpu(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -314,10 +599,9 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
 
     M, K = A.shape
     _, N = B.shape
-    # Use a lower threshold when operands are already on XLA — no host→device
-    # transfer cost. Crossover measured at ~900 MFLOPs vs ~2 GFLOPs unpinned.
-    already_pinned = A.device.type == "xla" and B.device.type == "xla"
-    flop_threshold = _MIN_NKI_FLOPS_PINNED if already_pinned else _MIN_NKI_FLOPS
+    # Use a lower threshold when operands are already on the device — no
+    # host→device transfer cost. Path-aware: see _min_nki_flops.
+    flop_threshold = _min_nki_flops(A, B)
     if flop_threshold > M * K * N:
         result = torch.matmul(A, B)
         return _stochastic_round_cpu(result, A.dtype) if use_sr else result
@@ -350,9 +634,7 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
             )
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
-            (a, b), orig_device = _to_xla(A_feed, B_feed)
-            c = matmul_kernel(a, b, use_sr=use_sr)
-            result = c.to(orig_device)
+            result = _launch(matmul_kernel, "matmul", A_feed, B_feed, use_sr=use_sr)
         return result[:M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:
@@ -421,9 +703,8 @@ def _nki_mp2_energy(
         )
         return torch.from_numpy(np.asarray(out_np)).to(B.device).sum()
 
-    (b, eo, ev, evb), orig_device = _to_xla(B_feed, eo_b, ev_feed, ev_b)
-    partial = mp2_energy_kernel(b, eo, ev, evb)
-    return partial.to(orig_device).sum()
+    partial = _launch(mp2_energy_kernel, "mp2_energy", B_feed, eo_b, ev_feed, ev_b)
+    return partial.sum()
 
 
 def _nki_ao_to_mo_transform(
@@ -481,9 +762,9 @@ def _nki_ao_to_mo_transform(
         result = torch.from_numpy(np.asarray(out_np)).to(eri.device)
         return result[:, :nvir, :] if nvir_pad != nvir else result
 
-    (e, co, cv), orig_device = _to_xla(eri_feed, C_occ_feed, C_vir_feed)
-    B = ao_to_mo_transform_kernel(e, co, cv)
-    result = B.to(orig_device)
+    result = _launch(
+        ao_to_mo_transform_kernel, "ao_to_mo_transform", eri_feed, C_occ_feed, C_vir_feed
+    )
     return result[:, :nvir, :] if nvir_pad != nvir else result
 
 
@@ -504,8 +785,7 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
 
     Bsz, M, K = A.shape
     _, _, N = B.shape
-    already_pinned = A.device.type == "xla" and B.device.type == "xla"
-    flop_threshold = _MIN_NKI_FLOPS_PINNED if already_pinned else _MIN_NKI_FLOPS
+    flop_threshold = _min_nki_flops(A, B)
     if Bsz * M * K * N < flop_threshold:
         return torch.bmm(A, B)
 
@@ -537,9 +817,7 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
             )
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
-            (a, b), orig_device = _to_xla(A_feed, B_feed)
-            c = batched_matmul_kernel(a, b, use_sr=use_sr)
-            result = c.to(orig_device)
+            result = _launch(batched_matmul_kernel, "batched_matmul", A_feed, B_feed, use_sr=use_sr)
         return result[:, :M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:

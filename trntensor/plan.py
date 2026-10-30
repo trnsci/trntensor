@@ -51,7 +51,7 @@ def _backend_for(strategy: str, operands: tuple) -> str:
     """
     if strategy not in ("matmul", "bmm"):
         return "pytorch"
-    from .nki.dispatch import _MIN_NKI_FLOPS, HAS_NKI
+    from .nki.dispatch import HAS_NKI, _nki_flop_threshold
 
     if not HAS_NKI:
         return "pytorch"
@@ -63,7 +63,10 @@ def _backend_for(strategy: str, operands: tuple) -> str:
         Bsz, M, K = operands[0].shape
         _, _, N = operands[1].shape
         flops = Bsz * M * K * N
-    return "nki" if flops >= _MIN_NKI_FLOPS else "pytorch"
+    # Plans are cached by shape, not device, so report against the path-aware
+    # unpinned threshold; device-resident operands may still dispatch to NKI
+    # below it (nki_matmul applies the pinned threshold at run time).
+    return "nki" if flops >= _nki_flop_threshold(pinned=False) else "pytorch"
 
 
 def _validate_subscripts(subscripts: str, operands: tuple[torch.Tensor, ...]) -> None:

@@ -10,6 +10,12 @@ import pytest
 SR_ENV_VAR = "NEURON_RT_STOCHASTIC_ROUNDING_EN"
 _SR_AT_PROCESS_START = os.environ.get(SR_ENV_VAR)
 
+# Test runs come from source checkouts / editable installs, which the
+# TorchNeuron NKI trace cache cannot version (it keys on wheel .dist-info).
+# A stale hit would run an old kernel, so disable it before anything imports
+# nki. Set it explicitly to override.
+os.environ.setdefault("NKI_ENABLE_TRACE_CACHE", "0")
+
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "neuron: requires Neuron hardware")

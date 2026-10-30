@@ -492,7 +492,8 @@ def _try_batched_multi_einsum(
     operand shapes. Returns ``None`` otherwise (caller falls through to
     the per-contraction loop).
 
-    Amortizes the ~0.67 ms fixed XLA dispatch latency across N contractions:
+    Amortizes the fixed per-launch dispatch latency (~0.67 ms on the XLA
+    path, ~0.2 ms native) across N contractions:
     instead of N individual ``nki_matmul`` calls each paying that overhead,
     the stack is dispatched once via ``nki_batched_matmul``.
 
@@ -520,10 +521,10 @@ def _try_batched_multi_einsum(
     A_stack = torch.stack([c[1].T if plan.transA else c[1] for c in contractions])
     B_stack = torch.stack([c[2].T if plan.transB else c[2] for c in contractions])
     out_stack = nki_batched_matmul(A_stack, B_stack, use_sr=(precision == "sr"))
-    if out_stack.device.type == "xla":
-        from .nki.dispatch import from_xla
+    from .nki.dispatch import _from_device, _is_device_tensor
 
-        out_stack = from_xla(out_stack)
+    if _is_device_tensor(out_stack):
+        out_stack = _from_device(out_stack)
     return [out_stack[i] for i in range(len(contractions))]
 
 
@@ -538,8 +539,9 @@ def multi_einsum(
     Returns list of results.
 
     Shared operands (same tensor object appearing in more than one
-    contraction) are pre-pinned to XLA once when NKI is available,
-    avoiding repeated host→device transfers.
+    contraction) are pre-pinned to the Neuron device once when NKI is
+    available (``neuron`` on TorchNeuron, XLA on Trn1), avoiding repeated
+    host→device transfers. Device-resident results are returned on CPU.
 
     When all contractions are homogeneous — same subscript, same operand
     shapes, 2-operand matmul — they are stacked and dispatched as a single
@@ -585,15 +587,16 @@ def multi_einsum(
             id_count[tid] = id_count.get(tid, 0) + 1
     shared_ids = {tid for tid, n in id_count.items() if n > 1}
 
-    # Pre-pin shared tensors to XLA once (only when NKI dispatch is active)
-    xla_map: dict[int, torch.Tensor] = {}
+    # Pre-pin shared tensors to the device once (only when NKI dispatch is
+    # active). Path-aware: "neuron" on TorchNeuron, XLA on the XLA lineage.
+    pinned_map: dict[int, torch.Tensor] = {}
     if HAS_NKI and _use_nki() and shared_ids:
-        from .nki.dispatch import to_xla
+        from .nki.dispatch import _to_device
 
-        xla_map = {tid: to_xla(id_to_tensor[tid]) for tid in shared_ids}
+        pinned_map = {tid: _to_device(id_to_tensor[tid]) for tid in shared_ids}
 
     # Build substituted contraction list with pre-pinned operands applied
-    subst = [(c[0], *(xla_map.get(id(op), op) for op in c[1:])) for c in contractions]
+    subst = [(c[0], *(pinned_map.get(id(op), op) for op in c[1:])) for c in contractions]
 
     # Pre-resolve target_forward_error → precision for the homogeneous batching
     # path (_try_batched_multi_einsum accepts only precision=). All contractions
@@ -629,9 +632,10 @@ def multi_einsum(
         result = einsum(
             subscripts, *ops, precision=precision, target_forward_error=target_forward_error
         )
-        if hasattr(result, "device") and result.device.type == "xla":
-            from .nki.dispatch import from_xla
+        if hasattr(result, "device"):
+            from .nki.dispatch import _from_device, _is_device_tensor
 
-            result = from_xla(result)
+            if _is_device_tensor(result):
+                result = _from_device(result)
         results.append(result)
     return results

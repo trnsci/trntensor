@@ -15,7 +15,7 @@ as the primary design surface.
 | Multiple `Plan` objects with HBM intermediates | `multi_einsum()` with shared-operand pre-pinning |
 | `cutensorDecompositionCreate` (Tucker HOSVD) | `tucker_decompose()` |
 | Custom THC / Cholesky-factored ERIs | `cp_decompose()` (tensor hypercontraction) |
-| CUDA stream + `cudaMemcpy` to pin device memory | `to_xla(tensor)` / `from_xla(tensor)` |
+| CUDA stream + `cudaMemcpy` to pin device memory | `to_device(tensor)` / `from_device(tensor)` (formerly `to_xla` / `from_xla`) |
 
 ## 2-Operand contractions — the generic path
 
@@ -119,12 +119,14 @@ XLA-resident copy is used for all subsequent contractions in the batch.
 
 On CPU (no NKI), `multi_einsum` behaves exactly like a loop over `einsum()`.
 
-## XLA residency: `to_xla` / `from_xla`
+## Device residency: `to_device` / `from_device`
 
-The NKI dispatch path always transfers operands to the Trainium XLA device
-before kernel launch. For a single large matmul this cost is negligible; for a
-tight loop of small contractions it dominates. `to_xla` / `from_xla` expose the
-transfer explicitly so callers can control when it happens:
+The NKI dispatch path always transfers operands to the Trainium device
+(`neuron` on TorchNeuron, the XLA device on Trn1) before kernel launch. For a
+single large matmul this cost is negligible; for a tight loop of small
+contractions it dominates. `to_device` / `from_device` expose the transfer
+explicitly so callers can control when it happens. `to_xla` / `from_xla` are
+the older names for the same thing and still work on both lineages:
 
 ```python
 # Cold path: B transferred on every call (3 transfers for 3 calls)
@@ -132,17 +134,17 @@ for _ in range(3):
     result = trntensor.einsum("ij,jk->ik", A, B)
 
 # Residency path: B transferred once, result stays on device until needed
-A_x = trntensor.to_xla(A)
-B_x = trntensor.to_xla(B)
+A_x = trntensor.to_device(A)
+B_x = trntensor.to_device(B)
 for _ in range(3):
     result_x = trntensor.einsum("ij,jk->ik", A_x, B_x)  # zero transfer cost
-result = trntensor.from_xla(result_x)
+result = trntensor.from_device(result_x)
 ```
 
 The residency API maps to the CUDA concept of a device-pinned buffer, but with
 explicit Python-level transfer rather than stream-implicit staging.
 
-`to_xla` raises `RuntimeError` on hosts without `nki` installed.
+`to_device` (like `to_xla`) raises `RuntimeError` on hosts without `nki` installed.
 
 ## 3+ operand einsums: contraction-path search
 

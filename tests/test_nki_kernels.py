@@ -14,6 +14,20 @@ pytestmark = pytest.mark.neuron
 ATOL = 1e-3
 RTOL = 1e-4
 
+_THRESHOLDS = (
+    "_MIN_NKI_FLOPS",
+    "_MIN_NKI_FLOPS_PINNED",
+    "_MIN_NKI_FLOPS_NATIVE",
+    "_MIN_NKI_FLOPS_NATIVE_PINNED",
+)
+
+
+def _device_type() -> str:
+    """Device type operands are pinned to on the active dispatch path."""
+    from trntensor.nki import dispatch
+
+    return "neuron" if dispatch._get_dispatch_path() == "native" else "xla"
+
 
 @pytest.fixture
 def nki_backend(monkeypatch):
@@ -25,7 +39,9 @@ def nki_backend(monkeypatch):
     import trntensor
     from trntensor.nki import dispatch
 
-    monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS", 0)
+    # Every threshold, so this holds on both the native and the XLA path.
+    for name in _THRESHOLDS:
+        monkeypatch.setattr(dispatch, name, 0)
     prev = trntensor.get_backend()
     trntensor.set_backend("nki")
     yield
@@ -273,32 +289,46 @@ class TestAoToMoTransformKTiling:
 class TestXlaResidency:
     """Expose Trainium's data-locality architecture at the user level.
 
-    ``to_xla`` / ``from_xla`` let callers pre-pin operands so repeated
-    trntensor calls skip the host↔device transfer that otherwise
-    dominates dispatch overhead.
+    ``to_device`` / ``from_device`` (and the older ``to_xla`` / ``from_xla``)
+    let callers pre-pin operands so repeated trntensor calls skip the
+    host↔device transfer that otherwise dominates dispatch overhead. The
+    device is ``neuron`` on the native TorchNeuron path and ``xla`` on the
+    PyTorch/XLA path.
     """
 
     def test_matmul_stays_on_xla(self, nki_backend):
-        """With operands on XLA, the result is also on XLA — caller
-        decides when to pull back."""
+        """With operands on the device, the result stays on the device —
+        caller decides when to pull back. Path-aware: on TorchNeuron
+        ``to_xla`` places on ``neuron``; on Trn1 it is the XLA device."""
         import trntensor
-        from trntensor.nki import dispatch
 
-        prev = dispatch._MIN_NKI_FLOPS
-        dispatch._MIN_NKI_FLOPS = 0
-        try:
-            torch.manual_seed(0)
-            A = trntensor.to_xla(torch.randn(128, 128))
-            B = trntensor.to_xla(torch.randn(128, 256))
-            out = trntensor.einsum("ij,jk->ik", A, B)
-            assert out.device.type == "xla", f"expected xla, got {out.device}"
+        expected = _device_type()
+        torch.manual_seed(0)
+        A = trntensor.to_xla(torch.randn(128, 128))
+        B = trntensor.to_xla(torch.randn(128, 256))
+        assert A.device.type == expected, f"expected {expected}, got {A.device}"
+        out = trntensor.einsum("ij,jk->ik", A, B)
+        assert out.device.type == expected, f"expected {expected}, got {out.device}"
 
-            # from_xla brings it back; content matches a CPU-only run.
-            out_cpu = trntensor.from_xla(out)
-            ref = trntensor.from_xla(A) @ trntensor.from_xla(B)
-            torch.testing.assert_close(out_cpu, ref, atol=ATOL, rtol=RTOL)
-        finally:
-            dispatch._MIN_NKI_FLOPS = prev
+        # from_xla brings it back; content matches a CPU-only run.
+        out_cpu = trntensor.from_xla(out)
+        assert out_cpu.device.type == "cpu"
+        ref = trntensor.from_xla(A) @ trntensor.from_xla(B)
+        torch.testing.assert_close(out_cpu, ref, atol=ATOL, rtol=RTOL)
+
+    def test_matmul_stays_on_device(self, nki_backend):
+        """Same contract through the path-neutral ``to_device`` / ``from_device``."""
+        import trntensor
+
+        expected = _device_type()
+        torch.manual_seed(0)
+        A = trntensor.to_device(torch.randn(128, 128))
+        B = trntensor.to_device(torch.randn(128, 256))
+        out = trntensor.einsum("ij,jk->ik", A, B)
+        assert out.device.type == expected, f"expected {expected}, got {out.device}"
+        out_cpu = trntensor.from_device(out)
+        ref = trntensor.from_device(A) @ trntensor.from_device(B)
+        torch.testing.assert_close(out_cpu, ref, atol=ATOL, rtol=RTOL)
 
     @pytest.mark.skip(
         reason="NKI compiler emits trn2-only shared-memory instructions when "
@@ -327,7 +357,7 @@ class TestXlaResidency:
         eps_vir_x = trntensor.to_xla(eps_vir)
 
         B_x = trntensor.ao_to_mo_transform(eri_x, C_occ_x, C_vir_x)
-        assert B_x.device.type == "xla"
+        assert B_x.device.type == _device_type()
         E_x = trntensor.mp2_energy(B_x, eps_occ_x, eps_vir_x)
         E = trntensor.from_xla(E_x)
 
@@ -343,33 +373,32 @@ class TestXlaResidency:
         import time
 
         import trntensor
-        from trntensor.nki import dispatch
 
         torch.manual_seed(0)
         A = torch.randn(2048, 2048)
         B = torch.randn(2048, 2048)
         N_ITERS = 5
 
-        prev = dispatch._MIN_NKI_FLOPS
-        dispatch._MIN_NKI_FLOPS = 0
-        try:
-            # Cold path: transfer per iteration.
-            trntensor.einsum("ij,jk->ik", A, B)  # warmup
-            t0 = time.perf_counter()
-            for _ in range(N_ITERS):
-                _ = trntensor.einsum("ij,jk->ik", A, B)
-            t_cold = time.perf_counter() - t0
+        # Cold path: transfer per iteration (thresholds zeroed by nki_backend).
+        trntensor.einsum("ij,jk->ik", A, B)  # warmup
+        t0 = time.perf_counter()
+        for _ in range(N_ITERS):
+            _ = trntensor.einsum("ij,jk->ik", A, B)
+        t_cold = time.perf_counter() - t0
 
-            # Residency: transfer once.
-            A_x = trntensor.to_xla(A)
-            B_x = trntensor.to_xla(B)
-            trntensor.einsum("ij,jk->ik", A_x, B_x)  # warmup
-            t0 = time.perf_counter()
-            for _ in range(N_ITERS):
-                _ = trntensor.einsum("ij,jk->ik", A_x, B_x)
-            t_hot = time.perf_counter() - t0
-        finally:
-            dispatch._MIN_NKI_FLOPS = prev
+        # Residency: transfer once.
+        A_x = trntensor.to_xla(A)
+        B_x = trntensor.to_xla(B)
+        trntensor.einsum("ij,jk->ik", A_x, B_x)  # warmup
+        t0 = time.perf_counter()
+        for _ in range(N_ITERS):
+            _ = trntensor.einsum("ij,jk->ik", A_x, B_x)
+        if A_x.device.type == "neuron":
+            # Native eager launches are asynchronous; wait before stopping the clock.
+            import torch_neuronx
+
+            torch_neuronx.synchronize()
+        t_hot = time.perf_counter() - t0
 
         speedup = t_cold / t_hot
         # Loose bar — profile suggests ~10x. Allow 3x for HW variance.

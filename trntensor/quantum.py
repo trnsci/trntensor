@@ -81,7 +81,16 @@ def _cpu_mp2_energy(
     eps_occ: torch.Tensor,
     eps_vir: torch.Tensor,
 ) -> torch.Tensor:
-    """Reference implementation. Same loop as ``examples/df_mp2_einsum.py``."""
+    """Reference implementation. Same loop as ``examples/df_mp2_einsum.py``.
+
+    The loop indexes scalars (``eps_occ[i]``) nocc² times, which is
+    catastrophically slow on an eager Neuron device. Device-resident
+    operands are copied to the host for the loop and the 0-D result is moved
+    back to ``B``'s device.
+    """
+    if B.device.type == "neuron":
+        e = _cpu_mp2_energy(B.cpu(), eps_occ.cpu(), eps_vir.cpu())
+        return e.to(B.device)
     nocc = B.shape[0]
     e = B.new_zeros(())
     for i in range(nocc):

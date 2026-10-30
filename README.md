@@ -28,7 +28,31 @@ Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1)
 
 ```bash
 pip install trntensor
+
+# Trn2/Trn3 with TorchNeuron (native PyTorch, Neuron SDK 2.33+)
+pip install "trntensor[torchneuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+# Trn1 / PyTorch-XLA lineage
+pip install "trntensor[neuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
 ```
+
+Kernels dispatch on whichever Neuron PyTorch lineage is installed:
+
+- **TorchNeuron (native)**: Trn2/Trn3, Neuron SDK 2.33+, Python ≥ 3.12,
+  `torch` 2.14, `torch-neuronx` 2.14.*. Each kernel is a PyTorch custom op
+  (`torch.ops.trntensor.*`) on the `neuron` device; no `torch_xla`.
+- **PyTorch/XLA**: Trn1 (and any host on the `torch-neuronx` 2.9 lineage).
+  Kernels dispatch through `torch_xla`, unchanged.
+
+trntensor picks the native path when the native `torch_neuronx` and a
+`neuron` device are present, and the XLA path when `torch_xla` is
+installed; otherwise it runs on PyTorch. Set `TRNSCI_NKI_DISPATCH=native`
+or `xla` (shared by all trnsci libraries) to force a path. Pin operands on
+the device with `to_device` / `from_device`; the older `to_xla` /
+`from_xla` still work on both lineages (see the
+[migration note](docs/api/nki.md#migrating-from-to_xla-from_xla)). With an
+editable install (`pip install -e`), set `NKI_ENABLE_TRACE_CACHE=0`: the NKI
+kernel cache only versions installed wheels and can serve stale kernels.
 
 ## Usage
 
@@ -72,7 +96,8 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 - [x] Tucker decomposition (HOSVD)
 - [x] DF-MP2 einsum example
 - [x] NKI fused contraction kernels (`mp2_energy`, `ao_to_mo_transform`)
-- [x] XLA operand residency (`to_xla` / `from_xla`)
+- [x] Device operand residency (`to_device` / `from_device`; `to_xla` / `from_xla` kept)
+- [x] Native TorchNeuron dispatch (Trn2/Trn3, `torch.ops.trntensor.*`) alongside PyTorch/XLA (Trn1)
 - [x] NKI CPU simulator + `nki-simulator` CI gate
 - [x] Optimal contraction ordering — greedy path search for 3+ operands
 - [x] Multi-contraction shared-operand XLA pre-pinning
