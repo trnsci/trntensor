@@ -41,9 +41,9 @@ X = trntensor.einsum("ijk,klm->ijlm", A, B)
 
 ```python
 plan = trntensor.plan_contraction("ij,jk->ik", A, B)
-print(plan.strategy)          # "matmul" | "bmm" | "torch" | "path"
-print(plan.backend)           # "nki" | "pytorch"
-print(plan.estimated_flops)   # multiply-add pairs
+print(plan.strategy)  # "matmul" | "bmm" | "torch" | "path"
+print(plan.backend)  # "nki" | "pytorch"
+print(plan.estimated_flops)  # multiply-add pairs
 print(plan.contraction_path)  # [(i,j), ...] for 3+ operand einsums
 ```
 
@@ -103,14 +103,13 @@ detects it and transfers it to the Trainium device once:
 
 ```python
 # Without multi_einsum: B transferred once per call (N transfers total)
-results = [trntensor.einsum("ap,bp->ab", B[i], B[j])
-           for i in range(nocc) for j in range(nocc)]
+results = [trntensor.einsum("ap,bp->ab", B[i], B[j]) for i in range(nocc) for j in range(nocc)]
 
 # With multi_einsum: shared B[i], B[j] pre-pinned; each appears in only
 # one contraction here, but B itself is the shared operand across a loop:
 results = trntensor.multi_einsum(
-    ("ap,bp->ab", B_i, B_j),   # direct term
-    ("ap,bp->ab", B_j, B_i),   # exchange term — B_i and B_j are reused
+    ("ap,bp->ab", B_i, B_j),  # direct term
+    ("ap,bp->ab", B_j, B_i),  # exchange term — B_i and B_j are reused
 )
 ```
 
@@ -161,7 +160,7 @@ search to choose the contraction order:
 C = trntensor.einsum("ij,jk,kl->il", A, B, C)
 
 plan = trntensor.plan_contraction("ij,jk,kl->il", A, B, C)
-print(plan.strategy)          # "path"
+print(plan.strategy)  # "path"
 print(plan.contraction_path)  # [(0,1),(0,1)] — contract A@B first, then ×C
 ```
 

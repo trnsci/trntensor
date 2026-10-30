@@ -161,8 +161,8 @@ before executing the loop, eliminating redundant host↔device transfers.
 
 ```python
 results = trntensor.multi_einsum(
-    ("ap,bp->ab", B_i, B_j),   # Coulomb term
-    ("ap,bp->ab", B_i, B_k),   # exchange term — B_i pinned once
+    ("ap,bp->ab", B_i, B_j),  # Coulomb term
+    ("ap,bp->ab", B_i, B_k),  # exchange term — B_i pinned once
 )
 ```
 

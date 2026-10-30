@@ -9,20 +9,20 @@ import trntensor
 # 2-index contraction (dispatches to matmul)
 A = torch.randn(32, 64)
 B = torch.randn(48, 64)
-C = trntensor.einsum("ap,bp->ab", A, B)   # (32, 48)
+C = trntensor.einsum("ap,bp->ab", A, B)  # (32, 48)
 
 # Batched (dispatches to bmm)
 Ab = torch.randn(16, 32, 64)
 Bb = torch.randn(16, 48, 64)
-Cb = trntensor.einsum("iap,ibp->iab", Ab, Bb)   # (16, 32, 48)
+Cb = trntensor.einsum("iap,ibp->iab", Ab, Bb)  # (16, 32, 48)
 ```
 
 ## Contraction planning
 
 ```python
 plan = trntensor.plan_contraction("ap,bp->ab", A, B)
-print(plan.dispatch)   # "matmul" | "bmm" | "torch" | "nki"
-print(plan.flops)      # estimated FLOP count
+print(plan.dispatch)  # "matmul" | "bmm" | "torch" | "nki"
+print(plan.flops)  # estimated FLOP count
 
 flops = trntensor.estimate_flops("ap,bp->ab", A, B)
 ```
@@ -43,7 +43,7 @@ reconstructed = trntensor.tucker_reconstruct(core, factors)
 ## Backend selection
 
 ```python
-trntensor.set_backend("auto")     # default
+trntensor.set_backend("auto")  # default
 trntensor.set_backend("pytorch")  # force PyTorch fallback
-trntensor.set_backend("nki")      # force NKI (requires Neuron hardware)
+trntensor.set_backend("nki")  # force NKI (requires Neuron hardware)
 ```

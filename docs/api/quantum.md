@@ -32,7 +32,7 @@ import trntensor
 nocc, nvir, naux = 5, 19, 72
 B = torch.randn(nocc, nvir, naux) * 0.1
 eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
-eps_vir =  torch.sort(torch.rand(nvir))[0] + 0.1
+eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
 
 E = trntensor.mp2_energy(B, eps_occ, eps_vir)
 print(f"E_MP2 = {E.item():.6f}")
