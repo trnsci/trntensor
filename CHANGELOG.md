@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-10-30
+
+Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
+
+Headline performance: native `"auto"` routes to aten on the device, and the planner contraction-order fix takes the DF-MP2 AO→MO transform (`mi,na,mnP->iaP`, nb=256) from 70 to 1.16 ms (#49).
+
 ### Changed
 
 - **Native dispatch thresholds are now measured (#41).** They were measured
