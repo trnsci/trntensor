@@ -103,6 +103,7 @@ class TestNativeDispatch:
             "ao_to_mo_transform",
             "mp2_energy_row",
             "ao_to_mo_trn2",
+            "ao_to_mo_trn2_packed",
         ):
             assert hasattr(torch.ops.trntensor, name)
 
@@ -196,6 +197,55 @@ class TestNativeTrn2Kernels:
         C_vir = torch.randn(nbasis, nvir, generator=g)
         out = dispatch._nki_ao_to_mo_trn2(*_dev(eri, C_occ, C_vir))
         assert out.device.type == "neuron" and out.shape == (nocc, nvir, naux)
+        ref = torch.einsum("na,inP->iaP", C_vir, torch.einsum("mi,mnP->inP", C_occ, eri))
+        torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-4)
+
+    @pytest.mark.parametrize(
+        "nbasis,nocc,nvir,naux",
+        [(128, 8, 120, 128), (200, 20, 180, 300), (256, 32, 224, 768), (256, 32, 200, 512)],
+    )
+    def test_ao_to_mo_trn2_packed_matches_full_kernel(self, nbasis, nocc, nvir, naux):
+        """#54: the packed kernel gathers the same blocks the full kernel loads,
+        so the two agree bit for bit (padding included)."""
+        import trntensor
+        from trntensor.nki import dispatch
+
+        g = torch.Generator().manual_seed(nbasis + naux)
+        eri = torch.randn(nbasis, nbasis, naux, generator=g) * 0.1
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C_occ = torch.randn(nbasis, nocc, generator=g)
+        C_vir = torch.randn(nbasis, nvir, generator=g)
+        co, cv = _dev(C_occ, C_vir)
+        out = dispatch._nki_ao_to_mo_trn2_packed(trntensor.pack_tril(eri).to("neuron"), co, cv)
+        assert out.device.type == "neuron" and out.shape == (nocc, nvir, naux)
+        full = dispatch._nki_ao_to_mo_trn2(eri.to("neuron"), co, cv)
+        assert torch.equal(out.cpu(), full.cpu())
+        ref = torch.einsum("na,inP->iaP", C_vir, torch.einsum("mi,mnP->inP", C_occ, eri))
+        torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-4)
+
+    def test_packed_host_cderi_uploads_and_routes_to_packed_kernel(self, monkeypatch):
+        """PySCF-layout (naux, npair) host integrals with device orbitals:
+        uploaded as is, transposed on the device, packed kernel under auto."""
+        import trntensor
+        from trntensor.nki import dispatch
+
+        calls = []
+        ops = dict(_ops())
+        fn = ops["ao_to_mo_trn2_packed"]
+        ops["ao_to_mo_trn2_packed"] = lambda *a, **k: calls.append(1) or fn(*a, **k)
+        monkeypatch.setattr(dispatch, "_native_ops", ops)
+        prev = trntensor.get_backend()
+        trntensor.set_backend("auto")
+        try:
+            g = torch.Generator().manual_seed(7)
+            eri = torch.randn(256, 256, 512, generator=g) * 0.1
+            eri = 0.5 * (eri + eri.transpose(0, 1))
+            C_occ, C_vir = torch.randn(256, 32, generator=g), torch.randn(256, 224, generator=g)
+            cderi = trntensor.pack_tril(eri).T.contiguous()  # (naux, npair)
+            out = trntensor.ao_to_mo_transform(cderi, *_dev(C_occ, C_vir))
+        finally:
+            trntensor.set_backend(prev)
+        assert calls == [1] and out.device.type == "neuron"
         ref = torch.einsum("na,inP->iaP", C_vir, torch.einsum("mi,mnP->inP", C_occ, eri))
         torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-4)
 

@@ -103,6 +103,19 @@ def ao_to_mo_trn2(eri: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tensor) -
     return _k.ao_to_mo_trn2_kernel(eri, C_occ, C_vir)
 
 
+@nki_op(
+    "trntensor::ao_to_mo_trn2_packed",
+    mutates_args={},
+    fake_fn=lambda eri_v, img, C_occ, C_vir: eri_v.new_empty(
+        (C_occ.shape[1], C_vir.shape[1], img.shape[0] * eri_v.shape[1])
+    ),
+)
+def ao_to_mo_trn2_packed(
+    eri_v: torch.Tensor, img: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tensor
+) -> torch.Tensor:
+    return _k.ao_to_mo_trn2_packed_kernel(eri_v, img, C_occ, C_vir)
+
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "matmul": matmul,
@@ -111,4 +124,5 @@ OPS = {
     "ao_to_mo_transform": ao_to_mo_transform,
     "mp2_energy_row": mp2_energy_row,
     "ao_to_mo_trn2": ao_to_mo_trn2,
+    "ao_to_mo_trn2_packed": ao_to_mo_trn2_packed,
 }

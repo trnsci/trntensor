@@ -132,3 +132,48 @@ class TestAoToMoTransformReference:
 
         with pytest.raises(ValueError, match="C_vir"):
             trntensor.ao_to_mo_transform(eri, C_occ, torch.randn(7, 3))
+
+
+class TestPackedAoToMo:
+    """#54: packed (μ≥ν) three-centre integrals."""
+
+    @staticmethod
+    def _sym(nb, naux, seed=0, dtype=torch.float64):
+        g = torch.Generator().manual_seed(seed)
+        e = torch.randn(nb, nb, naux, generator=g, dtype=dtype)
+        return 0.5 * (e + e.transpose(0, 1))
+
+    def test_pack_tril_is_pyscf_order(self):
+        e = self._sym(7, 3)
+        pk = trntensor.pack_tril(e)
+        assert pk.shape == (28, 3)
+        expected = torch.cat([e[mu, : mu + 1] for mu in range(7)])  # trnblas.parallel.pack_tril
+        assert torch.equal(pk, expected)
+        assert torch.equal(pk[5 * 6 // 2 + 2], e[5, 2])
+
+    def test_unpack_round_trip(self):
+        e = self._sym(9, 4)
+        assert torch.equal(trntensor.unpack_tril(trntensor.pack_tril(e), 9), e)
+        with pytest.raises(ValueError, match="nbasis=8 needs 36"):
+            trntensor.unpack_tril(trntensor.pack_tril(e), 8)
+
+    @pytest.mark.parametrize("layout", ["rows", "pyscf", "pyscf_view"])
+    def test_packed_matches_full(self, layout):
+        nb, naux, nocc = 11, 5, 3
+        e = self._sym(nb, naux)
+        g = torch.Generator().manual_seed(1)
+        C_occ = torch.randn(nb, nocc, generator=g, dtype=torch.float64)
+        C_vir = torch.randn(nb, nb - nocc, generator=g, dtype=torch.float64)
+        pk = trntensor.pack_tril(e)
+        arg = {"rows": pk, "pyscf": pk.T.contiguous(), "pyscf_view": pk.T.contiguous().T}[layout]
+        out = trntensor.ao_to_mo_transform(arg, C_occ, C_vir)
+        assert torch.equal(out, trntensor.ao_to_mo_transform(e, C_occ, C_vir))
+
+    def test_packed_shape_errors(self):
+        C = torch.randn(6, 2)
+        with pytest.raises(ValueError, match="npair = nbasis"):
+            trntensor.ao_to_mo_transform(torch.randn(20, 4), C, C)
+        with pytest.raises(ValueError, match="3D"):
+            trntensor.ao_to_mo_transform(torch.randn(21), C, C)
+        with pytest.raises(ValueError, match="C_occ must have shape"):
+            trntensor.ao_to_mo_transform(torch.randn(6, 6, 4), torch.randn(5, 2), C)
