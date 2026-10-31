@@ -29,6 +29,10 @@ def _r(*shape):
     return np.random.default_rng(0).random(shape, dtype=np.float32)
 
 
+def _u32(*shape):
+    return np.zeros(shape, dtype=np.uint32)
+
+
 # kernel name -> [(case label, () -> (args, kwargs))]
 KERNEL_INPUTS = {
     "matmul_kernel": [
@@ -72,6 +76,23 @@ KERNEL_INPUTS = {
             "nd2_naux384_nvir640",
             lambda: (
                 (_r(384, 640), _r(2, 384, 640), _r(1, 1), _r(1, 2), _r(640, 1), _r(1, 640)),
+                {},
+            ),
+        ),
+    ],
+    "ao_to_mo_trn2_packed_kernel": [
+        # (packed (npair·NPC, TP) rows, (NPC, 128, NKB·NB) uint32 gather indices, C_occ, C_vir)
+        (
+            "nb256_nocc32_nvir256_naux512",
+            lambda: (
+                (_r(32896 * 2, 256), _u32(2, 128, 512), _r(256, 32), _r(256, 256)),
+                {},
+            ),
+        ),
+        (
+            "nb384_nocc48_nvir384_naux1152",
+            lambda: (
+                (_r(73920 * 3, 384), _u32(3, 128, 1152), _r(384, 48), _r(384, 384)),
                 {},
             ),
         ),

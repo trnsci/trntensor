@@ -28,7 +28,7 @@ from .plan import (
     plan_contraction,
     select_precision_for_error,
 )
-from .quantum import ao_to_mo_transform, mp2_energy
+from .quantum import ao_to_mo_transform, mp2_energy, pack_tril, unpack_tril
 
 __all__ = [
     "einsum",
@@ -55,6 +55,8 @@ __all__ = [
     "from_xla",
     "mp2_energy",
     "ao_to_mo_transform",
+    "pack_tril",
+    "unpack_tril",
     "ShardedTensor",
     "scatter",
     "gather",

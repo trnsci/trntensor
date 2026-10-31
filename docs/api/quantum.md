@@ -93,7 +93,10 @@ B[i, a, P] = Σ_{μ, ν} C_occ[μ, i] · C_vir[ν, a] · eri[μ, ν, P]
 
 ### Arguments
 
-- `eri: (nbasis, nbasis, naux) tensor` — density-fitted two-electron integrals in the AO basis
+- `eri` — density-fitted three-centre integrals in the AO basis, one of:
+  - `(nbasis, nbasis, naux)`: the full square;
+  - `(npair, naux)`, `npair = nbasis(nbasis+1)/2`: the packed lower triangle, row `μ(μ+1)/2 + ν` for `ν ≤ μ` (see [Packed integrals](#packed-integrals));
+  - `(naux, npair)`: PySCF's `_cderi`, as is. When `naux == npair` the shape is ambiguous and is read as `(npair, naux)`; pass `cderi.T` then.
 - `C_occ: (nbasis, nocc) tensor` — occupied molecular orbital coefficients
 - `C_vir: (nbasis, nvir) tensor` — virtual molecular orbital coefficients
 
@@ -109,6 +112,52 @@ import trntensor
 B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
 E = trntensor.mp2_energy(B, eps_occ, eps_vir)
 ```
+
+### Packed integrals
+
+Real three-centre integrals are symmetric in μ↔ν, and drivers store only the
+lower triangle (PySCF `_cderi`, `trnblas.parallel.pack_tril`). Pass it packed
+(#54):
+
+```python
+B = trntensor.ao_to_mo_transform(cderi, C_occ_d, C_vir_d)  # cderi: host (naux, npair)
+```
+
+- `trntensor.pack_tril(eri)` and `trntensor.unpack_tril(eri_packed, nbasis)`
+  convert between the layouts (one `index_select` each, exact).
+- **A host `eri` with device `C_occ` is uploaded to `C_occ`'s device**, in the
+  layout given. The result stays on the device.
+- On the native path, `"auto"` sends packed device integrals to
+  `ao_to_mo_trn2_packed_kernel` under the same conditions as the full kernel.
+  Its stage 1 fetches each `(128 μ, NUB ν, TP aux)` block from the packed
+  rows with one batched indirect DMA. The full square never exists in device
+  memory. Its result is bit-identical to the full kernel's.
+- The aten and legacy routes unpack on the tensor's device first.
+
+Why: on Trn2 the host link carries about 13.8 GB/s for the whole chip, so the
+upload of `eri` was DF-MP2's largest stage. Packed, it is half the bytes.
+
+Upload of `eri` alone (Trn2, one logical core; host threads pinned to 2 CPUs):
+
+| nbasis/naux | full | packed | packed, from pinned host memory |
+|---|---|---|---|
+| 384/1152 | 49.2 ms | 25.1 ms | 24.9 ms |
+| 512/1536 | 115.7 ms | 58.5 ms | 58.4 ms |
+
+Pinned host memory and `copy_` into a preallocated device tensor upload no
+faster: H2D already runs at the link rate from ordinary host memory.
+Packing a full host tensor costs more than it saves: 180 ms on 2 host
+threads at 512/1536, against a 57 ms saving. Neither does uploading the
+triangle row by row (281 ms). So a 3-D host `eri` is uploaded as is.
+Packing pays only when the integrals already arrive packed.
+
+Kernel alone, device-resident, warm (fp32; padded `nvir` included):
+
+| nbasis/naux/nocc | LNC=2 full | LNC=2 packed | LNC=1 full | LNC=1 packed | device `unpack_tril` |
+|---|---|---|---|---|---|
+| 256/768/32 | 1.09 ms | 0.91 ms | 1.86 ms | 1.93 ms | — |
+| 384/1152/48 | 5.38 ms | 5.81 ms | 5.72 ms | 5.95 ms | 3.1 ms |
+| 512/1536/64 | 6.28 ms | 6.27 ms | 12.87 ms | 12.75 ms | 5.5 ms |
 
 ### Backend behaviour
 

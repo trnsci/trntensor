@@ -30,6 +30,7 @@ EXPECTED_OPS = {
     "ao_to_mo_transform",
     "mp2_energy_row",
     "ao_to_mo_trn2",
+    "ao_to_mo_trn2_packed",
 }
 
 
@@ -131,6 +132,7 @@ def native_host(monkeypatch):
         "ao_to_mo_transform_kernel",
         "mp2_energy_row_kernel",
         "ao_to_mo_trn2_kernel",
+        "ao_to_mo_trn2_packed_kernel",
     ):
         monkeypatch.setattr(_kernels, kname, no_raw_kernel, raising=False)
     # Force NKI: under "auto" the native path runs the fused quantum
@@ -388,6 +390,52 @@ class TestPublicApiOnNativePath:
             out, torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri), atol=1e-4, rtol=1e-4
         )
         assert [c[0] for c in native_host] == ["ao_to_mo_trn2"]
+
+    @pytest.mark.parametrize("pyscf_layout", [False, True])
+    def test_packed_ao_to_mo_routes_to_packed_op(self, native_host, monkeypatch, pyscf_layout):
+        """A 2-D eri reaches the packed op as (npair·NPC, TP) rows plus gather
+        indices; replaying the kernel's batched gather on CPU rebuilds the
+        padded full square, so the result matches the full transform."""
+        from trntensor.nki._kernels import ao_to_mo_trn2_nub
+
+        def packed_op(eri_v, img, C_occ, C_vir):
+            npc, tp = img.shape[0], eri_v.shape[1]
+            nbp, nub = C_occ.shape[0], ao_to_mo_trn2_nub(tp)
+            assert img.dtype == torch.uint32 and img.shape == (npc, 128, nbp // 128 * nbp)
+            assert nbp % 128 == 0 and C_vir.shape[1] % 128 == 0
+            idx = img.view(torch.int32).long()
+            full = torch.empty(nbp, nbp, npc * tp)
+            for c in range(npc):
+                for k in range(nbp // 128):
+                    for v0 in range(0, nbp, nub):
+                        blk = idx[c, :, k * nbp + v0 : k * nbp + v0 + nub]
+                        rows = eri_v[blk.T.flatten()].reshape(128, nub, tp)
+                        full[k * 128 : (k + 1) * 128, v0 : v0 + nub, c * tp : (c + 1) * tp] = rows
+            return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, full)
+
+        _install_ops(monkeypatch, native_host, ao_to_mo_trn2_packed=packed_op)
+        torch.manual_seed(0)
+        eri = torch.randn(40, 40, 6)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C_occ, C_vir = torch.randn(40, 5), torch.randn(40, 9)
+        pk = trntensor.pack_tril(eri)
+        out = trntensor.ao_to_mo_transform(pk.T.contiguous() if pyscf_layout else pk, C_occ, C_vir)
+        assert out.shape == (5, 9, 6)
+        torch.testing.assert_close(
+            out, torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri), atol=1e-4, rtol=1e-4
+        )
+        assert [c[0] for c in native_host] == ["ao_to_mo_trn2_packed"]
+
+    def test_packed_ao_to_mo_aten_route_unpacks(self, native_host, monkeypatch):
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "aten")
+        _install_ops(monkeypatch, native_host)  # any kernel launch would KeyError
+        torch.manual_seed(0)
+        eri = torch.randn(12, 12, 5)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C_occ, C_vir = torch.randn(12, 3), torch.randn(12, 9)
+        out = trntensor.ao_to_mo_transform(trntensor.pack_tril(eri), C_occ, C_vir)
+        torch.testing.assert_close(out, trntensor.ao_to_mo_transform(eri, C_occ, C_vir))
+        assert native_host == []
 
     def test_ao_to_mo_transform_legacy_routes_and_slices(self, native_host, monkeypatch):
         monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
@@ -742,6 +790,41 @@ class TestNativeKernelRetirement:
         monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
         assert dispatch._ao_to_mo_route(small, 16, 112) == "legacy"
 
+    def test_ao_to_mo_route_packed(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        npair = 256 * 257 // 2
+        large = torch.empty(npair, 512, device="meta")
+        assert dispatch._ao_to_mo_route(large, 32, 224, 256) == "trn2"
+        assert dispatch._ao_to_mo_route(torch.empty(npair, 512), 32, 224, 256) == "aten"
+        small = torch.empty(128 * 129 // 2, 256, device="meta")
+        assert dispatch._ao_to_mo_route(small, 16, 112, 128) == "aten"
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._ao_to_mo_route(small, 16, 112, 128) == "trn2"
+        # The gather-index chunk counts against SBUF.
+        full_b = dispatch._ao_to_mo_trn2_sbuf_bytes(1024, 32, 1000, 512, 4)
+        pk_b = dispatch._ao_to_mo_trn2_sbuf_bytes(1024, 32, 1000, 512, 4, packed=True)
+        assert pk_b - full_b == 4 * 8 * 1024
+
+    @pytest.mark.parametrize("nbasis,nbp,naux,tp", [(256, 256, 768, 384), (200, 256, 512, 256)])
+    def test_tril_gather_images_address_the_packed_rows(self, nbasis, nbp, naux, tp):
+        from trntensor.nki._kernels import ao_to_mo_trn2_nub
+
+        img = dispatch._tril_gather_images(nbasis, nbp, naux, tp).view(torch.int32).long()
+        npc, nub = naux // tp, ao_to_mo_trn2_nub(tp)
+        rows = dispatch._tril_rows(nbasis)
+        for c in (0, npc - 1):
+            for k in range(nbp // 128):
+                for v0 in (0, nbp - nub):
+                    got = img[c, :, k * nbp + v0 : k * nbp + v0 + nub].T.flatten()
+                    got = got.reshape(128, nub)  # [p, u] after the row-major write
+                    mu = torch.arange(k * 128, (k + 1) * 128)[:, None].expand(128, nub)
+                    nu = torch.arange(v0, v0 + nub)[None, :].expand(128, nub)
+                    ok = (mu < nbasis) & (nu < nbasis)
+                    want = rows[mu.clamp(max=nbasis - 1), nu.clamp(max=nbasis - 1)] * npc + c
+                    assert torch.equal(got[ok], want[ok])
+                    assert torch.equal(got[~ok], torch.full_like(got[~ok], c))
+
     @pytest.mark.parametrize("nocc", [1, 2, 5, 6, 7])
     def test_mp2_row_walk_matches_reference(self, nocc):
         from trntensor.quantum import _cpu_mp2_energy
@@ -944,3 +1027,7 @@ class TestLazyRegistration:
         assert mp2.shape == (5, 5) and mp2.dtype == torch.float32
         b = fake("ao_to_mo_transform")(m(256, 256, 4), m(256, 16), m(256, 512))
         assert b.shape == (16, 512, 4)
+        bp = fake("ao_to_mo_trn2_packed")(
+            m(32896 * 3, 256), m(3, 128, 512, dtype=torch.int32), m(256, 16), m(256, 512)
+        )
+        assert bp.shape == (16, 512, 768)

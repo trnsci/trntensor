@@ -25,7 +25,14 @@ import warnings
 import numpy as np
 import torch
 
-from ._kernels import HAS_NKI, TILE_K, TILE_M, TILE_N
+from ._kernels import (
+    HAS_NKI,
+    TILE_K,
+    TILE_M,
+    TILE_N,
+    ao_to_mo_trn2_nub,
+    ao_to_mo_trn2_tiling,
+)
 
 if HAS_NKI:
     import nki  # re-imported here so `nki.simulate` is reachable from dispatch
@@ -1132,20 +1139,18 @@ _AO_TO_MO_SBUF_BUDGET = 144 * 1024
 _AO_TO_MO_MIN_MACS = 5.0e8
 
 
-def _ao_to_mo_trn2_sbuf_bytes(nbasis: int, nocc: int, nvir: int, naux: int, itemsize: int) -> int:
+def _ao_to_mo_trn2_sbuf_bytes(
+    nbasis: int, nocc: int, nvir: int, naux: int, itemsize: int, packed: bool = False
+) -> int:
     nkb = _round_up(nbasis, TILE_K) // TILE_K
-    nxp = _round_up(naux, TILE_K)
-    tp = 128
-    for cand in (512, 256):
-        if nxp % (2 * cand) == 0:
-            tp = cand
-            break
-    nub = max(1, min(8, 2048 // tp))
+    tp, nub = ao_to_mo_trn2_tiling(_round_up(naux, TILE_K), packed)
     cols = nkb * (nocc + _round_up(nvir, TILE_M) + nub * tp + tp) + nub * tp
-    return itemsize * cols
+    # The packed kernel also keeps one chunk's gather indices (uint32).
+    idx = 4 * nkb * nkb * TILE_K if packed else 0
+    return itemsize * cols + idx
 
 
-def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
+def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int, nbasis: int | None = None) -> str:
     """'trn2', 'legacy' or 'aten' for :func:`trntensor.quantum.ao_to_mo_transform`.
 
     XLA path / simulator: 'legacy' whenever NKI is in use (unchanged).
@@ -1154,6 +1159,10 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
     ``_AO_TO_MO_MIN_MACS``, else aten; ``set_backend("nki")`` drops the size
     and residency conditions. Host ``eri``
     under ``"auto"`` stays on aten on the host.
+
+    A 2-D ``eri`` is the packed lower triangle ``(npair, naux)`` of an
+    ``nbasis`` basis (#54); then 'trn2' means ``ao_to_mo_trn2_packed_kernel``
+    and 'legacy' is not offered (the caller unpacks for it).
     """
     if not (_use_nki() and HAS_NKI):
         return "aten"
@@ -1164,9 +1173,12 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
         raise ValueError(f"TRNTENSOR_AO_TO_MO must be one of {_AO_TO_MO_CHOICES}; got {choice!r}")
     if choice != "auto":
         return choice
+    packed = eri.dim() == 2
+    nb = (nbasis if packed else eri.shape[0]) or 0
+    naux = eri.shape[-1]
     fits = (
         nocc <= 128
-        and _ao_to_mo_trn2_sbuf_bytes(eri.shape[0], nocc, nvir, eri.shape[2], eri.element_size())
+        and _ao_to_mo_trn2_sbuf_bytes(nb, nocc, nvir, naux, eri.element_size(), packed)
         <= _AO_TO_MO_SBUF_BUDGET
     )
     if not fits:
@@ -1175,7 +1187,7 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
         return "trn2"
     if ("ao2mo", tuple(eri.shape), nocc, nvir) in _native_kernel_failed:
         return "aten"
-    big = nocc * eri.shape[0] ** 2 * eri.shape[2] >= _AO_TO_MO_MIN_MACS
+    big = nocc * nb**2 * naux >= _AO_TO_MO_MIN_MACS
     return "trn2" if big and eri.device.type == _NEURON_DEVICE else "aten"
 
 
@@ -1208,6 +1220,107 @@ def _nki_ao_to_mo_trn2(
         cv[:nbasis, :nvir] = C_vir
         C_vir = cv
     out = _launch(None, "ao_to_mo_trn2", eri.contiguous(), C_occ.contiguous(), C_vir.contiguous())
+    return out[:, :nvir, :naux] if (nvp, nxp) != (nvir, naux) else out
+
+
+def _tril_rows(nbasis: int) -> torch.Tensor:
+    """``(nbasis, nbasis)`` int64: packed row ``max(μ,ν)(max+1)/2 + min`` of ``(μ, ν)``."""
+    r = torch.arange(nbasis, dtype=torch.int64)
+    hi = torch.maximum(r[:, None], r[None, :])
+    lo = torch.minimum(r[:, None], r[None, :])
+    return hi * (hi + 1) // 2 + lo
+
+
+def _tril_gather_images(nbasis: int, nbp: int, naux: int, tp: int, device=None) -> torch.Tensor:
+    """Gather indices for ``ao_to_mo_trn2_packed_kernel``: ``(NPC, 128, NKB·nbp)`` uint32.
+
+    The kernel views the packed ``(npair, naux)`` tensor as ``(npair·NPC,
+    tp)`` rows, so aux chunk ``c`` of pair ``r`` is row ``NPC·r + c``. One
+    batched indirect DMA fills the SBUF block ``e[p, u, :] = eri[k·128 + p,
+    v0 + u, chunk c]`` (``p < 128``, ``u < NUB``) from a ``(128, NUB)``
+    index block that the DMA reads column-major and writes row-major: the
+    ``j``-th row (``j = m·128 + q`` for index ``[q, m]``) lands at ``p = j //
+    NUB``, ``u = j % NUB``. Block ``(k, v0)`` sits at columns ``k·nbp + v0``.
+
+    Rows/columns past ``nbasis`` (padding) read pair 0; the zero padding of
+    ``C_occ``/``C_vir`` cancels them. Cached per shape and ``device``
+    (``4·NPC·nbp²`` bytes, so repeat calls skip the upload).
+    """
+    key = (nbasis, nbp, naux, tp, str(device))
+    hit = _gather_image_cache.get(key)
+    if hit is not None:
+        return hit
+    npc = naux // tp
+    nub = ao_to_mo_trn2_nub(tp)
+    nkb = nbp // TILE_K
+    rows = torch.zeros(nbp, nbp, dtype=torch.int64)
+    rows[:nbasis, :nbasis] = _tril_rows(nbasis)
+    q = torch.arange(TILE_K)[:, None]
+    m = torch.arange(nub)[None, :]
+    j = m * TILE_K + q  # (128, NUB)
+    dp, du = j // nub, j % nub
+    k = torch.arange(nkb)[:, None, None, None]
+    v0 = (torch.arange(nbp // nub) * nub)[None, :, None, None]
+    mu = k * TILE_K + dp[None, None]  # (NKB, NB/NUB, 128, NUB)
+    nu = v0 + du[None, None]
+    base = rows[mu, nu].permute(2, 0, 1, 3).reshape(TILE_K, nkb * nbp)
+    img = base[None] * npc + torch.arange(npc)[:, None, None]
+    if int(img.max()) >= 2**31:
+        raise ValueError("packed eri too large for 32-bit gather indices")
+    hit = img.to(torch.int32).view(torch.uint32).contiguous()
+    if device is not None:
+        hit = hit.to(device)
+    _gather_image_cache[key] = hit
+    return hit
+
+
+_gather_image_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _packed_tp(naux: int) -> int:
+    return ao_to_mo_trn2_tiling(naux, packed=True)[0]
+
+
+def _nki_ao_to_mo_trn2_packed(
+    eri_p: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch ``ao_to_mo_trn2_packed_kernel`` on packed ``(npair, naux)`` integrals (#54).
+
+    Pads naux to a 128 multiple (a copy of the packed tensor, half the size
+    of the full one) and nbasis/nvir through ``C_occ``/``C_vir`` and the
+    gather indices; slices the result back to ``(nocc, nvir, naux)``.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    npair, naux = eri_p.shape
+    nbasis, nocc = C_occ.shape
+    nvir = C_vir.shape[1]
+    nbp, nvp, nxp = _round_up(nbasis, TILE_K), _round_up(nvir, TILE_M), _round_up(naux, TILE_K)
+    if nxp != naux:
+        ep = torch.zeros(npair, nxp, dtype=eri_p.dtype, device=eri_p.device)
+        ep[:, :naux] = eri_p
+        eri_p = ep
+    if nbp != nbasis:
+        co = torch.zeros(nbp, nocc, dtype=C_occ.dtype, device=C_occ.device)
+        co[:nbasis] = C_occ
+        C_occ = co
+    if (nbp, nvp) != (nbasis, nvir):
+        cv = torch.zeros(nbp, nvp, dtype=C_vir.dtype, device=C_vir.device)
+        cv[:nbasis, :nvir] = C_vir
+        C_vir = cv
+    tp = _packed_tp(nxp)
+    dev = eri_p.device if eri_p.device.type == _NEURON_DEVICE else None
+    img = _tril_gather_images(nbasis, nbp, nxp, tp, dev)
+    out = _launch(
+        None,
+        "ao_to_mo_trn2_packed",
+        eri_p.contiguous().view(npair * (nxp // tp), tp),
+        img,
+        C_occ.contiguous(),
+        C_vir.contiguous(),
+    )
     return out[:, :nvir, :naux] if (nvp, nxp) != (nvir, naux) else out
 
 

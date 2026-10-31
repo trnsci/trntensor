@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Packed (μ≥ν) three-centre integrals in `ao_to_mo_transform` (#54).**
+  - A 2-D `eri` is read as the packed lower triangle: `(npair, naux)` (row `μ(μ+1)/2 + ν`, the `trnblas.parallel.pack_tril` layout), or PySCF's `_cderi` `(naux, npair)` as is. 3-D calls are unchanged.
+  - New `trntensor.pack_tril` / `trntensor.unpack_tril`.
+  - A host `eri` with device `C_occ` is now uploaded to that device; this used to fail on mixed devices.
+  - New native kernel `ao_to_mo_trn2_packed_kernel`. It gathers its stage-1 blocks from the packed rows with batched indirect DMA, so the full square is never written to device memory. Bit-identical to `ao_to_mo_trn2_kernel`, and as fast at LNC=1 and LNC=2.
+  - DF-MP2 end to end on Trn2 (umbrella `df_mp2_profile.py`, one LNC=2 core): 342 → 281 ms at ao/aux/occ 512/1536/64, 157 → 135 ms at 384/1152/48, with identical energies. The upload of `eri` halves (119 → 62 ms).
+  - Pinned host memory does not speed up the upload (measured), so there is no pinned staging path.
+
 ## [0.19.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

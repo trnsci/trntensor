@@ -30,6 +30,40 @@ TILE_K = 128
 TILE_N = 512
 
 
+def ao_to_mo_trn2_tiling(naux: int, packed: bool = False) -> tuple[int, int]:
+    """``(TP, NUB)`` for the Trn2 AO→MO kernels: aux chunk width and ν per block.
+
+    ``TP`` is the widest aux chunk (≤ 512, one PSUM bank) that still gives
+    an even chunk count, so both programs get work at LNC=2; else 128. The
+    packed kernel gathers ``TP``-wide rows, so when no even split exists it
+    takes the widest divisor of ``naux`` instead (wider rows, fewer DMA
+    descriptors; it then runs as one program, like the full kernel).
+    ``NUB`` (a power of two, so it divides 128) keeps a stage-1 block at
+    ``NUB·TP ≤ 2048`` elements per partition per μ-tile.
+    """
+    tp = 128
+    for cand in (512, 256):
+        if naux % (2 * cand) == 0:
+            tp = cand
+            break
+    else:
+        if packed:
+            for cand in (512, 384, 256):
+                if naux % cand == 0:
+                    tp = cand
+                    break
+    return tp, ao_to_mo_trn2_nub(tp)
+
+
+def ao_to_mo_trn2_nub(tp: int) -> int:
+    """ν per stage-1 block for aux chunk ``tp``: the largest power of two
+    ≤ 8 with ``NUB·tp ≤ 2048``."""
+    nub = 1
+    while nub * 2 * tp <= 2048 and nub < 8:
+        nub *= 2
+    return nub
+
+
 if HAS_NKI:
 
     @nki.jit
@@ -488,41 +522,23 @@ if HAS_NKI:
         nl.store(e_partial[0:TILE, pid * NJ : pid * NJ + NJ], value=acc_j)
         return e_partial
 
-    @nki.jit
-    def ao_to_mo_trn2_kernel(eri, C_occ, C_vir):
-        """``B[i, a, P] = Σ_{μ,ν} C_occ[μ,i] C_vir[ν,a] eri[μ,ν,P]`` (native, Trn2).
+    def _ao_to_mo_trn2_body(eri, img, C_occ, C_vir, NB, NAUX, TP, NUB):
+        """Shared body of the full and packed Trn2 AO→MO kernels.
 
-        Two plain GEMM stages per auxiliary chunk of ``TP`` columns:
-
-        1. ``X[i, ν, Pc] = Σ_μ C_occ[μ, i] · eri[μ, ν, Pc]``: stationary
-           ``C_occ`` μ-tile (resident in SBUF), moving ``eri[μ-tile, ν, Pc]``.
-           X goes to kernel-scratch HBM, i-major.
-        2. ``B[i, a, Pc] = Σ_ν C_vir[ν, a] · X[i, ν, Pc]``: stationary ``C_vir``
-           tile (resident), moving ``X[i, ν-tile, Pc]`` (ν on partitions).
-
-        Every load has the contraction index on the partition axis, so there
-        are no DMA transposes. The aux chunks are split across the programs
-        of the logical core (both physical cores at LNC=2); each program
-        reads back only the X it wrote.
-
-        NBASIS, NVIR multiples of 128; NOCC ≤ 128; NAUX a multiple of 128.
+        ``img`` is None for the full ``(NB, NB, NAUX)`` ``eri``. Otherwise
+        ``eri`` is the packed lower triangle viewed as ``(npair·NPC, TP)``
+        rows (row ``NPC·pair + c`` = aux chunk ``c`` of packed row ``pair``)
+        and ``img`` the ``(NPC, 128, NKB·NB)`` uint32 gather indices; stage 1
+        then gathers each ``(128, NUB, TP)`` block straight from the packed
+        tensor with one batched indirect DMA, so the full square never
+        exists in HBM.
         """
-        NB, _, NAUX = eri.shape
         _, NOCC = C_occ.shape
         _, NVIR = C_vir.shape
         TILE = 128
-        # Widest aux chunk (≤ 512, one PSUM bank) that still gives an even
-        # chunk count, so both programs get work at LNC=2.
-        TP = 128
-        for tp in (512, 256):
-            if NAUX % (2 * tp) == 0:
-                TP = tp
-                break
         NPC = NAUX // TP
         NKB = NB // TILE
         NAV = NVIR // TILE
-        # ν per stage-1 DMA: NUB * TP * 4 bytes per partition per μ-tile.
-        NUB = max(1, min(8, 2048 // TP))
         n_prog, pid, _axis = _programs(NPC)
         NPC_per = NPC // n_prog
 
@@ -540,16 +556,33 @@ if HAS_NKI:
             )
 
         for pc in nl.affine_range(NPC_per):
-            p_off = (pid * NPC_per + pc) * TP
+            c = pid * NPC_per + pc
+            p_off = c * TP
+            if img is not None:
+                # This chunk's gather indices: NKB·NB·4 bytes per partition.
+                idx_sb = nl.ndarray((TILE, NKB * NB), dtype=nl.uint32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=idx_sb, src=img[c])
             # Stage 1: X[:, ν, Pc] for every ν, NUB ν per DMA (one
             # (128, NUB, TP) eri block per μ-tile instead of NUB small loads).
             for vb in nl.affine_range(NB // NUB):
                 v0 = vb * NUB
                 e_blk = nl.ndarray((TILE, NKB, NUB, TP), dtype=eri.dtype, buffer=nl.sbuf)
                 for k in nl.affine_range(NKB):
-                    e_blk[0:TILE, k, 0:NUB, 0:TP] = nl.load(
-                        eri[k * TILE : (k + 1) * TILE, v0 : v0 + NUB, p_off : p_off + TP]
-                    )
+                    if img is None:
+                        e_blk[0:TILE, k, 0:NUB, 0:TP] = nl.load(
+                            eri[k * TILE : (k + 1) * TILE, v0 : v0 + NUB, p_off : p_off + TP]
+                        )
+                    else:
+                        # DMA batching: a (128, NUB) index block, read
+                        # column-major, fills e_blk[:, k] row-major.
+                        nisa.dma_copy(
+                            dst=e_blk[0:TILE, k, 0:NUB, 0:TP],
+                            src=eri.ap(
+                                pattern=[[TP, TILE * NUB], [1, TP]],
+                                vector_offset=idx_sb[0:TILE, k * NB + v0 : k * NB + v0 + NUB],
+                                indirect_dim=0,
+                            ),
+                        )
                 x_sb = nl.ndarray((NOCC, NUB, TP), dtype=eri.dtype, buffer=nl.sbuf)
                 for u in nl.affine_range(NUB):
                     px = nl.zeros((NOCC, TP), dtype=nl.float32, buffer=nl.psum)
@@ -584,3 +617,52 @@ if HAS_NKI:
                     nisa.tensor_copy(src=pb, dst=b_sb)
                     nl.store(B_out[i, av * TILE : (av + 1) * TILE, p_off : p_off + TP], value=b_sb)
         return B_out
+
+    @nki.jit
+    def ao_to_mo_trn2_kernel(eri, C_occ, C_vir):
+        """``B[i, a, P] = Σ_{μ,ν} C_occ[μ,i] C_vir[ν,a] eri[μ,ν,P]`` (native, Trn2).
+
+        Two plain GEMM stages per auxiliary chunk of ``TP`` columns:
+
+        1. ``X[i, ν, Pc] = Σ_μ C_occ[μ, i] · eri[μ, ν, Pc]``: stationary
+           ``C_occ`` μ-tile (resident in SBUF), moving ``eri[μ-tile, ν, Pc]``.
+           X goes to kernel-scratch HBM, i-major.
+        2. ``B[i, a, Pc] = Σ_ν C_vir[ν, a] · X[i, ν, Pc]``: stationary ``C_vir``
+           tile (resident), moving ``X[i, ν-tile, Pc]`` (ν on partitions).
+
+        Every load has the contraction index on the partition axis, so there
+        are no DMA transposes. The aux chunks are split across the programs
+        of the logical core (both physical cores at LNC=2); each program
+        reads back only the X it wrote.
+
+        NBASIS, NVIR multiples of 128; NOCC ≤ 128; NAUX a multiple of 128.
+        """
+        NB, _, NAUX = eri.shape
+        TP, NUB = ao_to_mo_trn2_tiling(NAUX)
+        return _ao_to_mo_trn2_body(eri, None, C_occ, C_vir, NB, NAUX, TP, NUB)
+
+    @nki.jit
+    def ao_to_mo_trn2_packed_kernel(eri_v, img, C_occ, C_vir):
+        """:func:`ao_to_mo_trn2_kernel` reading packed μ≥ν integrals in place (#54).
+
+        ``eri_v``: the packed lower triangle ``(npair, NAUX)`` (row
+        ``μ(μ+1)/2 + ν`` for ``ν ≤ μ``, PySCF ``lib.pack_tril`` order;
+        ``_cderi`` is its transpose), viewed as ``(npair·NPC, TP)`` so each
+        aux chunk of a pair is one contiguous row.
+        ``img``: ``(NPC, 128, NKB·NB)`` uint32 gather indices built by
+        ``dispatch._tril_gather_images``: for chunk ``c``, μ-tile ``k`` and
+        ν block ``v0``, the ``(128, NUB)`` block at columns ``k·NB + v0``
+        holds, column-major, the rows of ``eri[k·128 + p, v0 + u, chunk c]``
+        in ``(p, u)`` row-major order.
+
+        Stage 1 fetches each ``(128, NUB, TP)`` block with one batched
+        indirect DMA (vs ``NUB`` strided loads in the full kernel); stage 2
+        is unchanged. The full square is never written. Same constraints as
+        the full kernel; ``TP``/``NUB`` from ``ao_to_mo_trn2_tiling(...,
+        packed=True)``.
+        """
+        NB = C_occ.shape[0]
+        NPC = img.shape[0]
+        TP = eri_v.shape[1]
+        NUB = ao_to_mo_trn2_nub(TP)
+        return _ao_to_mo_trn2_body(eri_v, img, C_occ, C_vir, NB, NPC * TP, TP, NUB)

@@ -119,7 +119,7 @@ supported in maintenance mode."
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. Emit the one-time XLA-path and `to_xla` / `from_xla` deprecation warnings. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting (not trntensor's). Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. Set it with `pip install -e`; the test suite sets it by default. |
 | `TRNTENSOR_MP2_ENERGY=auto\|rows\|aten\|legacy` | Native path: force the `mp2_energy` executor (`rows` = the Trn2 row kernel, `legacy` = the original kernel, deprecated there). |
-| `TRNTENSOR_AO_TO_MO=auto\|trn2\|aten\|legacy` | Native path: force the `ao_to_mo_transform` executor (`trn2` = the Trn2 kernel, `legacy` = the original kernel, deprecated there). |
+| `TRNTENSOR_AO_TO_MO=auto\|trn2\|aten\|legacy` | Native path: force the `ao_to_mo_transform` executor (`trn2` = the Trn2 kernel, or `ao_to_mo_trn2_packed_kernel` for a packed 2-D `eri`; `legacy` = the original kernel, deprecated there; `aten` and `legacy` unpack a packed `eri` first). |
 | `TRNTENSOR_FORCE_BACKEND=pytorch\|nki\|auto` | Override the backend selection at runtime without calling `set_backend()`. Used by benchmarks to sweep both paths on the same machine. |
 | `TRNTENSOR_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU instead of XLA → NEFF → hardware. Catches Python-trace-level errors without AWS round-trips. MLIR verifier errors remain hardware-only. |
 

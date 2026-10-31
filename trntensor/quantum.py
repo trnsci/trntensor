@@ -131,6 +131,50 @@ def _cpu_mp2_energy(
     return e
 
 
+def pack_tril(eri: torch.Tensor) -> torch.Tensor:
+    """``(nbasis, nbasis, naux)`` μ↔ν-symmetric integrals → packed ``(npair, naux)``.
+
+    Row ``μ(μ+1)/2 + ν`` holds ``eri[μ, ν]`` for ``ν ≤ μ``, with ``npair =
+    nbasis(nbasis+1)/2``: PySCF's ``lib.pack_tril`` order (its ``_cderi``,
+    ``(naux, npair)``, is the transpose) and ``trnblas.parallel.pack_tril``'s
+    layout. Only the lower triangle is read; the input is assumed symmetric.
+    """
+    if eri.dim() != 3 or eri.shape[0] != eri.shape[1]:
+        raise ValueError(f"eri must be (nbasis, nbasis, naux); got shape {tuple(eri.shape)}")
+    n = eri.shape[0]
+    r = torch.tril_indices(n, n)
+    return eri.reshape(n * n, eri.shape[2]).index_select(0, (r[0] * n + r[1]).to(eri.device))
+
+
+def unpack_tril(eri_packed: torch.Tensor, nbasis: int) -> torch.Tensor:
+    """Inverse of :func:`pack_tril`: packed ``(npair, naux)`` → full ``(nbasis, nbasis, naux)``.
+
+    One ``index_select`` on the packed tensor's device (exact).
+    """
+    npair, naux = eri_packed.shape
+    if npair != nbasis * (nbasis + 1) // 2:
+        raise ValueError(
+            f"packed eri has {npair} rows; nbasis={nbasis} needs {nbasis * (nbasis + 1) // 2}"
+        )
+    from .nki.dispatch import _tril_rows
+
+    idx = _tril_rows(nbasis).reshape(-1).to(eri_packed.device)
+    return eri_packed.index_select(0, idx).reshape(nbasis, nbasis, naux)
+
+
+def _as_packed_rows(eri: torch.Tensor, nbasis: int) -> torch.Tensor:
+    """A 2-D ``eri`` as ``(npair, naux)``: accepts that, or PySCF's ``(naux, npair)``."""
+    npair = nbasis * (nbasis + 1) // 2
+    if eri.shape[0] == npair:
+        return eri
+    if eri.shape[1] == npair:
+        return eri.T
+    raise ValueError(
+        f"eri must be 3D (nbasis, nbasis, naux), or packed 2D (npair, naux) / (naux, npair) "
+        f"with npair = nbasis(nbasis+1)/2 = {npair} for nbasis={nbasis}; got {tuple(eri.shape)}"
+    )
+
+
 def ao_to_mo_transform(
     eri: torch.Tensor,
     C_occ: torch.Tensor,
@@ -158,14 +202,35 @@ def ao_to_mo_transform(
 
     Without NKI the fallback is the same two-step contraction.
 
+    **Packed integrals (#54).** Real three-centre integrals are symmetric in
+    μ↔ν, and drivers store only the lower triangle. A 2-D ``eri`` is taken
+    as that packed form: ``(npair, naux)`` with row ``μ(μ+1)/2 + ν`` for
+    ``ν ≤ μ`` and ``npair = nbasis(nbasis+1)/2`` (:func:`pack_tril`;
+    ``trnblas.parallel.pack_tril``), or PySCF's ``_cderi`` ``(naux, npair)``
+    as is (one transpose copy on the tensor's device; pass ``cderi.T`` when
+    ``naux == npair``). On the native path the packed tensor feeds
+    ``ao_to_mo_trn2_packed_kernel``, which gathers its rows in place: the
+    full square never exists in device memory, and only half the bytes
+    cross the host link. The aten and legacy routes unpack it with one
+    ``index_select`` (exact).
+
+    **Host integrals, device orbitals.** When ``eri`` is on the host and
+    ``C_occ`` on a Neuron device, ``eri`` is uploaded to that device first
+    (the result stays there). Send it packed: the upload runs at the host
+    link's ~14 GB/s whatever the host buffer (pinned memory measured no
+    faster), so halving the bytes is what moves it. Packing a full host
+    tensor here would cost more host time than it saves, so a 3-D ``eri``
+    is uploaded as is.
+
     Composes with :func:`mp2_energy`: ``B = ao_to_mo_transform(eri, C_occ,
     C_vir)`` then ``E = mp2_energy(B, eps_occ, eps_vir)`` is the full
     DF-MP2 pipeline from AO integrals to correlation energy.
 
     Parameters
     ----------
-    eri : (nbasis, nbasis, naux) tensor
-        Density-fitted two-electron integrals in the AO basis.
+    eri : (nbasis, nbasis, naux), (npair, naux) or (naux, npair) tensor
+        Density-fitted three-centre integrals in the AO basis, full or
+        packed lower triangle.
     C_occ : (nbasis, nocc) tensor
         Occupied molecular orbital coefficients.
     C_vir : (nbasis, nvir) tensor
@@ -176,22 +241,44 @@ def ao_to_mo_transform(
     (nocc, nvir, naux) tensor
         The transformed DF coefficients ``B_ia^P``.
     """
-    if eri.dim() != 3:
-        raise ValueError(f"eri must be 3D (nbasis, nbasis, naux); got shape {tuple(eri.shape)}")
-    nbasis_mu, nbasis_nu, _naux = eri.shape
-    if nbasis_mu != nbasis_nu:
+    if C_occ.dim() != 2 or C_vir.dim() != 2:
         raise ValueError(
-            f"eri first two dims must match (nbasis, nbasis); got ({nbasis_mu}, {nbasis_nu})"
+            f"C_occ and C_vir must be 2D; got {tuple(C_occ.shape)} and {tuple(C_vir.shape)}"
         )
-    nbasis = nbasis_mu
-    if C_occ.dim() != 2 or C_occ.shape[0] != nbasis:
+    nbasis = C_occ.shape[0]
+    if eri.dim() == 2:
+        eri = _as_packed_rows(eri, nbasis)
+    elif eri.dim() == 3:
+        nbasis_mu, nbasis_nu, _naux = eri.shape
+        if nbasis_mu != nbasis_nu:
+            raise ValueError(
+                f"eri first two dims must match (nbasis, nbasis); got ({nbasis_mu}, {nbasis_nu})"
+            )
+        nbasis = nbasis_mu
+    else:
+        raise ValueError(
+            "eri must be 3D (nbasis, nbasis, naux) or packed 2D (npair, naux); "
+            f"got shape {tuple(eri.shape)}"
+        )
+    if C_occ.shape[0] != nbasis:
         raise ValueError(f"C_occ must have shape ({nbasis}, nocc); got {tuple(C_occ.shape)}")
-    if C_vir.dim() != 2 or C_vir.shape[0] != nbasis:
+    if C_vir.shape[0] != nbasis:
         raise ValueError(f"C_vir must have shape ({nbasis}, nvir); got {tuple(C_vir.shape)}")
     _, nocc = C_occ.shape
     _, nvir = C_vir.shape
+    packed = eri.dim() == 2
+    if eri.device.type == "cpu" and C_occ.device.type != "cpu":
+        # Upload in the caller's layout: PySCF's (naux, npair) goes up as is
+        # (a host-side transpose would cost more than the upload saves).
+        if packed and not eri.is_contiguous() and eri.T.is_contiguous():
+            eri = eri.T.to(C_occ.device).T
+        else:
+            eri = eri.contiguous().to(C_occ.device)
 
-    route = _ao_to_mo_route(eri, nocc, nvir)
+    route = _ao_to_mo_route(eri, nocc, nvir, nbasis)
+    if packed and route != "trn2":
+        # aten / legacy consume the full square.
+        return ao_to_mo_transform(unpack_tril(eri, nbasis), C_occ, C_vir)
     if route != "aten":
         from .nki import dispatch as _d
 
@@ -205,6 +292,8 @@ def ao_to_mo_transform(
             )
         try:
             if route == "trn2":
+                if packed:
+                    return _d._nki_ao_to_mo_trn2_packed(eri, C_occ, C_vir)
                 return _d._nki_ao_to_mo_trn2(eri, C_occ, C_vir)
             if _d._on_native_path():
                 _d._warn_native_kernel_deprecated(
@@ -219,6 +308,8 @@ def ao_to_mo_transform(
                 raise
             if route == "trn2":
                 _d._note_native_kernel_failure(("ao2mo", tuple(eri.shape), nocc, nvir))
+    if packed:
+        eri = unpack_tril(eri, nbasis)
     return _cpu_ao_to_mo_transform(eri, C_occ, C_vir)
 
 
