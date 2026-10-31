@@ -611,6 +611,7 @@ class TestNativeKernelRetirement:
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
         monkeypatch.setattr(dispatch, "_native_kernel_deprecations_emitted", set())
         monkeypatch.setattr(dispatch, "_native_kernel_failed", set())
+        monkeypatch.setattr(dispatch, "_gc_may_free", True)
         monkeypatch.setattr(dispatch, "_backend", "auto")
         monkeypatch.delenv("TRNTENSOR_FORCE_BACKEND", raising=False)
         monkeypatch.delenv("TRNTENSOR_MP2_ENERGY", raising=False)
@@ -714,6 +715,14 @@ class TestNativeKernelRetirement:
         dev = torch.device("cpu")
         assert dispatch._device_has_room(dev, 2**30) is True
         assert dispatch._device_has_room(dev, 2 * 2**30) is False
+        # After a gc pass that freed nothing, later refusals skip the pass.
+        assert dispatch._gc_may_free is False
+        import gc as _gc
+
+        collected = []
+        monkeypatch.setattr(_gc, "collect", lambda: collected.append(1))
+        assert dispatch._device_has_room(dev, 2 * 2**30) is False
+        assert collected == []
         monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "nosuchdev")
         assert dispatch._device_has_room(dev, 10**15) is True
 

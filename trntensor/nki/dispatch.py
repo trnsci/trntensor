@@ -898,6 +898,11 @@ def _mp2_row_staging_bytes(B: torch.Tensor, dims: dict) -> int:
     return padded + window
 
 
+# Cleared when a gc pass in `_device_has_room` freed nothing; set again by
+# every row-kernel call (which can leave a collectable cycle behind).
+_gc_may_free = True
+
+
 def _device_has_room(device: torch.device, nbytes: int) -> bool:
     """False when this process's live device allocations plus ``nbytes`` would
     leave less than ``_MP2_ROW_HEADROOM_BYTES`` of the device. Live, not
@@ -912,11 +917,19 @@ def _device_has_room(device: torch.device, nbytes: int) -> bool:
             return True
         # The first launch of a kernel shape leaves its inputs in a reference
         # cycle (measured on TorchNeuron, #51: the ~1 GiB staging buffer at
-        # nocc=96 stays allocated until a gc pass). Collect once and recheck.
+        # nocc=96 stays allocated until a gc pass). Collect once and recheck,
+        # unless the last collection freed nothing and no row kernel has run
+        # since (a full gc pass cost ~0.1 s per call with the device full).
+        global _gc_may_free
+        if not _gc_may_free:
+            return False
         import gc
 
+        before = mod.memory_allocated(idx)
         gc.collect()
-        return mod.memory_allocated(idx) + nbytes <= total - _MP2_ROW_HEADROOM_BYTES
+        after = mod.memory_allocated(idx)
+        _gc_may_free = after < before
+        return after + nbytes <= total - _MP2_ROW_HEADROOM_BYTES
     except Exception:
         return True
 
@@ -1026,6 +1039,8 @@ def _nki_mp2_energy_rows(
     Bt, Bx, eo, ex, evc, evr = _mp2_row_feeds(B, eps_occ, eps_vir, dims)
     nd_pad = dims["nd_pad"]
     op = _get_native_ops()["mp2_energy_row"]
+    global _gc_may_free
+    _gc_may_free = True
     acc = None
     for i in range(nocc):
         p = op(
