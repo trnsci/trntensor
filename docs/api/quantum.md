@@ -79,6 +79,14 @@ print(f"E_MP2 = {E.item():.6f}")
   plus that staging would leave less than 3 GiB free. A shape whose kernel
   launch fails anyway falls back to aten and is remembered for the rest of
   the process.
+- **Host `B` on native TorchNeuron (#56).** Under `"auto"`, a host `B` with
+  `nocc²·nvir²·naux` of at least 1.5e8 multiply-adds (scaled by
+  `torch.get_num_threads() / 2`) is uploaded with the orbital energies, the
+  device route above runs, and the energy comes back as a host scalar.
+  Smaller problems stay on the host. On Trn2 with 2 host threads this took
+  646 ms -> 16 ms at 32/224/1024 and 15.8 s -> 135 ms at 64/448/1536. See
+  [host operands](nki.md#host-operands-upload-or-stay-56) for the table and
+  `TRNTENSOR_HOST_ROUTE`.
 - **PyTorch/XLA path (Trn1)**: the original single-launch `mp2_energy_kernel`.
   It accumulates `T` in PSUM, builds `Δ` on the Vector Engine, and writes one
   partial per `(i, j)` pair.
@@ -191,6 +199,16 @@ Kernel alone, device-resident, warm (fp32; padded `nvir` included):
   nbasis 64 and 128 it measured 0.79 and 0.57 ms with the kernel forced,
   which is why `"auto"` keeps aten there.
 
+- **Host inputs on native TorchNeuron (#56).** Under `"auto"`, with `eri`,
+  `C_occ` and `C_vir` all on the host, the inputs are uploaded (`eri` in the
+  layout given), the device route above runs, and the result is downloaded,
+  once `nocc·nbasis²·naux` reaches 2e8 for a full `eri` or 3e7 for a packed
+  one (both scaled by `torch.get_num_threads() / 2`). A packed host `eri`
+  otherwise pays a host unpack, so its threshold is lower. On Trn2 with 2
+  host threads at 512/1536/64 this took 574 -> 137 ms full and 979 -> 80 ms
+  packed. PySCF's `(naux, npair)` layout went from 5.2 s to 83 ms on one
+  physical core. See [host operands](nki.md#host-operands-upload-or-stay-56)
+  for the table and `TRNTENSOR_HOST_ROUTE`.
 - **PyTorch/XLA path (Trn1)**: the original kernel. It loops over P, with the
   `(i, ν)` intermediate round-tripping through kernel-scratch HBM. On the
   native path it is deprecated.

@@ -19,6 +19,8 @@ which is where cuTENSOR beats cuBLAS for tensor workloads.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .plan import ContractionPlan, _parse_subscripts, plan_contraction
@@ -425,6 +427,10 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
         if plan.strategy == "path":
             return _execute_path(subscripts, operands, plan)
         return _einsum_fp64(subscripts, operands)
+    if plan.strategy in ("torch", "path"):
+        offloaded = _offload_host_einsum(subscripts, operands, plan)
+        if offloaded is not None:
+            return offloaded
     if plan.strategy == "torch":
         return torch.einsum(subscripts, *operands)
     elif plan.strategy == "bmm":
@@ -435,6 +441,52 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
         return _execute_path(subscripts, operands, plan)
     else:
         return torch.einsum(subscripts, *operands)
+
+
+def _offload_host_einsum(subscripts: str, operands: tuple, plan: ContractionPlan):
+    """Host operands of a "torch" or "path" plan, run on the ``neuron`` device (#56).
+
+    Native path, ``"auto"`` backend, ``precision="fast"``, 2+ operands. The
+    operands are uploaded once when the contraction work (for a path, the
+    sum of its binary steps) reaches ``_EINSUM_HOST_OFFLOAD_MACS`` (matmul's
+    crossover, scaled by host threads) and ``_EINSUM_HOST_MIN_INTENSITY``
+    multiply-adds per byte moved. The plan then runs on the device (a path
+    keeps its intermediates there), and the result comes back through the
+    caching host allocator. Returns None to stay on the host.
+    ``TRNTENSOR_HOST_ROUTE=host|device`` replaces the size test.
+    """
+    if len(operands) < 2 or plan.precision != "fast" or "." in subscripts:
+        return None
+    from .nki import dispatch as d
+
+    if not (d.HAS_NKI and d._on_native_path()):
+        return None
+    input_str, output_str = _parse_subscripts(subscripts)
+    terms = input_str.split(",")
+    size: dict[str, int] = {}
+    for term, op in zip(terms, operands, strict=False):
+        for c, n in zip(term, op.shape, strict=False):
+            size[c] = int(n)
+    if plan.strategy == "path":
+        from .plan import _path_macs
+
+        work = _path_macs(terms, output_str, size, plan.contraction_path)
+    else:
+        work = math.prod(size.values())
+    moved = sum(op.numel() * op.element_size() for op in operands)
+    moved += math.prod(size[c] for c in output_str) * operands[0].element_size()
+    floor = d._EINSUM_HOST_MIN_INTENSITY * moved
+    if not d._offload_host(work, d._EINSUM_HOST_OFFLOAD_MACS, *operands, floor=floor):
+        return None
+    try:
+        result = _execute_contraction(
+            subscripts, tuple(op.to(d._NEURON_DEVICE) for op in operands), plan
+        )
+    except Exception:
+        if d._REQUIRE_NKI:
+            raise
+        return None
+    return d._to_host(result, operands[0].device)
 
 
 def _execute_matmul(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:

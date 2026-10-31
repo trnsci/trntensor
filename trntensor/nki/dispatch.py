@@ -257,28 +257,121 @@ def _route(flops: int, pinned: bool) -> str:
     at or above the pinned threshold, else "host" (aten on device); host
     operands stay on the host below the unpinned (offload) threshold and
     otherwise go to the device, as "nki" at or above the pinned threshold and
-    as "aten" below it.
+    as "aten" below it. ``TRNTENSOR_HOST_ROUTE=host|device`` replaces the
+    offload threshold for host operands (#56).
     """
     if not _on_native_path():
         return "nki" if flops >= _nki_flop_threshold(pinned) else "host"
     nki_ok = flops >= _MIN_NKI_FLOPS_NATIVE_PINNED
     if pinned:
         return "nki" if nki_ok else "host"
-    if flops < _MIN_NKI_FLOPS_NATIVE:
+    choice = _host_route_choice()
+    if choice == "host" or (choice == "auto" and flops < _MIN_NKI_FLOPS_NATIVE):
         return "host"
     return "nki" if nki_ok else "aten"
 
 
 def _route_for(flops: int, *operands: torch.Tensor) -> str:
-    """:func:`_route` for these operands' residency."""
-    device_type = _NEURON_DEVICE if _on_native_path() else "xla"
-    return _route(flops, pinned=all(t.device.type == device_type for t in operands))
+    """:func:`_route` for these operands' residency.
+
+    On the native path, host operands of a dtype the device does not compute
+    natively (float64, complex) stay on the host: the ``neuron`` device's
+    engines top out at fp32 (#56)."""
+    native = _on_native_path()
+    device_type = _NEURON_DEVICE if native else "xla"
+    pinned = all(t.device.type == device_type for t in operands)
+    route = _route(flops, pinned=pinned)
+    if native and route == "aten" and any(t.dtype not in _OFFLOAD_DTYPES for t in operands):
+        return "host"
+    return route
 
 
 def _aten_on_device(fn, *tensors: torch.Tensor) -> torch.Tensor:
     """Run ``fn`` (an aten op) on the ``neuron`` device; result on the caller's device."""
     orig = tensors[0].device
     return _to_host(fn(*(t.to(_NEURON_DEVICE) for t in tensors)), orig)
+
+
+# ── Host-input routing (#56) ────────────────────────────────────────────────
+#
+# Native path, ``"auto"`` backend, every operand on the host: once the work
+# reaches the entry point's threshold, the operands are uploaded, the call
+# runs on the ``neuron`` device by the device-resident policy, and the result
+# comes back through the caching host allocator (`_to_host`). Measured on Trn2
+# (SDK 2.33, one logical core at LNC=2, fp32, warm medians, host in -> host
+# out, tables on #56), with 2 host threads on two physical cores:
+#
+# - mp2_energy, work nocc²·nvir²·naux: the device route costs ~3 ms at small
+#   sizes (upload, launch floor, scalar readback). Host aten takes 3.8 ms at
+#   1.05e8 and 5.1 ms at 1.5e8. Larger problems gain 40-120x: 646 ms -> 16 ms
+#   at nocc=32, nvir=224, naux=1024, and 15.8 s -> 135 ms at 64/448/1536.
+# - ao_to_mo_transform, stage-1 work nocc·nbasis²·naux:
+#   - full eri: host 6.2 vs device 8.9 ms at 1.3e8, 9.4 vs 7.1 ms at 2.5e8,
+#     then 1.2-4.2x. The upload of the full square sets the device time.
+#   - packed eri: on the host it is unpacked first, which makes the host
+#     route 1.3-12x slower than uploading the packed rows (half the bytes).
+#     Host wins at 6e6, the device from 3e7.
+# - einsum with a "torch" or "path" plan and 2+ operands: the host runs bmm
+#   either way, so the crossover is matmul's, 5e8. Patterns with little
+#   reuse (under _EINSUM_HOST_MIN_INTENSITY multiply-adds per byte moved:
+#   elementwise products at 0.08, outer products at 0.25) stay on the host.
+#   They measured 1.4-2.9x faster uploaded, but only because 2 host threads
+#   stream memory slower than the link. Host bandwidth grows with threads and
+#   the link does not, and these patterns fill device memory.
+#
+# The host side is compute-bound and scales with threads, so like trnblas#65
+# the thresholds scale by torch.get_num_threads() / _HOST_MODEL_THREADS. The
+# matmul/bmm offload threshold (_MIN_NKI_FLOPS_NATIVE, #41; re-measured here
+# at the same crossover) keeps its own env/cache override and is not scaled.
+#
+# TRNTENSOR_HOST_ROUTE=host|device|auto overrides the size tests for host
+# operands, matmul/bmm included. Explicit backends keep their route:
+# set_backend("pytorch") never leaves the host, and set_backend("nki") runs
+# the kernels, which upload host operands themselves. Only float32 /
+# bfloat16 / float16 tensors are uploaded; float64 and complex stay on the
+# host, since the device computes in at most fp32.
+_HOST_ROUTE_CHOICES = ("auto", "host", "device")
+_HOST_MODEL_THREADS = 2
+_MP2_HOST_OFFLOAD_MACS = 1.5e8
+_AO_TO_MO_HOST_OFFLOAD_MACS = 2.0e8
+_AO_TO_MO_HOST_OFFLOAD_MACS_PACKED = 3.0e7
+_EINSUM_HOST_OFFLOAD_MACS = 5.0e8
+_EINSUM_HOST_MIN_INTENSITY = 0.5
+_OFFLOAD_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+
+
+def _host_route_choice() -> str:
+    choice = os.environ.get("TRNTENSOR_HOST_ROUTE", "auto").strip().lower() or "auto"
+    if choice not in _HOST_ROUTE_CHOICES:
+        raise ValueError(
+            f"TRNTENSOR_HOST_ROUTE must be one of {_HOST_ROUTE_CHOICES}; got {choice!r}"
+        )
+    return choice
+
+
+def _host_thread_scale() -> float:
+    return max(1, torch.get_num_threads()) / _HOST_MODEL_THREADS
+
+
+def _offload_host(
+    work: float, threshold: float, *tensors: torch.Tensor, floor: float = 0.0
+) -> bool:
+    """True when host operands doing ``work`` multiply-adds should be uploaded
+    and run on the ``neuron`` device: native path, ``"auto"`` backend (not
+    forced NKI), every operand a CPU tensor of an uploadable dtype, and
+    ``work`` at least ``threshold`` (scaled by the host's thread count) and
+    ``floor`` (not scaled). ``TRNTENSOR_HOST_ROUTE=host|device`` replaces the
+    size test."""
+    if not (_use_nki() and HAS_NKI) or not _on_native_path() or _nki_forced():
+        return False
+    if _NEURON_DEVICE == "cpu":  # CPU standing in for the device (tests)
+        return False
+    if any(t.device.type != "cpu" or t.dtype not in _OFFLOAD_DTYPES for t in tensors):
+        return False
+    choice = _host_route_choice()
+    if choice != "auto":
+        return choice == "device"
+    return work >= max(threshold * _host_thread_scale(), floor)
 
 
 # ── Host results through the caching host allocator ─────────────────────────
@@ -1004,8 +1097,9 @@ def _mp2_energy_route(B: torch.Tensor) -> str:
     when it fits in SBUF and each row launch carries at least
     ``_MP2_ROW_MIN_ROW_FLOP`` and the device has room for its input staging,
     else aten; ``set_backend("nki")`` uses the row kernel whenever it fits in
-    SBUF. Host ``B`` under ``"auto"`` stays on aten on the
-    host.
+    SBUF. Under ``"auto"``, :func:`trntensor.quantum.mp2_energy` uploads a
+    large host ``B`` first and then asks again (#56); a host ``B`` that
+    reaches this function gets 'aten', on the host.
     """
     if not (_use_nki() and HAS_NKI):
         return "aten"
@@ -1212,8 +1306,10 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int, nbasis: int | None 
     Native path: the Trn2 kernel for device-resident ``eri`` when
     ``nocc ≤ 128``, its SBUF working set fits and the stage-1 work reaches
     ``_AO_TO_MO_MIN_MACS``, else aten; ``set_backend("nki")`` drops the size
-    and residency conditions. Host ``eri``
-    under ``"auto"`` stays on aten on the host.
+    and residency conditions. Under ``"auto"``,
+    :func:`trntensor.quantum.ao_to_mo_transform` uploads large host inputs
+    first and then asks again (#56); a host ``eri`` that reaches this
+    function gets 'aten', on the host.
 
     A 2-D ``eri`` is the packed lower triangle ``(npair, naux)`` of an
     ``nbasis`` basis (#54); then 'trn2' means ``ao_to_mo_trn2_packed_kernel``

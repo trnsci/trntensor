@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Host inputs run on the device when that is faster (#56).** On the
+  native TorchNeuron path under `"auto"`, host operands are uploaded, run on
+  the device by the device-resident policy and downloaded into cached host
+  memory once the work reaches a measured threshold:
+  - `mp2_energy`: `nocc²·nvir²·naux` ≥ 1.5e8;
+  - `ao_to_mo_transform`: `nocc·nbasis²·naux` ≥ 2e8 for a full `eri`, 3e7 for a packed one;
+  - `einsum` generic and multi-operand plans: ≥ 5e8 multiply-adds and at least 0.5 multiply-adds per byte moved. A path uploads once and keeps its intermediates on the device.
+  - These thresholds scale with `torch.get_num_threads() / 2`, as in trnblas#65. Matmul/bmm keep `TRNTENSOR_MIN_NKI_FLOPS_NATIVE` (5e8, re-measured).
+  - Trn2, 2 host threads, warm: `mp2_energy` 646 -> 16 ms at 32/224/1024 and 15.8 s -> 135 ms at 64/448/1536. `ao_to_mo_transform` at 512/1536/64 went 574 -> 137 ms full and 979 -> 80 ms packed. The umbrella DF-MP2 profile in host-auto mode at 512/1536/64 went 29.9 s -> 0.37 s (fused pipeline) and 28.9 s -> 0.41 s (example pipeline, with trnblas 0.9 routing).
+  - `TRNTENSOR_HOST_ROUTE=host|device|auto` overrides the choice. `set_backend("pytorch")` and `set_backend("nki")` keep their routes.
+  - If the upload or the device call fails, the call runs on the host.
+- **float64 and complex host matmul/bmm stay on the host** under native
+  `"auto"`. Before, they were offloaded from 5e8 multiply-adds, and the
+  device computes in at most fp32: a float64 `einsum("ij,jk->ik")` at 1024³
+  came back with 1.4e-7 relative error. It is now exact float64.
+
 - **Host results at the host-link rate (#56).** On the native TorchNeuron
   path, results of 1 MiB and up that come back to the host (`einsum` /
   `multi_einsum` with host operands on the `aten`-on-device route, kernel
