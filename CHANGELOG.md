@@ -17,6 +17,7 @@ Resolves #51: on the native TorchNeuron path (Trn2/Trn3), the AO→MO and MP2-en
   - Gridless launch: at LNC=2 each physical core takes half of the `j` window (`num_programs()` / `program_id`), and it also runs at LNC=1.
   - The design follows trnblas `pair_energy_sym` (trnblas#55, #58).
   - Native `"auto"` uses it for device-resident `B` once each row launch carries at least 3 GFLOP. On Trn2 it measured 1.25–1.9× faster than aten: for example 0.69 s against 1.30 s at `nocc=96, nvir=672, naux=2304`.
+  - Near a full device the kernel's input staging (about 1.5× the padded `B`) needs more memory than aten's 64 MiB chunks. `"auto"` keeps aten when live allocations plus that staging would leave less than 3 GiB of the core free, and remembers shapes whose launch failed.
   - `TRNTENSOR_MP2_ENERGY=auto|rows|aten|legacy` overrides the choice.
 - **`ao_to_mo_trn2_kernel`, the native AO→MO kernel (#51).**
   - Two plain GEMM stages with the contraction index on the partition axis, so there are no DMA transposes.

@@ -74,7 +74,11 @@ print(f"E_MP2 = {E.item():.6f}")
   Holding 12 or 18 GB of the core's 24 GB on the device did not slow either
   path. The aten path's 64 MiB `T` chunks stay clear of the slowdown in
   aws-neuron-sdk#1447. The row kernel's input staging is about 1.5× the
-  padded `B`.
+  padded `B`, so near a full device it needs more memory than aten does.
+  `"auto"` therefore keeps aten when this process's live device allocations
+  plus that staging would leave less than 3 GiB free. A shape whose kernel
+  launch fails anyway falls back to aten and is remembered for the rest of
+  the process.
 - **PyTorch/XLA path (Trn1)**: the original single-launch `mp2_energy_kernel`.
   It accumulates `T` in PSUM, builds `Δ` on the Vector Engine, and writes one
   partial per `(i, j)` pair.
