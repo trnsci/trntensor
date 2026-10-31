@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-10-31
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: packed ERI input for `ao_to_mo_transform` (DF-MP2 14–18% faster, #55); pinned-memory downloads (1.6–3.7×, #57); large host-input calls offload to the device above measured thresholds (umbrella DF-MP2 at xxl 29 s → 0.4 s, #58).
+
 ### Changed
 
 - **Host inputs run on the device when that is faster (#56).** On the
