@@ -19,6 +19,7 @@ the first launch by ``_get_dispatch_path``.
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import warnings
 
@@ -277,7 +278,61 @@ def _route_for(flops: int, *operands: torch.Tensor) -> str:
 def _aten_on_device(fn, *tensors: torch.Tensor) -> torch.Tensor:
     """Run ``fn`` (an aten op) on the ``neuron`` device; result on the caller's device."""
     orig = tensors[0].device
-    return fn(*(t.to(_NEURON_DEVICE) for t in tensors)).to(orig)
+    return _to_host(fn(*(t.to(_NEURON_DEVICE) for t in tensors)), orig)
+
+
+# ── Host results through the caching host allocator ─────────────────────────
+#
+# Same fix as trnblas#61/#64. On Trn2 (SDK 2.33, native TorchNeuron) a
+# device→host copy into fresh pageable memory (`.to("cpu")`, `torch.empty` +
+# `copy_`) runs at ~4 GB/s, because the host page-faults every page it
+# touches. A copy into memory that is already faulted in runs at the link
+# rate, 13-14 GB/s. `torch.empty(..., pin_memory=True)` comes from the
+# accelerator's caching host allocator: each call still returns a fresh tensor
+# (a block is recycled only after the tensor that owned it is freed, so results
+# never alias), and recycled blocks come back already faulted in. Uploads from
+# pageable memory already run at the link rate and are unchanged.
+#
+# Costs: blocks are rounded up to a power of two, and freed blocks stay cached
+# until `torch.accelerator.empty_host_cache()`. TRNTENSOR_PINNED_OUTPUT=0 turns
+# this off (plain `.to("cpu")`). Results under `_PINNED_OUTPUT_MIN_BYTES`
+# always take `.to(device)`. The XLA path and the simulator are unchanged.
+_PINNED_OUTPUT_MIN_BYTES = 1 << 20
+
+
+def _pinned_output_enabled() -> bool:
+    value = os.environ.get("TRNTENSOR_PINNED_OUTPUT", "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _use_host_cache(device, nbytes: int) -> bool:
+    """True when a CPU result of `nbytes` should come from the caching host
+    allocator: native path, CPU destination, large enough, not disabled."""
+    return (
+        torch.device(device).type == "cpu"
+        and nbytes >= _PINNED_OUTPUT_MIN_BYTES
+        and _pinned_output_enabled()
+        and not _use_simulator()
+        and _get_dispatch_path() == "native"
+    )
+
+
+def _host_empty(shape, dtype: torch.dtype, device) -> torch.Tensor:
+    """`torch.empty(shape, dtype=dtype, device=device)`; a large CPU tensor on the
+    native path comes from the caching host allocator (fresh, already faulted in)."""
+    shape = tuple(shape)
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if _use_host_cache(device, nbytes):
+        return torch.empty(shape, dtype=dtype, pin_memory=True)
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _to_host(t: torch.Tensor, device) -> torch.Tensor:
+    """`t.to(device)`. A large device → CPU copy lands in a fresh tensor from
+    the caching host allocator, about 3.5x faster than `.to("cpu")` (trnblas#61)."""
+    if t.device.type == "cpu" or not _use_host_cache(device, t.numel() * t.element_size()):
+        return t.to(device)
+    return _host_empty(t.shape, t.dtype, device).copy_(t)
 
 
 _backend = "auto"
@@ -512,7 +567,7 @@ def _launch(kernel, op_name: str, *tensors: torch.Tensor, **consts) -> torch.Ten
     if _get_dispatch_path() == "native":
         orig = tensors[0].device
         op = _get_native_ops()[op_name]
-        return op(*(t.to(_NEURON_DEVICE) for t in tensors), **consts).to(orig)
+        return _to_host(op(*(t.to(_NEURON_DEVICE) for t in tensors), **consts), orig)
     xs, orig = _to_xla(*tensors)
     return kernel(*xs, **consts).to(orig)
 
@@ -561,7 +616,7 @@ def _from_device(tensor: torch.Tensor) -> torch.Tensor:
     """Move ``tensor`` back to CPU (never warns). No-op if already on CPU."""
     if tensor.device.type == "cpu":
         return tensor
-    return tensor.to("cpu")
+    return _to_host(tensor, "cpu")
 
 
 def to_device(tensor: torch.Tensor) -> torch.Tensor:
