@@ -670,6 +670,22 @@ class TestNativeKernelRetirement:
         monkeypatch.setattr(dispatch, "_use_nki", lambda: False)
         assert dispatch._mp2_energy_route(B) == "aten"
 
+    def test_ao_to_mo_route(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        small = torch.empty(128, 128, 256, device="meta")
+        large = torch.empty(256, 256, 512, device="meta")
+        assert dispatch._ao_to_mo_route(small, 16, 112) == "aten"
+        assert dispatch._ao_to_mo_route(large, 32, 224) == "trn2"
+        assert dispatch._ao_to_mo_route(torch.empty(256, 256, 512), 32, 224) == "aten"
+        assert dispatch._ao_to_mo_route(large, 129, 224) == "aten"
+        huge = torch.empty(4096, 4096, 512, device="meta")
+        assert dispatch._ao_to_mo_route(huge, 32, 4000) == "aten"  # SBUF
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._ao_to_mo_route(small, 16, 112) == "trn2"
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
+        assert dispatch._ao_to_mo_route(small, 16, 112) == "legacy"
+
     @pytest.mark.parametrize("nocc", [1, 2, 5, 6, 7])
     def test_mp2_row_walk_matches_reference(self, nocc):
         from trntensor.quantum import _cpu_mp2_energy

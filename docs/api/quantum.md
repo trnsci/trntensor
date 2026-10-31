@@ -117,17 +117,26 @@ E = trntensor.mp2_energy(B, eps_occ, eps_vir)
   - Stage 2: `B[i, a, P] = Σ_ν C_vir[ν, a] X[i, ν, P]`.
   - The auxiliary index is split across both physical cores at LNC=2.
   - `"auto"` uses the kernel for device-resident `eri` with `nocc ≤ 128` when
-    its SBUF working set fits; otherwise it runs the two aten steps.
+    its SBUF working set fits and the stage-1 work `nocc·nbasis²·naux` is at
+    least 5e8 multiply-adds (about nbasis ≥ 256). Smaller problems lose to
+    the launch floor and the padding copies; otherwise it runs the two aten
+    steps.
     `TRNTENSOR_AO_TO_MO=auto|trn2|aten|legacy` overrides the choice.
 
   Measured on Trn2 (fp32, one LNC=2 core, device-resident, warm, #51):
 
-  | nbasis, nocc, naux | two aten einsums | Trn2 kernel | original kernel |
-  |---|---|---|---|
-  | 128, 16, 256 | 0.49 ms | 0.43 ms | 16.1 ms |
-  | 256, 32, 512 | 1.27 ms | 1.11 ms | 112 ms (#49) |
-  | 512, 32, 1024 | 7.31 ms | 4.56 ms | — |
-  | 768, 48, 1536 | 18.2 ms | 11.8 ms | — |
+  | nbasis, nocc, naux | two aten einsums | Trn2 kernel (op) | `ao_to_mo_transform`, `"auto"` | original kernel |
+  |---|---|---|---|---|
+  | 64, 8, 128 | 0.41 ms | — | 0.41 ms (aten) | 6.0 ms (#49) |
+  | 128, 16, 256 | 0.49 ms | 0.43 ms | 0.49 ms (aten) | 16.1 ms |
+  | 256, 32, 512 | 1.23 ms | 1.11 ms | 0.92 ms | 112 ms (#49) |
+  | 512, 32, 1024 | 7.30 ms | 4.56 ms | 4.72 ms | — |
+  | 768, 48, 1536 | 18.3 ms | 11.8 ms | 12.0 ms | — |
+
+  The op column takes tile-multiple inputs (the raw kernel). The `"auto"`
+  column includes the padding of `nvir` to 128 and is the shipped route. At
+  nbasis 64 and 128 it measured 0.79 and 0.57 ms with the kernel forced,
+  which is why `"auto"` keeps aten there.
 
 - **PyTorch/XLA path (Trn1)**: the original kernel. It loops over P, with the
   `(i, ν)` intermediate round-tripping through kernel-scratch HBM. On the

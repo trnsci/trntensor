@@ -146,8 +146,10 @@ def ao_to_mo_transform(
       stages are plain GEMMs with the contraction index on the partition
       axis (no DMA transposes), and the auxiliary index is split across both
       physical cores at LNC=2. ``"auto"`` uses it for device-resident ``eri``
-      with ``nocc ≤ 128`` when its SBUF working set fits; it measured
-      1.1-1.6x faster than the two aten einsums on Trn2 (#51). Otherwise the
+      with ``nocc ≤ 128`` when its SBUF working set fits and the stage-1
+      work ``nocc·nbasis²·naux`` is at least 5e8 multiply-adds (about
+      nbasis ≥ 256). There it measured 1.3-1.6x faster than the two aten
+      einsums on Trn2 (#51). Otherwise the
       two-step aten contraction below runs. ``TRNTENSOR_AO_TO_MO=
       auto|trn2|aten|legacy`` overrides the choice.
     - PyTorch/XLA path (Trn1): the original kernel (``nocc ≤ 128``).

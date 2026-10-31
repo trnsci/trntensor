@@ -21,7 +21,7 @@ Resolves #51: on the native TorchNeuron path (Trn2/Trn3), the AO→MO and MP2-en
 - **`ao_to_mo_trn2_kernel`, the native AO→MO kernel (#51).**
   - Two plain GEMM stages with the contraction index on the partition axis, so there are no DMA transposes.
   - The auxiliary index is split across both physical cores at LNC=2.
-  - Native `"auto"` uses it for device-resident `eri` with `nocc ≤ 128`. On Trn2 it measured 1.1–1.6× faster than the two aten einsums, at nbasis 128–768.
+  - Native `"auto"` uses it for device-resident `eri` with `nocc ≤ 128` and stage-1 work of at least 5e8 multiply-adds (about nbasis ≥ 256). There it measured 1.3–1.6× faster than the two aten einsums on Trn2, at nbasis 256–768. Smaller problems stay on aten.
   - `TRNTENSOR_AO_TO_MO=auto|trn2|aten|legacy` overrides the choice.
 - `scripts/bench_native_kernels.py`: a kernel-level A/B harness (aten against the original and the Trn2 kernels), with `--hold-gb` for the memory-pressure regime of aws-neuron-sdk#1447.
 

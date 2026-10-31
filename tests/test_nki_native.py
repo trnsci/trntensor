@@ -228,8 +228,8 @@ class TestNativeTrn2Kernels:
             B = torch.randn(32, 320, 1024) * 0.05
             eo, ev = -torch.rand(32) - 1.0, torch.rand(320) + 0.5
             trntensor.mp2_energy(*_dev(B, eo, ev))
-            eri = torch.randn(128, 128, 128)
-            trntensor.ao_to_mo_transform(*_dev(eri, torch.randn(128, 8), torch.randn(128, 120)))
+            eri = torch.randn(256, 256, 512) * 0.1
+            trntensor.ao_to_mo_transform(*_dev(eri, torch.randn(256, 32), torch.randn(256, 200)))
             # Small MP2 stays on aten.
             trntensor.mp2_energy(*_dev(B[:4, :32, :64].contiguous(), eo[:4], ev[:32]))
         finally:

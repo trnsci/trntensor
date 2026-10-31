@@ -1056,6 +1056,12 @@ _AO_TO_MO_CHOICES = ("auto", "trn2", "aten", "legacy")
 # SBUF bytes per partition `ao_to_mo_trn2_kernel` keeps live (C_occ, C_vir,
 # one stage-1 eri block, one X[i] strip); same budget as the MP2 kernel.
 _AO_TO_MO_SBUF_BUDGET = 144 * 1024
+# Under "auto" the kernel needs stage-1 work nocc·nbasis²·naux of at least
+# this many multiply-adds. Below it, the custom-op launch floor and the
+# padding copies lose to aten: nbasis=128, nocc=16, naux=256 (6.7e7) measured
+# 0.57 ms against 0.49 ms; nbasis=256, nocc=32, naux=512 (1.1e9) 0.92 ms
+# against 1.23 ms (#51).
+_AO_TO_MO_MIN_MACS = 5.0e8
 
 
 def _ao_to_mo_trn2_sbuf_bytes(nbasis: int, nocc: int, nvir: int, naux: int, itemsize: int) -> int:
@@ -1076,8 +1082,9 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
 
     XLA path / simulator: 'legacy' whenever NKI is in use (unchanged).
     Native path: the Trn2 kernel for device-resident ``eri`` when
-    ``nocc ≤ 128`` and its SBUF working set fits, else aten;
-    ``set_backend("nki")`` also sends host ``eri`` to the kernel. Host ``eri``
+    ``nocc ≤ 128``, its SBUF working set fits and the stage-1 work reaches
+    ``_AO_TO_MO_MIN_MACS``, else aten; ``set_backend("nki")`` drops the size
+    and residency conditions. Host ``eri``
     under ``"auto"`` stays on aten on the host.
     """
     if not (_use_nki() and HAS_NKI):
@@ -1096,9 +1103,10 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
     )
     if not fits:
         return "aten"
-    if _nki_forced() or eri.device.type == _NEURON_DEVICE:
+    if _nki_forced():
         return "trn2"
-    return "aten"
+    big = nocc * eri.shape[0] ** 2 * eri.shape[2] >= _AO_TO_MO_MIN_MACS
+    return "trn2" if big and eri.device.type == _NEURON_DEVICE else "aten"
 
 
 def _nki_ao_to_mo_trn2(
