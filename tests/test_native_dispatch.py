@@ -843,6 +843,206 @@ class TestNativeKernelRetirement:
         )
 
 
+class TestHostInputRouting:
+    """#56: host operands under native "auto" upload, run on the device, come back."""
+
+    @pytest.fixture(autouse=True)
+    def _native(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE", 1000)
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE_PINNED", dispatch.NKI_NEVER)
+        monkeypatch.setattr(dispatch, "_EINSUM_HOST_OFFLOAD_MACS", 1000)
+        monkeypatch.setattr(dispatch, "_host_thread_scale", lambda: 1.0)
+        for var in ("TRNTENSOR_FORCE_BACKEND", "TRNTENSOR_HOST_ROUTE", "TRNTENSOR_REQUIRE_NKI"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_offload_host_policy(self, monkeypatch):
+        x = torch.empty(4)
+        assert dispatch._offload_host(100, 100, x) is True
+        assert dispatch._offload_host(99, 100, x) is False
+        # Only host operands of an uploadable dtype.
+        assert dispatch._offload_host(100, 100, x, torch.empty(4, device="meta")) is False
+        assert dispatch._offload_host(100, 100, x.double()) is False
+        assert dispatch._offload_host(100, 100, x.bfloat16()) is True
+        # The env override replaces the size test, not the dtype test.
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "device")
+        assert dispatch._offload_host(0, 100, x) is True
+        assert dispatch._offload_host(0, 100, x.double()) is False
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "host")
+        assert dispatch._offload_host(10**15, 100, x) is False
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "bogus")
+        with pytest.raises(ValueError, match="TRNTENSOR_HOST_ROUTE"):
+            dispatch._offload_host(100, 100, x)
+
+    def test_thresholds_scale_with_host_threads(self, monkeypatch):
+        x = torch.empty(4)
+        monkeypatch.setattr(dispatch, "_host_thread_scale", lambda: 4.0)
+        assert dispatch._offload_host(399, 100, x) is False
+        assert dispatch._offload_host(400, 100, x) is True
+        assert dispatch._offload_host(400, 100, x, floor=401) is False
+        monkeypatch.undo()
+        threads = torch.get_num_threads()
+        try:
+            torch.set_num_threads(8)
+            assert dispatch._host_thread_scale() == 8 / dispatch._HOST_MODEL_THREADS
+        finally:
+            torch.set_num_threads(threads)
+
+    def test_explicit_backends_keep_their_route(self, monkeypatch):
+        x = torch.empty(4)
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "device")
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._offload_host(100, 100, x) is False
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: False)  # "pytorch"
+        assert dispatch._offload_host(100, 100, x) is False
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        assert dispatch._offload_host(100, 100, x) is False
+
+    def test_matmul_route_env_override(self, monkeypatch):
+        assert dispatch._route(999, pinned=False) == "host"
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "device")
+        assert dispatch._route(1, pinned=False) == "aten"
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "host")
+        assert dispatch._route(10**15, pinned=False) == "host"
+        assert dispatch._route(10**15, pinned=True) == "host"  # aten on the device
+
+    def test_float64_host_matmul_stays_on_host(self):
+        A = torch.empty(64, 64, dtype=torch.float64)
+        assert dispatch._route_for(10**12, A, A) == "host"
+        assert dispatch._route_for(10**12, A.float(), A.float()) == "aten"
+
+    def _fake_device(self, monkeypatch, value):
+        from trntensor import quantum
+
+        seen = []
+
+        def on_device(fn, *ts):
+            seen.append(tuple(t.shape for t in ts))
+            return value
+
+        monkeypatch.setattr(quantum, "_on_device", on_device)
+        return seen
+
+    def test_mp2_energy_host_input_offloads_above_threshold(self, monkeypatch):
+        from trntensor.quantum import _cpu_mp2_energy
+
+        monkeypatch.setattr(dispatch, "_MP2_HOST_OFFLOAD_MACS", 4 * 4 * 8 * 8 * 16)
+        seen = self._fake_device(monkeypatch, torch.tensor(42.0))
+        B = torch.randn(4, 8, 16) * 0.1
+        eo, ev = -torch.rand(4) - 1.0, torch.rand(8) + 0.5
+        assert float(trntensor.mp2_energy(B, eo, ev)) == 42.0
+        assert seen == [((4, 8, 16), (4,), (8,))]
+        small = B[:3].contiguous()
+        e = trntensor.mp2_energy(small, eo[:3], ev)
+        torch.testing.assert_close(e, _cpu_mp2_energy(small, eo[:3], ev))
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "host")
+        torch.testing.assert_close(trntensor.mp2_energy(B, eo, ev), _cpu_mp2_energy(B, eo, ev))
+        assert len(seen) == 1
+
+    def test_mp2_energy_falls_back_to_host_when_device_fails(self, monkeypatch):
+        from trntensor import quantum
+
+        B = torch.randn(4, 8, 16) * 0.1
+        eo, ev = -torch.rand(4) - 1.0, torch.rand(8) + 0.5
+
+        def boom(*a):
+            raise RuntimeError("NRT_RESOURCE")
+
+        assert quantum._on_device(boom, B) is None
+        monkeypatch.setenv("TRNTENSOR_REQUIRE_NKI", "1")
+        with pytest.raises(RuntimeError, match="NRT_RESOURCE"):
+            quantum._on_device(boom, B)
+        monkeypatch.delenv("TRNTENSOR_REQUIRE_NKI")
+        monkeypatch.setattr(dispatch, "_MP2_HOST_OFFLOAD_MACS", 0)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "nosuchdev")  # the upload raises
+        torch.testing.assert_close(
+            trntensor.mp2_energy(B, eo, ev), quantum._cpu_mp2_energy(B, eo, ev)
+        )
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_ao_to_mo_host_input_offloads(self, monkeypatch, packed):
+        from trntensor.quantum import _cpu_ao_to_mo_transform, pack_tril
+
+        nb, naux, nocc, nvir = 8, 16, 2, 6
+        eri = torch.randn(nb, nb, naux)
+        eri = eri + eri.transpose(0, 1)
+        C_occ, C_vir = torch.randn(nb, nocc), torch.randn(nb, nvir)
+        arg = pack_tril(eri) if packed else eri
+        for name in ("_AO_TO_MO_HOST_OFFLOAD_MACS", "_AO_TO_MO_HOST_OFFLOAD_MACS_PACKED"):
+            monkeypatch.setattr(dispatch, name, nocc * nb * nb * naux)
+        marker = torch.full((nocc, nvir, naux), 7.0)
+        seen = self._fake_device(monkeypatch, marker)
+        downloads = []
+        monkeypatch.setattr(dispatch, "_to_host", lambda t, dev: downloads.append(dev) or t)
+        assert torch.equal(trntensor.ao_to_mo_transform(arg, C_occ, C_vir), marker)
+        assert seen == [((nb, nocc), (nb, nvir))] and downloads == ["cpu"]
+        # Below the threshold: the host route, unchanged.
+        for name in ("_AO_TO_MO_HOST_OFFLOAD_MACS", "_AO_TO_MO_HOST_OFFLOAD_MACS_PACKED"):
+            monkeypatch.setattr(dispatch, name, nocc * nb * nb * naux + 1)
+        torch.testing.assert_close(
+            trntensor.ao_to_mo_transform(arg, C_occ, C_vir),
+            _cpu_ao_to_mo_transform(eri, C_occ, C_vir),
+        )
+        assert len(seen) == 1
+
+    def _capture_downloads(self, monkeypatch):
+        got = []
+
+        def to_host(t, dev):
+            got.append(t.device.type)
+            return torch.full(t.shape, 3.0)
+
+        monkeypatch.setattr(dispatch, "_to_host", to_host)
+        return got
+
+    def test_einsum_torch_plan_offloads(self, monkeypatch):
+        got = self._capture_downloads(monkeypatch)
+        a, b = torch.randn(8, 4), torch.randn(8, 8, 16)
+        monkeypatch.setattr(dispatch, "_EINSUM_HOST_MIN_INTENSITY", 1.0)
+        out = trntensor.einsum("mi,mnP->inP", a, b)  # 4096 MACs, 6 KiB moved
+        assert got == [] and torch.allclose(out, torch.einsum("mi,mnP->inP", a, b))
+        monkeypatch.setattr(dispatch, "_EINSUM_HOST_MIN_INTENSITY", 0.1)
+        out = trntensor.einsum("mi,mnP->inP", a, b)
+        assert got == ["meta"] and out.shape == (4, 8, 16) and bool((out == 3.0).all())
+
+    def test_einsum_path_plan_offloads_once(self, monkeypatch):
+        got = self._capture_downloads(monkeypatch)
+        monkeypatch.setattr(dispatch, "_EINSUM_HOST_MIN_INTENSITY", 0.0)
+        a, b, c = torch.randn(8, 2), torch.randn(8, 6), torch.randn(8, 8, 16)
+        out = trntensor.einsum("mi,na,mnP->iaP", a, b, c)
+        assert got == ["meta"] and out.shape == (2, 6, 16)
+
+    def test_einsum_low_reuse_stays_on_host(self, monkeypatch):
+        got = self._capture_downloads(monkeypatch)
+        x = torch.randn(64, 64)
+        for sub, ops in (("ij,ij->ij", (x, x)), ("ab,cd->abcd", (x[:8, :8], x[:8, :8]))):
+            torch.testing.assert_close(trntensor.einsum(sub, *ops), torch.einsum(sub, *ops))
+        assert got == []
+        # The env override forces it; fp64 and kahan never leave the host.
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "device")
+        trntensor.einsum("ij,ij->ij", x, x)
+        assert got == ["meta"]
+        trntensor.einsum("ij,ij->ij", x.double(), x.double())
+        trntensor.einsum("ij,ijk->k", x, torch.randn(64, 64, 2), precision="kahan")
+        assert got == ["meta"]
+
+    def test_path_macs_sums_binary_steps(self):
+        from trntensor.plan import _greedy_path_search, _path_macs
+
+        size = {"m": 8, "n": 8, "i": 2, "a": 6, "P": 16}
+        terms = ["mi", "na", "mnP"]
+        path = _greedy_path_search(terms, "iaP", size)
+        # mi,mnP -> inP (8·2·8·16), then na,inP -> iaP (8·6·2·16).
+        assert _path_macs(terms, "iaP", size, path) == 8 * 2 * 8 * 16 + 8 * 6 * 2 * 16
+
+
 class TestResidency:
     def test_to_device_native_places_on_neuron(self, monkeypatch):
         monkeypatch.setattr(dispatch, "HAS_NKI", True)

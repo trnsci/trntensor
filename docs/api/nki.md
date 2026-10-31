@@ -120,6 +120,7 @@ supported in maintenance mode."
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting (not trntensor's). Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. Set it with `pip install -e`; the test suite sets it by default. |
 | `TRNTENSOR_MP2_ENERGY=auto\|rows\|aten\|legacy` | Native path: force the `mp2_energy` executor (`rows` = the Trn2 row kernel, `legacy` = the original kernel, deprecated there). |
 | `TRNTENSOR_AO_TO_MO=auto\|trn2\|aten\|legacy` | Native path: force the `ao_to_mo_transform` executor (`trn2` = the Trn2 kernel, or `ao_to_mo_trn2_packed_kernel` for a packed 2-D `eri`; `legacy` = the original kernel, deprecated there; `aten` and `legacy` unpack a packed `eri` first). |
+| `TRNTENSOR_HOST_ROUTE=auto\|host\|device` | Native path, `"auto"` backend, all operands on the host: where the work runs (#56). `auto` (default) uploads it once it reaches the measured thresholds below; `host` keeps it on the host; `device` always uploads. Covers `mp2_energy`, `ao_to_mo_transform`, `einsum` / `multi_einsum` (matmul, bmm, generic and multi-operand plans). Only float32 / bfloat16 / float16 operands are uploaded. `set_backend("pytorch")` and `set_backend("nki")` ignore it. |
 | `TRNTENSOR_PINNED_OUTPUT=0` | Native path: download results with plain `.to("cpu")` instead of into memory from the caching host allocator (`torch.empty(..., pin_memory=True)`, results of 1 MiB and up; #56). |
 | `TRNTENSOR_FORCE_BACKEND=pytorch\|nki\|auto` | Override the backend selection at runtime without calling `set_backend()`. Used by benchmarks to sweep both paths on the same machine. |
 | `TRNTENSOR_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU instead of XLA → NEFF → hardware. Catches Python-trace-level errors without AWS round-trips. MLIR verifier errors remain hardware-only. |
@@ -148,6 +149,93 @@ NeuronCore and two host threads, with `scripts/bench_native_einsum.py` and
 
   The default of 500 M sits between these. A host with more threads moves the
   crossover up. Re-measure on your host with `scripts/autotune_dispatch.py`.
+
+### Host operands: upload or stay (#56)
+
+With every operand on the host, native `"auto"` uploads the work, runs it on
+the device by the device-resident policy, and downloads the result into
+memory from the caching host allocator, once the work reaches:
+
+| entry point | work | offload from (2 host threads) |
+|---|---|---|
+| `mp2_energy` | `nocc²·nvir²·naux` | 1.5e8 |
+| `ao_to_mo_transform`, full `eri` | `nocc·nbasis²·naux` | 2e8 |
+| `ao_to_mo_transform`, packed `eri` | `nocc·nbasis²·naux` | 3e7 |
+| `einsum`, generic or multi-operand plan | contraction multiply-adds (a path: the sum of its steps) | 5e8, and at least 0.5 multiply-adds per byte moved |
+| `einsum` matmul / bmm | `M·K·N` | `TRNTENSOR_MIN_NKI_FLOPS_NATIVE` (5e8, above) |
+
+- The first four scale with `torch.get_num_threads() / 2`, as trnblas#65
+  does: the host side is compute-bound and the thresholds were measured with
+  2 threads. The matmul threshold keeps its own override and is not scaled.
+- Einsums with little reuse stay on the host at any size: under 0.5
+  multiply-adds per byte moved, such as elementwise (0.08) and outer
+  (0.25) products. They measured 1.4-2.9x faster uploaded, but only because
+  2 host threads stream memory slower than the link. Host bandwidth grows
+  with threads and the link's does not, and these patterns fill device
+  memory.
+- float64 and complex operands stay on the host, matmul included. The
+  device computes in at most fp32.
+- If the upload or the device call fails (for example, a full device), the
+  call runs on the host. `TRNTENSOR_REQUIRE_NKI=1` raises instead.
+- The first call of each shape on the device pays its compile. These tables
+  are warm.
+
+Measured on Trn2 (SDK 2.33, one logical core at LNC=2, fp32, warm medians,
+host in to host out). Host threads were pinned to 2 CPUs on two physical
+cores:
+
+"Host" is the host route on two physical cores; the column after it is the
+same on one physical core (both hyperthreads). "Device" is upload + the
+device-resident `auto` route + download. **Bold** is what `auto` now picks.
+
+`mp2_energy`, ms:
+
+| nocc/nvir/naux | work | host | host, 1 core | device |
+|---|---|---|---|---|
+| 8/56/192 | 3.9e7 | **1.4** | 1.7 | 3.1 |
+| 8/80/256 | 1.1e8 | **3.8** | 4.9 | 4.2 |
+| 8/96/256 | 1.5e8 | 5.1 | 6.8 | **4.1** |
+| 16/112/384 | 1.2e9 | 26.0 | 39.0 | **3.7** |
+| 16/240/768 | 1.1e10 | 173 | 253 | **6.5** |
+| 32/224/1024 | 5.3e10 | 646 | 1128 | **16.4** |
+| 48/336/1152 | 3.0e11 | 3697 | 6457 | **47.4** |
+| 64/448/1536 | 1.3e12 | 15849 | 28157 | **135** |
+
+`ao_to_mo_transform`, ms (full `eri` / packed `eri`):
+
+| nbasis/naux/nocc | work | host | host, 1 core | device |
+|---|---|---|---|---|
+| 64/192/8 | 6.3e6 | **1.0** / **1.3** | 1.1 / 1.7 | 5.7 / 6.7 |
+| 128/384/16 | 1.0e8 | **4.7** / 6.7 | 7.4 / 11.0 | 7.5 / **5.3** |
+| 128/512/16 | 1.3e8 | **6.2** / – | 10.1 / 21.7 | 8.9 / **4.1** |
+| 160/480/20 | 2.5e8 | 9.4 / – | 16.3 / 32.9 | **7.1** / **5.1** |
+| 256/512/8 | 2.7e8 | 16.0 / 54.2 | 26.5 / 71.0 | **13.6** / **13.0** |
+| 256/1024/32 | 2.2e9 | 66.6 / 138 | 111 / 198 | **25.7** / **15.7** |
+| 384/1152/48 | 8.2e9 | 211 / 397 | 355 / 571 | **62.2** / **37.9** |
+| 512/1536/64 | 2.6e10 | 574 / 979 | 959 / 1473 | **137** / **79.9** |
+
+`einsum` with host operands, ms:
+
+| contraction | work | MACs per byte | host | host, 1 core | device |
+|---|---|---|---|---|---|
+| `mi,mnP->inP` 128/16/384 | 1.0e8 | 3.6 | **3.2** | 5.5 | 4.4 |
+| `mi,mnP->inP` 256/32/768 | 1.6e9 | 7.1 | 30.5 | 52.4 | **19.7** |
+| `mi,mnP->inP` 512/4/1536 | 1.6e9 | 1.0 | – | 252 | **123** |
+| `iap,jbp->ijab` 16/112/384 | 1.2e9 | 67 | 7.5 | 13.3 | **3.8** |
+| `iaP,PQ->iaQ` 64/448/1536 | 6.8e10 | 187 | 386 | 707 | **31.9** |
+| `abc,cd->abd` 256 | 4.3e9 | 32 | 46.9 | 62.7 | **11.7** |
+| `mi,na,mnP->iaP` 256/32/224/768 (path) | 3.0e9 | 13.5 | – | 90.1 | **19.0** |
+| `ij,ij->ij` 8192² | 6.7e7 | 0.08 | – | **85.8** | 60.3 |
+| `ab,cd->abcd` 160 | 6.6e8 | 0.25 | – | **580** | 199 |
+| `ij,jk->ik` 640³ | 2.6e8 | 53 | **2.3** | 3.7 | 2.6 |
+| `ij,jk->ik` 768³ | 4.5e8 | 66 | **3.4** | 5.6 | 2.7 |
+| `ij,jk->ik` 1024³ | 1.1e9 | 85 | 6.5 | 12.1 | **3.2** |
+
+- Results match the host route to 5e-7 relative (fp32 summation order).
+- On one physical core the host is about 1.7x slower, so the device wins
+  earlier: from 3e7 for the full `eri`, and below 1.3e8 for matmul. The
+  thresholds were set on the faster host, so they are on the host's side.
+- The device floor varied between runs, 1.2 to 2.6 ms for a small matmul.
 
 Kernel status on the native path after #51:
 

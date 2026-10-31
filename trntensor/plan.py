@@ -13,6 +13,7 @@ where many contractions share operands.
 
 from __future__ import annotations
 
+import math
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -269,6 +270,30 @@ def _greedy_path_search(
 
     path.append((0, 1))
     return path
+
+
+def _path_macs(
+    input_list: list[str],
+    output_str: str,
+    size_map: dict[str, int],
+    path: list[tuple[int, int]],
+) -> int:
+    """Multiply-adds of ``path`` (from :func:`_greedy_path_search`): the sum
+    over its binary steps of the product of the pair's index sizes."""
+    inputs = list(input_list)
+    total = 0
+    for step, (i, j) in enumerate(path):
+        pair = set(inputs[i]) | set(inputs[j])
+        total += math.prod(size_map.get(c, 1) for c in pair)
+        if step == len(path) - 1:
+            break
+        surviving = set(output_str)
+        for k, inp in enumerate(inputs):
+            if k not in (i, j):
+                surviving |= set(inp)
+        inter = "".join(sorted(pair & surviving))
+        inputs = [inp for k, inp in enumerate(inputs) if k not in (i, j)] + [inter]
+    return total
 
 
 def _parse_subscripts(subscripts: str) -> tuple[str, str]:

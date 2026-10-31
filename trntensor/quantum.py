@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import torch
 
+from .nki import dispatch as _dispatch
 from .nki.dispatch import _ao_to_mo_route, _mp2_energy_route
 
 
@@ -44,10 +45,17 @@ def mp2_energy(
       ``B`` once each row launch carries at least 3 GFLOP (padded
       ``2·(nocc//2+1)·nvir²·naux``; e.g. ``nocc=32, nvir=320, naux=1024``).
       There it measured 1.25-1.9x faster than aten on Trn2, with the gap
-      growing with size (#51). Smaller problems,
-      and host ``B``, use the aten formulation. ``set_backend("nki")`` uses
-      the row kernel whenever it fits in SBUF. ``TRNTENSOR_MP2_ENERGY=
-      auto|rows|aten|legacy`` overrides the choice.
+      growing with size (#51). Smaller problems use the aten formulation on
+      the device. ``set_backend("nki")`` uses the row kernel whenever it fits
+      in SBUF. ``TRNTENSOR_MP2_ENERGY=auto|rows|aten|legacy`` overrides the
+      choice.
+    - **Host ``B`` under native ``"auto"`` (#56)**: from
+      ``nocc²·nvir²·naux`` of 1.5e8 multiply-adds (times host threads / 2),
+      ``B`` and the orbital energies are uploaded and the device route above
+      runs; the energy comes back as a host scalar. On Trn2 with 2 host threads that took 646 ms ->
+      16 ms at nocc=32, nvir=224, naux=1024 and 15.8 s -> 135 ms at
+      64/448/1536. Smaller problems stay on the host.
+      ``TRNTENSOR_HOST_ROUTE=host|device`` overrides the size test.
     - PyTorch/XLA path (Trn1): the original single-launch kernel.
 
     The aten formulation contracts ``T`` in occupied-index chunks, so its
@@ -75,6 +83,12 @@ def mp2_energy(
     if eps_vir.shape != (nvir,):
         raise ValueError(f"eps_vir must have shape ({nvir},); got {tuple(eps_vir.shape)}")
 
+    if _dispatch._offload_host(
+        nocc * nocc * nvir * nvir * _naux, _dispatch._MP2_HOST_OFFLOAD_MACS, B, eps_occ, eps_vir
+    ):
+        e = _on_device(mp2_energy, B, eps_occ, eps_vir)
+        if e is not None:
+            return e.to(B.device)
     route = _mp2_energy_route(B)
     if route != "aten":
         from .nki import dispatch as _d
@@ -96,6 +110,20 @@ def mp2_energy(
             if route == "rows":
                 _d._note_native_kernel_failure(("mp2", tuple(B.shape)))
     return _cpu_mp2_energy(B, eps_occ, eps_vir)
+
+
+def _on_device(fn, *tensors: torch.Tensor):
+    """``fn`` on the operands uploaded to the ``neuron`` device (#56), or None
+    when that fails (e.g. the device is full), so the caller runs on the host.
+    ``TRNTENSOR_REQUIRE_NKI=1`` re-raises instead."""
+    import os
+
+    try:
+        return fn(*(t.to(_dispatch._NEURON_DEVICE) for t in tensors))
+    except Exception:
+        if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
+            raise
+        return None
 
 
 # Elements of the per-chunk T block (chunk·nocc·nvir²) the aten MP2 path
@@ -214,6 +242,14 @@ def ao_to_mo_transform(
     cross the host link. The aten and legacy routes unpack it with one
     ``index_select`` (exact).
 
+    **Host inputs (#56).** Under native ``"auto"`` with ``eri``, ``C_occ``
+    and ``C_vir`` all on the host, the inputs are uploaded (``eri`` in the
+    layout given), the device route above runs and the result comes back to
+    the host, once the stage-1 work ``nocc·nbasis²·naux`` reaches 2e8
+    multiply-adds for a full ``eri`` or 3e7 for a packed one, times host
+    threads / 2 (packed host input otherwise pays a host unpack). ``TRNTENSOR_HOST_ROUTE=host|device``
+    overrides the size test.
+
     **Host integrals, device orbitals.** When ``eri`` is on the host and
     ``C_occ`` on a Neuron device, ``eri`` is uploaded to that device first
     (the result stays there). Send it packed: the upload runs at the host
@@ -267,6 +303,21 @@ def ao_to_mo_transform(
     _, nocc = C_occ.shape
     _, nvir = C_vir.shape
     packed = eri.dim() == 2
+    if _dispatch._offload_host(
+        nocc * nbasis * nbasis * eri.shape[-1],
+        _dispatch._AO_TO_MO_HOST_OFFLOAD_MACS_PACKED
+        if packed
+        else _dispatch._AO_TO_MO_HOST_OFFLOAD_MACS,
+        eri,
+        C_occ,
+        C_vir,
+    ):
+        # Host in, host out through the device (#56): upload the orbitals
+        # here and the integrals below (in the caller's layout), run the
+        # device route, download into cached host memory.
+        out = _on_device(lambda co, cv: ao_to_mo_transform(eri, co, cv), C_occ, C_vir)
+        if out is not None:
+            return _dispatch._to_host(out, "cpu")
     if eri.device.type == "cpu" and C_occ.device.type != "cpu":
         # Upload in the caller's layout: PySCF's (naux, npair) goes up as is
         # (a host-side transpose would cost more than the upload saves).

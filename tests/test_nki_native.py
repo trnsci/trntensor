@@ -286,3 +286,93 @@ class TestNativeTrn2Kernels:
             trntensor.set_backend(prev)
         assert calls.count("mp2_energy_row") == 32
         assert calls.count("ao_to_mo_trn2") == 1
+
+
+class TestHostInputRouting:
+    """#56: host inputs under "auto" upload, run on the device, and return on
+    the host with the host route's result."""
+
+    @pytest.fixture(autouse=True)
+    def _auto(self, monkeypatch):
+        import trntensor
+
+        for var in ("TRNTENSOR_HOST_ROUTE", "TRNTENSOR_FORCE_BACKEND"):
+            monkeypatch.delenv(var, raising=False)
+        prev = trntensor.get_backend()
+        trntensor.set_backend("auto")
+        yield
+        trntensor.set_backend(prev)
+
+    def _uploads(self, monkeypatch):
+        from trntensor.nki import dispatch
+
+        seen = []
+        real = dispatch._to_host
+
+        def to_host(t, dev):
+            seen.append(t.device.type)
+            return real(t, dev)
+
+        monkeypatch.setattr(dispatch, "_to_host", to_host)
+        return seen
+
+    def _both_routes(self, monkeypatch, fn):
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "host")
+        ref = fn()
+        monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "auto")
+        return ref, fn()
+
+    def test_mp2_energy(self, monkeypatch):
+        import trntensor
+
+        g = torch.Generator().manual_seed(0)
+        B = torch.randn(16, 112, 384, generator=g) * 0.05
+        eo, ev = -1.0 - torch.rand(16, generator=g), 0.5 + torch.rand(112, generator=g)
+        ref, e = self._both_routes(monkeypatch, lambda: trntensor.mp2_energy(B, eo, ev))
+        assert e.device.type == "cpu"
+        torch.testing.assert_close(e, ref, rtol=1e-5, atol=0)
+
+    @pytest.mark.parametrize("layout", ["full", "packed", "cderi"])
+    def test_ao_to_mo_transform(self, monkeypatch, layout):
+        import trntensor
+
+        nb, naux, nocc = 128, 384, 16
+        g = torch.Generator().manual_seed(1)
+        eri = torch.randn(nb, nb, naux, generator=g)
+        eri = (eri + eri.transpose(0, 1)).contiguous()
+        arg = {
+            "full": eri,
+            "packed": trntensor.pack_tril(eri).contiguous(),
+            "cderi": trntensor.pack_tril(eri).t().contiguous(),
+        }[layout]
+        if layout == "full":
+            monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "device")  # below its threshold
+        C_occ, C_vir = torch.randn(nb, nocc, generator=g), torch.randn(nb, nb - nocc, generator=g)
+        ref = trntensor.quantum._cpu_ao_to_mo_transform(eri, C_occ, C_vir)
+        seen = self._uploads(monkeypatch)
+        out = trntensor.ao_to_mo_transform(arg, C_occ, C_vir)
+        assert out.device.type == "cpu" and "neuron" in seen
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-3)
+
+    def test_einsum_generic_and_path(self, monkeypatch):
+        import trntensor
+
+        g = torch.Generator().manual_seed(2)
+        B = torch.randn(16, 112, 384, generator=g)
+        C, X = torch.randn(256, 32, generator=g), torch.randn(256, 224, generator=g)
+        eri = torch.randn(256, 256, 768, generator=g)
+        seen = self._uploads(monkeypatch)
+        for sub, ops in (("iap,jbp->ijab", (B, B)), ("mi,na,mnP->iaP", (C, X, eri))):
+            seen.clear()
+            out = trntensor.einsum(sub, *ops)
+            assert out.device.type == "cpu" and seen == ["neuron"], (sub, seen)
+            torch.testing.assert_close(out, torch.einsum(sub, *ops), rtol=1e-4, atol=1e-3)
+
+    def test_float64_stays_on_host(self, monkeypatch):
+        import trntensor
+
+        A = torch.randn(1024, 1024, dtype=torch.float64)
+        seen = self._uploads(monkeypatch)
+        out = trntensor.einsum("ij,jk->ik", A, A)
+        assert out.dtype == torch.float64 and seen == []
+        torch.testing.assert_close(out, A @ A)
