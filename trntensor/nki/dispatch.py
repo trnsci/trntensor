@@ -883,14 +883,46 @@ def _note_native_kernel_failure(key: tuple) -> None:
 _MP2_ROW_MIN_ROW_FLOP = 3.0e9
 
 
+# Device memory the row kernel's staging may use, relative to the logical
+# core's capacity: leave this much for NEFFs and runtime scratch. With 18 of
+# 24 GiB held at nocc=96, nvir=672, naux=2304 (~1.7 GiB of staging) the kernel
+# ran; with 20 GiB held its staging failed with NRT_RESOURCE and left the
+# runtime thrashing for minutes (#51).
+_MP2_ROW_HEADROOM_BYTES = 3 * 2**30
+
+
+def _mp2_row_staging_bytes(B: torch.Tensor, dims: dict) -> int:
+    nocc = B.shape[0]
+    padded = nocc * dims["nvir_pad"] * dims["naux_pad"] * 4
+    window = (nocc + dims["nd_pad"]) * dims["nvir_pad"] * dims["naux_pad"] * 4
+    return padded + window
+
+
+def _device_has_room(device: torch.device, nbytes: int) -> bool:
+    """False when this process's live device allocations plus ``nbytes`` would
+    leave less than ``_MP2_ROW_HEADROOM_BYTES`` of the device. Live, not
+    reserved: blocks the caching allocator holds free (e.g. the previous call's
+    staging) are reusable. True when the backend does not report memory. It
+    only sees this process's allocations."""
+    try:
+        mod = getattr(torch, _NEURON_DEVICE)
+        idx = device.index if device.index is not None else mod.current_device()
+        total = mod.get_device_properties(idx).total_memory
+        used = mod.memory_allocated(idx)
+    except Exception:
+        return True
+    return used + nbytes <= total - _MP2_ROW_HEADROOM_BYTES
+
+
 def _mp2_energy_route(B: torch.Tensor) -> str:
     """'rows', 'legacy' or 'aten' for :func:`trntensor.quantum.mp2_energy`.
 
     XLA path / simulator: 'legacy' (the original kernel) whenever NKI is in
     use, as before. Native path: device-resident ``B`` uses the row kernel
     when it fits in SBUF and each row launch carries at least
-    ``_MP2_ROW_MIN_ROW_FLOP``, else aten; ``set_backend("nki")`` uses the row
-    kernel whenever it fits. Host ``B`` under ``"auto"`` stays on aten on the
+    ``_MP2_ROW_MIN_ROW_FLOP`` and the device has room for its input staging,
+    else aten; ``set_backend("nki")`` uses the row kernel whenever it fits in
+    SBUF. Host ``B`` under ``"auto"`` stays on aten on the
     host.
     """
     if not (_use_nki() and HAS_NKI):
@@ -910,7 +942,9 @@ def _mp2_energy_route(B: torch.Tensor) -> str:
         return "rows" if fits else "aten"
     if B.device.type != _NEURON_DEVICE or ("mp2", tuple(B.shape)) in _native_kernel_failed:
         return "aten"
-    return "rows" if fits and dims["row_flop"] >= _MP2_ROW_MIN_ROW_FLOP else "aten"
+    if not fits or dims["row_flop"] < _MP2_ROW_MIN_ROW_FLOP:
+        return "aten"
+    return "rows" if _device_has_room(B.device, _mp2_row_staging_bytes(B, dims)) else "aten"
 
 
 def _mp2_row_feeds(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor, dims: dict):

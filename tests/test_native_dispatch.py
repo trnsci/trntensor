@@ -692,6 +692,31 @@ class TestNativeKernelRetirement:
         assert attempts == [1]
         assert dispatch._mp2_energy_route(B) == "aten"
 
+    def test_mp2_route_needs_device_room_under_auto(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        large = torch.empty(64, 448, 1536, device="meta")
+        monkeypatch.setattr(dispatch, "_device_has_room", lambda dev, n: False)
+        assert dispatch._mp2_energy_route(large) == "aten"
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._mp2_energy_route(large) == "rows"
+
+    def test_device_has_room_reads_allocated_memory(self, monkeypatch):
+        import types as _t
+
+        fake = _t.SimpleNamespace(
+            current_device=lambda: 0,
+            get_device_properties=lambda i: _t.SimpleNamespace(total_memory=24 * 2**30),
+            memory_allocated=lambda i: 20 * 2**30,
+        )
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "fakedev")
+        monkeypatch.setattr(torch, "fakedev", fake, raising=False)
+        dev = torch.device("cpu")
+        assert dispatch._device_has_room(dev, 2**30) is True
+        assert dispatch._device_has_room(dev, 2 * 2**30) is False
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "nosuchdev")
+        assert dispatch._device_has_room(dev, 10**15) is True
+
     def test_ao_to_mo_route(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
         monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
