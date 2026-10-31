@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-10-31
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: new native MP2-energy and AO→MO kernels beat aten by 1.25–1.9× and 1.3–1.6× in the `auto` region; native NKI matmul/bmm kernels deprecated (#52).
+
 Resolves #51: on the native TorchNeuron path (Trn2/Trn3), the AO→MO and MP2-energy kernels are rewritten for Trn2 and now beat aten, and the NKI matmul/bmm kernels are retired in favour of aten.
 
 ### Added
