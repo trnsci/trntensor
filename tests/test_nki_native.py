@@ -96,7 +96,14 @@ class TestNativeDispatch:
 
     def test_ops_registered_in_torch_ops(self):
         _ops()
-        for name in ("matmul", "batched_matmul", "mp2_energy", "ao_to_mo_transform"):
+        for name in (
+            "matmul",
+            "batched_matmul",
+            "mp2_energy",
+            "ao_to_mo_transform",
+            "mp2_energy_row",
+            "ao_to_mo_trn2",
+        ):
             assert hasattr(torch.ops.trntensor, name)
 
     def test_matmul_op_eager_matches_reference(self):
@@ -174,3 +181,58 @@ class TestNativeDispatch:
         torch.testing.assert_close(
             E, _cpu_mp2_energy(B_ref, eps_occ, eps_vir), atol=1e-3, rtol=1e-4
         )
+
+
+class TestNativeTrn2Kernels:
+    """#51: the Trn2 AO→MO and MP2 row kernels on hardware (LNC=1 and LNC=2)."""
+
+    @pytest.mark.parametrize("nbasis,nocc,nvir,naux", [(128, 8, 120, 128), (256, 32, 200, 512)])
+    def test_ao_to_mo_trn2_matches_reference(self, nbasis, nocc, nvir, naux):
+        from trntensor.nki import dispatch
+
+        g = torch.Generator().manual_seed(nbasis)
+        eri = torch.randn(nbasis, nbasis, naux, generator=g) * 0.1
+        C_occ = torch.randn(nbasis, nocc, generator=g)
+        C_vir = torch.randn(nbasis, nvir, generator=g)
+        out = dispatch._nki_ao_to_mo_trn2(*_dev(eri, C_occ, C_vir))
+        assert out.device.type == "neuron" and out.shape == (nocc, nvir, naux)
+        ref = torch.einsum("na,inP->iaP", C_vir, torch.einsum("mi,mnP->inP", C_occ, eri))
+        torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-4)
+
+    @pytest.mark.parametrize("nocc,nvir,naux", [(1, 64, 100), (5, 128, 256), (8, 200, 300)])
+    def test_mp2_row_kernel_matches_reference(self, nocc, nvir, naux):
+        from trntensor.nki import dispatch
+        from trntensor.quantum import _cpu_mp2_energy
+
+        g = torch.Generator().manual_seed(nocc)
+        B = torch.randn(nocc, nvir, naux, generator=g) * 0.05
+        eo = -torch.rand(nocc, generator=g) - 1.0
+        ev = torch.rand(nvir, generator=g) + 0.5
+        e = dispatch._nki_mp2_energy_rows(*_dev(B, eo, ev))
+        ref = _cpu_mp2_energy(B.double(), eo.double(), ev.double())
+        assert abs(float(e.cpu()) - float(ref)) <= 1e-5 * abs(float(ref))
+
+    def test_auto_routes_large_problems_to_trn2_kernels(self, monkeypatch):
+        import trntensor
+        from trntensor.nki import dispatch
+
+        calls = []
+        ops = dict(_ops())
+        for name in ("mp2_energy_row", "ao_to_mo_trn2"):
+            fn = ops[name]
+            ops[name] = lambda *a, _fn=fn, _n=name, **k: calls.append(_n) or _fn(*a, **k)
+        monkeypatch.setattr(dispatch, "_native_ops", ops)
+        prev = trntensor.get_backend()
+        trntensor.set_backend("auto")
+        try:
+            B = torch.randn(32, 320, 1024) * 0.05
+            eo, ev = -torch.rand(32) - 1.0, torch.rand(320) + 0.5
+            trntensor.mp2_energy(*_dev(B, eo, ev))
+            eri = torch.randn(256, 256, 512) * 0.1
+            trntensor.ao_to_mo_transform(*_dev(eri, torch.randn(256, 32), torch.randn(256, 200)))
+            # Small MP2 stays on aten.
+            trntensor.mp2_energy(*_dev(B[:4, :32, :64].contiguous(), eo[:4], ev[:32]))
+        finally:
+            trntensor.set_backend(prev)
+        assert calls.count("mp2_energy_row") == 32
+        assert calls.count("ao_to_mo_trn2") == 1

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from .nki.dispatch import _use_fused_kernel
+from .nki.dispatch import _ao_to_mo_route, _mp2_energy_route
 
 
 def mp2_energy(
@@ -34,15 +34,24 @@ def mp2_energy(
         T_{ijab}  = Σ_P B[i,a,P] B[j,b,P]
         Δ_{ijab}  = ε_i + ε_j - ε_a - ε_b
 
-    The fused NKI kernel computes the entire sum in one dispatch:
-    contraction accumulates in PSUM, the spin-adapted numerator and
-    denominator are built in SBUF, and the final reduction folds into a
-    scalar accumulator — no intermediate ``T`` tensor is ever materialized
-    to HBM. It runs on the PyTorch/XLA path and whenever NKI is forced
-    (``set_backend("nki")``). On the native TorchNeuron path ``"auto"`` uses
-    the aten formulation on the operands' device instead, which measured as
-    fast or faster on Trn2 (#41). The aten formulation contracts ``T`` in
-    occupied-index chunks, so its peak memory is bounded.
+    On Trainium the contraction, the spin-adapted numerator, the
+    denominator and the reduction run inside NKI kernels: ``T`` accumulates
+    in PSUM, is folded on the Vector Engine and never reaches device memory.
+
+    - Native TorchNeuron path (Trn2/Trn3): the row kernel
+      (``mp2_energy_row_kernel``, one launch per occupied row, pair symmetry,
+      both physical cores at LNC=2). ``"auto"`` uses it for device-resident
+      ``B`` once each row launch carries at least 3 GFLOP (padded
+      ``2·(nocc//2+1)·nvir²·naux``; e.g. ``nocc=32, nvir=320, naux=1024``).
+      There it measured 1.25-1.9x faster than aten on Trn2, with the gap
+      growing with size (#51). Smaller problems,
+      and host ``B``, use the aten formulation. ``set_backend("nki")`` uses
+      the row kernel whenever it fits in SBUF. ``TRNTENSOR_MP2_ENERGY=
+      auto|rows|aten|legacy`` overrides the choice.
+    - PyTorch/XLA path (Trn1): the original single-launch kernel.
+
+    The aten formulation contracts ``T`` in occupied-index chunks, so its
+    peak memory is bounded.
 
     Parameters
     ----------
@@ -66,16 +75,26 @@ def mp2_energy(
     if eps_vir.shape != (nvir,):
         raise ValueError(f"eps_vir must have shape ({nvir},); got {tuple(eps_vir.shape)}")
 
-    if _use_fused_kernel():
-        from .nki.dispatch import _nki_mp2_energy
+    route = _mp2_energy_route(B)
+    if route != "aten":
+        from .nki import dispatch as _d
 
         try:
-            return _nki_mp2_energy(B, eps_occ, eps_vir)
+            if route == "rows":
+                return _d._nki_mp2_energy_rows(B, eps_occ, eps_vir)
+            if _d._on_native_path():
+                _d._warn_native_kernel_deprecated(
+                    "original mp2_energy",
+                    "the Trn2 row kernel replaces it (TRNTENSOR_MP2_ENERGY=rows)",
+                )
+            return _d._nki_mp2_energy(B, eps_occ, eps_vir)
         except Exception:
             import os
 
             if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
                 raise
+            if route == "rows":
+                _d._note_native_kernel_failure(("mp2", tuple(B.shape)))
     return _cpu_mp2_energy(B, eps_occ, eps_vir)
 
 
@@ -123,14 +142,21 @@ def ao_to_mo_transform(
 
         B[i, a, P] = Σ_{μ, ν} C_occ[μ, i] · C_vir[ν, a] · eri[μ, ν, P]
 
-    as the canonical chemistry primitive. On Trainium, this is one NKI
-    program: the first matmul's result lives in SBUF as an intermediate
-    ``(i, ν)`` tile that feeds the second matmul directly — no
-    intermediate four-index tensor is materialized to HBM. The kernel runs
-    on the PyTorch/XLA path and whenever NKI is forced; on the native
-    TorchNeuron path ``"auto"`` uses the two-step aten contraction below,
-    which measured 6-20x faster on Trn2 (#41). Without NKI the fallback is
-    the same two-step contraction.
+    as the canonical chemistry primitive, one NKI program on Trainium.
+
+    - Native TorchNeuron path (Trn2/Trn3): ``ao_to_mo_trn2_kernel``. Both
+      stages are plain GEMMs with the contraction index on the partition
+      axis (no DMA transposes), and the auxiliary index is split across both
+      physical cores at LNC=2. ``"auto"`` uses it for device-resident ``eri``
+      with ``nocc ≤ 128`` when its SBUF working set fits and the stage-1
+      work ``nocc·nbasis²·naux`` is at least 5e8 multiply-adds (about
+      nbasis ≥ 256). There it measured 1.3-1.6x faster than the two aten
+      einsums on Trn2 (#51). Otherwise the
+      two-step aten contraction below runs. ``TRNTENSOR_AO_TO_MO=
+      auto|trn2|aten|legacy`` overrides the choice.
+    - PyTorch/XLA path (Trn1): the original kernel (``nocc ≤ 128``).
+
+    Without NKI the fallback is the same two-step contraction.
 
     Composes with :func:`mp2_energy`: ``B = ao_to_mo_transform(eri, C_occ,
     C_vir)`` then ``E = mp2_energy(B, eps_occ, eps_vir)`` is the full
@@ -165,25 +191,34 @@ def ao_to_mo_transform(
     _, nocc = C_occ.shape
     _, nvir = C_vir.shape
 
-    if _use_fused_kernel():
-        from .nki.dispatch import _nki_ao_to_mo_transform
+    route = _ao_to_mo_route(eri, nocc, nvir)
+    if route != "aten":
+        from .nki import dispatch as _d
 
-        # Tiled over ν (step 1) and a (step 2); K-tiled over μ/ν. The
-        # dispatcher pads nbasis to a TILE_K and nvir to a TILE_N multiple.
-        # NOCC ≤ 128: stationary M dim of the step-2 nc_matmul; M-tiling
-        # not yet implemented.
-        if nocc > 128:
+        # The original kernel: NOCC ≤ 128 is the stationary M dim of its
+        # step-2 nc_matmul; M-tiling not implemented. (The Trn2 kernel's
+        # route already requires nocc ≤ 128.)
+        if route == "legacy" and nocc > 128:
             raise NotImplementedError(
                 f"ao_to_mo_transform NKI path requires nocc ≤ 128 "
                 f"(got nocc={nocc}); M-tiling not yet implemented."
             )
         try:
-            return _nki_ao_to_mo_transform(eri, C_occ, C_vir)
+            if route == "trn2":
+                return _d._nki_ao_to_mo_trn2(eri, C_occ, C_vir)
+            if _d._on_native_path():
+                _d._warn_native_kernel_deprecated(
+                    "original ao_to_mo_transform",
+                    "the Trn2 kernel replaces it (TRNTENSOR_AO_TO_MO=trn2)",
+                )
+            return _d._nki_ao_to_mo_transform(eri, C_occ, C_vir)
         except Exception:
             import os
 
             if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
                 raise
+            if route == "trn2":
+                _d._note_native_kernel_failure(("ao2mo", tuple(eri.shape), nocc, nvir))
     return _cpu_ao_to_mo_transform(eri, C_occ, C_vir)
 
 

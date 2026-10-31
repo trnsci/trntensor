@@ -76,10 +76,39 @@ def ao_to_mo_transform(eri: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tens
     return _k.ao_to_mo_transform_kernel(eri, C_occ, C_vir)
 
 
+@nki_op(
+    "trntensor::mp2_energy_row",
+    mutates_args={},
+    fake_fn=lambda bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row: bt_i.new_empty(
+        (128, Bw.shape[0]), dtype=torch.float32
+    ),
+)
+def mp2_energy_row(
+    bt_i: torch.Tensor,
+    Bw: torch.Tensor,
+    eps_occ_i: torch.Tensor,
+    eps_occ_w: torch.Tensor,
+    eps_vir_col: torch.Tensor,
+    eps_vir_row: torch.Tensor,
+) -> torch.Tensor:
+    return _k.mp2_energy_row_kernel(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row)
+
+
+@nki_op(
+    "trntensor::ao_to_mo_trn2",
+    mutates_args={},
+    fake_fn=lambda eri, C_occ, C_vir: eri.new_empty((C_occ.shape[1], C_vir.shape[1], eri.shape[2])),
+)
+def ao_to_mo_trn2(eri: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tensor) -> torch.Tensor:
+    return _k.ao_to_mo_trn2_kernel(eri, C_occ, C_vir)
+
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "matmul": matmul,
     "batched_matmul": batched_matmul,
     "mp2_energy": mp2_energy,
     "ao_to_mo_transform": ao_to_mo_transform,
+    "mp2_energy_row": mp2_energy_row,
+    "ao_to_mo_trn2": ao_to_mo_trn2,
 }

@@ -58,6 +58,34 @@ KERNEL_INPUTS = {
             lambda: ((_r(512, 512, 2), _r(512, 10), _r(512, 1024)), {}),
         ),
     ],
+    # Native Trn2 kernels (#51): gridless, split by num_programs at lnc=2.
+    "mp2_energy_row_kernel": [
+        # (B[i].T, window (ND, naux, nvir), eps_i (1,1), eps window (1,ND), eps_vir col/row)
+        (
+            "nd4_naux256_nvir256",
+            lambda: (
+                (_r(256, 256), _r(4, 256, 256), _r(1, 1), _r(1, 4), _r(256, 1), _r(1, 256)),
+                {},
+            ),
+        ),
+        (
+            "nd2_naux384_nvir640",
+            lambda: (
+                (_r(384, 640), _r(2, 384, 640), _r(1, 1), _r(1, 2), _r(640, 1), _r(1, 640)),
+                {},
+            ),
+        ),
+    ],
+    "ao_to_mo_trn2_kernel": [
+        (
+            "nb256_nocc32_nvir256_naux512",
+            lambda: ((_r(256, 256, 512), _r(256, 32), _r(256, 256)), {}),
+        ),
+        (
+            "nb128_nocc8_nvir128_naux128",
+            lambda: ((_r(128, 128, 128), _r(128, 8), _r(128, 128)), {}),
+        ),
+    ],
 }
 
 

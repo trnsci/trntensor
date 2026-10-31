@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Resolves #51: on the native TorchNeuron path (Trn2/Trn3), the AO→MO and MP2-energy kernels are rewritten for Trn2 and now beat aten, and the NKI matmul/bmm kernels are retired in favour of aten.
+
+### Added
+
+- **`mp2_energy_row_kernel`, the native MP2-energy kernel (#51).**
+  - One launch per occupied row, using the pair symmetry `e_ij = e_ji`.
+  - Per pair, one GEMM fills `T` in SBUF; the `Tᵀ` blocks are Tensor Engine transposes. `T` never reaches device memory.
+  - Gridless launch: at LNC=2 each physical core takes half of the `j` window (`num_programs()` / `program_id`), and it also runs at LNC=1.
+  - The design follows trnblas `pair_energy_sym` (trnblas#55, #58).
+  - Native `"auto"` uses it for device-resident `B` once each row launch carries at least 3 GFLOP. On Trn2 it measured 1.25–1.9× faster than aten: for example 0.69 s against 1.30 s at `nocc=96, nvir=672, naux=2304`.
+  - Near a full device the kernel's input staging (about 1.5× the padded `B`) needs more memory than aten's 64 MiB chunks. `"auto"` keeps aten when live allocations plus that staging would leave less than 3 GiB of the core free, and remembers shapes whose launch failed.
+  - `TRNTENSOR_MP2_ENERGY=auto|rows|aten|legacy` overrides the choice.
+- **`ao_to_mo_trn2_kernel`, the native AO→MO kernel (#51).**
+  - Two plain GEMM stages with the contraction index on the partition axis, so there are no DMA transposes.
+  - The auxiliary index is split across both physical cores at LNC=2.
+  - Native `"auto"` uses it for device-resident `eri` with `nocc ≤ 128` and stage-1 work of at least 5e8 multiply-adds (about nbasis ≥ 256). There it measured 1.3–1.6× faster than the two aten einsums on Trn2, at nbasis 256–768. Smaller problems stay on aten.
+  - `TRNTENSOR_AO_TO_MO=auto|trn2|aten|legacy` overrides the choice.
+- `scripts/bench_native_kernels.py`: a kernel-level A/B harness (aten against the original and the Trn2 kernels), with `--hold-gb` for the memory-pressure regime of aws-neuron-sdk#1447.
+
+### Deprecated
+
+- **On the native path, the NKI `matmul` / `batched_matmul` kernels and the original `mp2_energy` / `ao_to_mo_transform` kernels (#51).** `set_backend("nki")` still runs the matmul/bmm kernels there, with a one-time `FutureWarning`; a later release will route them to aten.
+  - A Trn2 rewrite of matmul used both cores, Tensor Engine transposes and B-tile reuse. It was 1.2–4.3× faster than the original kernel, but still slower than aten at every size (4096³ fp32: 4.10 ms against 3.80 ms; bf16: 1.61 ms against 1.43 ms). It was not kept.
+  - Native `"auto"` already used aten for these.
+  - The XLA path (Trn1) keeps all four original kernels unchanged and does not warn.
+
+### Changed
+
+- Under `set_backend("nki")` on the native path, `mp2_energy` and `ao_to_mo_transform` run the Trn2 kernels instead of the original ones.
+
 ## [0.18.0] — 2026-10-30
 
 Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.

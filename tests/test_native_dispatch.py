@@ -23,7 +23,14 @@ from trntensor.nki import _kernels, dispatch
 
 _REAL_FIND_SPEC = importlib.util.find_spec
 
-EXPECTED_OPS = {"matmul", "batched_matmul", "mp2_energy", "ao_to_mo_transform"}
+EXPECTED_OPS = {
+    "matmul",
+    "batched_matmul",
+    "mp2_energy",
+    "ao_to_mo_transform",
+    "mp2_energy_row",
+    "ao_to_mo_trn2",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +129,8 @@ def native_host(monkeypatch):
         "batched_matmul_kernel",
         "mp2_energy_kernel",
         "ao_to_mo_transform_kernel",
+        "mp2_energy_row_kernel",
+        "ao_to_mo_trn2_kernel",
     ):
         monkeypatch.setattr(_kernels, kname, no_raw_kernel, raising=False)
     # Force NKI: under "auto" the native path runs the fused quantum
@@ -364,21 +373,66 @@ class TestPublicApiOnNativePath:
         assert [o.shape for o in outs] == [(64, 16), (64, 8)]
         assert [c[0] for c in native_host] == ["matmul", "matmul"]
 
-    def test_ao_to_mo_transform_routes_and_slices(self, native_host, monkeypatch):
+    def test_ao_to_mo_transform_routes_to_trn2_op(self, native_host, monkeypatch):
+        def ao_to_mo(eri, C_occ, C_vir):
+            assert eri.shape[0] % 128 == 0 and eri.shape[2] % 128 == 0
+            assert C_vir.shape[1] % 128 == 0
+            return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+
+        _install_ops(monkeypatch, native_host, ao_to_mo_trn2=ao_to_mo)
+        torch.manual_seed(0)
+        eri, C_occ, C_vir = torch.randn(40, 40, 6), torch.randn(40, 5), torch.randn(40, 9)
+        out = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        assert out.shape == (5, 9, 6)
+        torch.testing.assert_close(
+            out, torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri), atol=1e-4, rtol=1e-4
+        )
+        assert [c[0] for c in native_host] == ["ao_to_mo_trn2"]
+
+    def test_ao_to_mo_transform_legacy_routes_and_slices(self, native_host, monkeypatch):
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
+        monkeypatch.setattr(dispatch, "_native_kernel_deprecations_emitted", set())
+
         def ao_to_mo(eri, C_occ, C_vir):
             return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
 
         _install_ops(monkeypatch, native_host, ao_to_mo_transform=ao_to_mo)
         torch.manual_seed(0)
         eri, C_occ, C_vir = torch.randn(40, 40, 6), torch.randn(40, 5), torch.randn(40, 9)
-        out = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        with pytest.warns(FutureWarning, match="deprecated on the native"):
+            out = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
         torch.testing.assert_close(
             out, torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri), atol=1e-4, rtol=1e-4
         )
         assert [c[0] for c in native_host] == ["ao_to_mo_transform"]
 
-    def test_mp2_energy_routes_to_op(self, native_host, monkeypatch):
+    def test_mp2_energy_routes_to_row_op(self, native_host, monkeypatch):
         from trntensor.quantum import _cpu_mp2_energy
+
+        def row(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row):
+            # Torch stand-in: per-partition partials (128, ND), all in row 0.
+            out = torch.zeros(128, Bw.shape[0])
+            for d in range(Bw.shape[0]):
+                T = bt_i.T @ Bw[d]
+                denom = eps_occ_i[0, 0] + eps_occ_w[0, d] - eps_vir_col - eps_vir_row
+                out[0, d] = (T * (2 * T - T.T) / denom).sum()
+            return out
+
+        _install_ops(monkeypatch, native_host, mp2_energy_row=row)
+        torch.manual_seed(1)
+        nocc, nvir, naux = 5, 7, 10
+        B = torch.randn(nocc, nvir, naux) * 0.1
+        eps_occ = -torch.rand(nocc) - 0.5
+        eps_vir = torch.rand(nvir) + 0.1
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(e, _cpu_mp2_energy(B, eps_occ, eps_vir), atol=1e-5, rtol=1e-4)
+        assert [c[0] for c in native_host] == ["mp2_energy_row"] * nocc
+
+    def test_mp2_energy_legacy_routes_to_op(self, native_host, monkeypatch):
+        from trntensor.quantum import _cpu_mp2_energy
+
+        monkeypatch.setenv("TRNTENSOR_MP2_ENERGY", "legacy")
+        monkeypatch.setattr(dispatch, "_native_kernel_deprecations_emitted", set())
 
         def mp2(B_T, eps_occ_b, eps_vir, eps_vir_b):
             # Torch stand-in on the kernel's padded, transposed layout.
@@ -399,7 +453,8 @@ class TestPublicApiOnNativePath:
         B = torch.randn(nocc, nvir, naux) * 0.1
         eps_occ = -torch.rand(nocc) - 0.5
         eps_vir = torch.rand(nvir) + 0.1
-        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        with pytest.warns(FutureWarning, match="deprecated on the native"):
+            e = trntensor.mp2_energy(B, eps_occ, eps_vir)
         torch.testing.assert_close(e, _cpu_mp2_energy(B, eps_occ, eps_vir), atol=1e-5, rtol=1e-4)
         assert [c[0] for c in native_host] == ["mp2_energy"]
 
@@ -544,6 +599,165 @@ class TestNativeRoute:
         monkeypatch.setattr(dispatch, "_backend", "auto")
         monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
         assert dispatch._use_fused_kernel() is True
+
+
+class TestNativeKernelRetirement:
+    """#51: native policy for the matmul/bmm/AO→MO kernels and the MP2 row kernel."""
+
+    @pytest.fixture(autouse=True)
+    def _native(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_native_kernel_deprecations_emitted", set())
+        monkeypatch.setattr(dispatch, "_native_kernel_failed", set())
+        monkeypatch.setattr(dispatch, "_gc_may_free", True)
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.delenv("TRNTENSOR_FORCE_BACKEND", raising=False)
+        monkeypatch.delenv("TRNTENSOR_MP2_ENERGY", raising=False)
+
+    def _forced_matmul(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE", 0)
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE_PINNED", 0)
+        monkeypatch.setattr(dispatch, "_launch", lambda k, name, a, b, **kw: a @ b)
+        for name in ("matmul_kernel", "batched_matmul_kernel"):
+            monkeypatch.setattr(_kernels, name, None, raising=False)
+
+    def test_forced_native_matmul_warns_once(self, monkeypatch):
+        self._forced_matmul(monkeypatch)
+        A, B = torch.randn(128, 128), torch.randn(128, 128)
+        with pytest.warns(FutureWarning, match="matmul kernel is deprecated"):
+            dispatch.nki_matmul(A, B)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            dispatch.nki_matmul(A, B)
+        with pytest.warns(FutureWarning, match="batched_matmul kernel is deprecated"):
+            dispatch.nki_batched_matmul(A[None], B[None])
+
+    def test_xla_matmul_does_not_warn(self, monkeypatch):
+        self._forced_matmul(monkeypatch)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            dispatch.nki_matmul(torch.randn(128, 128), torch.randn(128, 128))
+
+    def test_mp2_route_auto_by_row_work(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        small = torch.empty(16, 128, 512, device="meta")
+        large = torch.empty(64, 448, 1536, device="meta")
+        assert dispatch._mp2_energy_route(small) == "aten"
+        assert dispatch._mp2_energy_route(large) == "rows"
+        # Host B stays on aten under auto.
+        assert dispatch._mp2_energy_route(torch.empty(64, 448, 1536)) == "aten"
+        # Forced NKI: the row kernel whenever it fits in SBUF.
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._mp2_energy_route(small) == "rows"
+        too_big = torch.empty(8, 1024, 4096, device="meta")
+        assert dispatch._mp2_row_dims(*too_big.shape)["sbuf_bytes"] > dispatch._MP2_ROW_SBUF_BUDGET
+        assert dispatch._mp2_energy_route(too_big) == "aten"
+
+    def test_mp2_route_env_override_and_xla(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        B = torch.empty(4, 8, 8)
+        monkeypatch.setenv("TRNTENSOR_MP2_ENERGY", "legacy")
+        assert dispatch._mp2_energy_route(B) == "legacy"
+        monkeypatch.setenv("TRNTENSOR_MP2_ENERGY", "bogus")
+        with pytest.raises(ValueError, match="TRNTENSOR_MP2_ENERGY"):
+            dispatch._mp2_energy_route(B)
+        monkeypatch.delenv("TRNTENSOR_MP2_ENERGY")
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        assert dispatch._mp2_energy_route(B) == "legacy"
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: False)
+        assert dispatch._mp2_energy_route(B) == "aten"
+
+    def test_failed_kernel_shape_falls_back_and_is_remembered(self, monkeypatch):
+        from trntensor.quantum import _cpu_mp2_energy
+
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
+        monkeypatch.setattr(dispatch, "_MP2_ROW_MIN_ROW_FLOP", 0)
+        monkeypatch.delenv("TRNTENSOR_REQUIRE_NKI", raising=False)
+        attempts = []
+
+        def oom(*a, **k):
+            attempts.append(1)
+            raise RuntimeError("NRT_RESOURCE")
+
+        monkeypatch.setattr(dispatch, "_nki_mp2_energy_rows", oom)
+        B = torch.randn(4, 8, 16) * 0.1
+        eo, ev = -torch.rand(4) - 1.0, torch.rand(8) + 0.5
+        for _ in range(3):
+            torch.testing.assert_close(trntensor.mp2_energy(B, eo, ev), _cpu_mp2_energy(B, eo, ev))
+        assert attempts == [1]
+        assert dispatch._mp2_energy_route(B) == "aten"
+
+    def test_mp2_route_needs_device_room_under_auto(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        large = torch.empty(64, 448, 1536, device="meta")
+        monkeypatch.setattr(dispatch, "_device_has_room", lambda dev, n: False)
+        assert dispatch._mp2_energy_route(large) == "aten"
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._mp2_energy_route(large) == "rows"
+
+    def test_device_has_room_reads_allocated_memory(self, monkeypatch):
+        import types as _t
+
+        fake = _t.SimpleNamespace(
+            current_device=lambda: 0,
+            get_device_properties=lambda i: _t.SimpleNamespace(total_memory=24 * 2**30),
+            memory_allocated=lambda i: 20 * 2**30,
+        )
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "fakedev")
+        monkeypatch.setattr(torch, "fakedev", fake, raising=False)
+        dev = torch.device("cpu")
+        assert dispatch._device_has_room(dev, 2**30) is True
+        assert dispatch._device_has_room(dev, 2 * 2**30) is False
+        # After a gc pass that freed nothing, later refusals skip the pass.
+        assert dispatch._gc_may_free is False
+        import gc as _gc
+
+        collected = []
+        monkeypatch.setattr(_gc, "collect", lambda: collected.append(1))
+        assert dispatch._device_has_room(dev, 2 * 2**30) is False
+        assert collected == []
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "nosuchdev")
+        assert dispatch._device_has_room(dev, 10**15) is True
+
+    def test_ao_to_mo_route(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        small = torch.empty(128, 128, 256, device="meta")
+        large = torch.empty(256, 256, 512, device="meta")
+        assert dispatch._ao_to_mo_route(small, 16, 112) == "aten"
+        assert dispatch._ao_to_mo_route(large, 32, 224) == "trn2"
+        assert dispatch._ao_to_mo_route(torch.empty(256, 256, 512), 32, 224) == "aten"
+        assert dispatch._ao_to_mo_route(large, 129, 224) == "aten"
+        huge = torch.empty(4096, 4096, 512, device="meta")
+        assert dispatch._ao_to_mo_route(huge, 32, 4000) == "aten"  # SBUF
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._ao_to_mo_route(small, 16, 112) == "trn2"
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
+        assert dispatch._ao_to_mo_route(small, 16, 112) == "legacy"
+
+    @pytest.mark.parametrize("nocc", [1, 2, 5, 6, 7])
+    def test_mp2_row_walk_matches_reference(self, nocc):
+        from trntensor.quantum import _cpu_mp2_energy
+
+        g = torch.Generator().manual_seed(nocc)
+        B = torch.randn(nocc, 20, 40, generator=g, dtype=torch.float64) * 0.1
+        eo = -torch.rand(nocc, generator=g, dtype=torch.float64) - 1.0
+        ev = torch.rand(20, generator=g, dtype=torch.float64) + 0.5
+        dims = dispatch._mp2_row_dims(nocc, 20, 40)
+        assert dims["nd_pad"] % 2 == 0
+        torch.testing.assert_close(
+            dispatch._mp2_row_reference(B, eo, ev).double(),
+            _cpu_mp2_energy(B, eo, ev).double(),
+            rtol=1e-6,
+            atol=1e-9,
+        )
 
 
 class TestResidency:

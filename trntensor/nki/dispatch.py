@@ -299,14 +299,44 @@ def _nki_forced() -> bool:
     return _backend == "nki"
 
 
-def _use_fused_kernel() -> bool:
-    """Whether the fused quantum-chemistry kernels (``mp2_energy``,
-    ``ao_to_mo_transform``) should run under the current settings.
+# Native-path kernel retirement (#51). On Trn2 these trntensor kernels measured
+# slower than aten at every size, including a rewrite with the program_id
+# split and Tensor Engine transposes, so native ``"auto"`` never runs them.
+# ``set_backend("nki")`` still runs them, with a one-time FutureWarning; a
+# later release routes them to aten on the native path. The XLA path (Trn1)
+# keeps them unchanged and does not warn.
+_native_kernel_deprecations_emitted: set[str] = set()
 
-    On the native TorchNeuron path, ``"auto"`` uses the aten formulation:
-    on Trn2 the fused kernels measured slower than aten on the device
-    (AO→MO 6-20x; MP2 energy 1.0-1.5x, parity at best). They still run when
-    NKI is forced. Other paths keep the kernels under ``"auto"``.
+NATIVE_KERNEL_DEPRECATION_MESSAGE = (
+    "trntensor: the NKI {name} kernel is deprecated on the native TorchNeuron "
+    "path (Trn2/Trn3) and will be removed from it in a future release; {why} "
+    "(trnsci/trntensor#51). The PyTorch/XLA path (Trn1) is unaffected. This "
+    "warning is shown once per kernel per process."
+)
+_ATEN_IS_FASTER = (
+    'aten on the neuron device is faster at every measured size, and set_backend("auto") '
+    "already uses it"
+)
+
+
+def _warn_native_kernel_deprecated(name: str, why: str = _ATEN_IS_FASTER) -> None:
+    if name in _native_kernel_deprecations_emitted:
+        return
+    _native_kernel_deprecations_emitted.add(name)
+    warnings.warn(
+        NATIVE_KERNEL_DEPRECATION_MESSAGE.format(name=name, why=why),
+        FutureWarning,
+        stacklevel=3,
+    )
+
+
+def _use_fused_kernel() -> bool:
+    """Whether the fused ``ao_to_mo_transform`` kernel should run under the
+    current settings (``mp2_energy`` routes through :func:`_mp2_energy_route`).
+
+    On the native TorchNeuron path, ``"auto"`` uses the aten formulation
+    (#41, #51); the kernel still runs when NKI is forced. Other paths keep
+    the kernel under ``"auto"``.
     """
     if not (_use_nki() and HAS_NKI):
         return False
@@ -690,6 +720,9 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
         result = torch.matmul(A, B)
         return _stochastic_round_cpu(result, A.dtype) if use_sr else result
 
+    if _on_native_path():
+        _warn_native_kernel_deprecated("matmul")
+
     from ._kernels import matmul_kernel
 
     M_pad = _round_up(M, TILE_M)
@@ -791,6 +824,238 @@ def _nki_mp2_energy(
     return partial.sum()
 
 
+# ── Native MP2 energy: per-row symmetric kernel, both cores at LNC=2 (#51) ──
+#
+# SBUF bytes per partition `mp2_energy_row_kernel` keeps live: B[i].T and
+# B[j].T (NK * NVIR each) plus the T strip block (NA * NVIR), all fp32. Trn2
+# has 192 KiB per partition; leave room for the compiler's temporaries.
+_MP2_ROW_SBUF_BUDGET = 144 * 1024
+
+
+def _mp2_row_dims(nocc: int, nvir: int, naux: int) -> dict:
+    """Padded sizes, j-window length and per-d weights for `mp2_energy_row_kernel`.
+
+    Row i takes j = i + d (mod nocc) for d = 0..nocc//2, so every unordered
+    pair {i, j} is visited by exactly one (i, d), twice for d = nocc/2 when
+    nocc is even. e_ij = e_ji, so off-diagonal d get weight 2 except that
+    doubled d, which gets 1. The window is padded to an even length (one j
+    per LNC=2 program) with weight-0 entries.
+    """
+    nvir_pad = _round_up(nvir, TILE_M)
+    naux_pad = _round_up(naux, TILE_K)
+    half = nocc // 2
+    nd = half + 1
+    nd_pad = nd + (nd % 2)
+    weights = [2.0] * nd_pad
+    weights[0] = 1.0
+    if half > 0 and nocc % 2 == 0:
+        weights[half] = 1.0
+    for d in range(nd, nd_pad):
+        weights[d] = 0.0
+    na, nk = nvir_pad // TILE_M, naux_pad // TILE_K
+    return dict(
+        nvir_pad=nvir_pad,
+        naux_pad=naux_pad,
+        nd_pad=nd_pad,
+        weights=weights,
+        sbuf_bytes=4 * nvir_pad * (2 * nk + na),
+        row_flop=2.0 * nd * nvir_pad * nvir_pad * naux_pad,
+    )
+
+
+# Native `mp2_energy` routing (#51). The row kernel launches once per occupied
+# row, so it pays ~nocc custom-op launch floors and wins only once each row
+# carries enough work. TRNTENSOR_MP2_ENERGY overrides: auto | rows | aten |
+# legacy (the original single-launch kernel; deprecated on the native path).
+_MP2_ENERGY_CHOICES = ("auto", "rows", "aten", "legacy")
+# Shapes whose Trn2 kernel launch failed in this process (e.g. its input
+# staging hit NRT_RESOURCE with the device nearly full). "auto" sends them
+# straight to aten instead of paying the failed attempt again: at nocc=96,
+# nvir=672, naux=2304 with 20 of 24 GB held, each failed attempt cost ~2.3 s
+# on top of aten's 1.3 s (#51).
+_native_kernel_failed: set[tuple] = set()
+
+
+def _note_native_kernel_failure(key: tuple) -> None:
+    _native_kernel_failed.add(key)
+
+
+_MP2_ROW_MIN_ROW_FLOP = 3.0e9
+
+
+# Device memory the row kernel's staging may use, relative to the logical
+# core's capacity: leave this much for NEFFs and runtime scratch. With 18 of
+# 24 GiB held at nocc=96, nvir=672, naux=2304 (~1.7 GiB of staging) the kernel
+# ran; with 20 GiB held its staging failed with NRT_RESOURCE and left the
+# runtime thrashing for minutes (#51).
+_MP2_ROW_HEADROOM_BYTES = 3 * 2**30
+
+
+def _mp2_row_staging_bytes(B: torch.Tensor, dims: dict) -> int:
+    nocc = B.shape[0]
+    padded = nocc * dims["nvir_pad"] * dims["naux_pad"] * 4
+    window = (nocc + dims["nd_pad"]) * dims["nvir_pad"] * dims["naux_pad"] * 4
+    return padded + window
+
+
+# Cleared when a gc pass in `_device_has_room` freed nothing; set again by
+# every row-kernel call (which can leave a collectable cycle behind).
+_gc_may_free = True
+
+
+def _device_has_room(device: torch.device, nbytes: int) -> bool:
+    """False when this process's live device allocations plus ``nbytes`` would
+    leave less than ``_MP2_ROW_HEADROOM_BYTES`` of the device. Live, not
+    reserved: blocks the caching allocator holds free (e.g. the previous call's
+    staging) are reusable. True when the backend does not report memory. It
+    only sees this process's allocations."""
+    try:
+        mod = getattr(torch, _NEURON_DEVICE)
+        idx = device.index if device.index is not None else mod.current_device()
+        total = mod.get_device_properties(idx).total_memory
+        if mod.memory_allocated(idx) + nbytes <= total - _MP2_ROW_HEADROOM_BYTES:
+            return True
+        # The first launch of a kernel shape leaves its inputs in a reference
+        # cycle (measured on TorchNeuron, #51: the ~1 GiB staging buffer at
+        # nocc=96 stays allocated until a gc pass). Collect once and recheck,
+        # unless the last collection freed nothing and no row kernel has run
+        # since (a full gc pass cost ~0.1 s per call with the device full).
+        global _gc_may_free
+        if not _gc_may_free:
+            return False
+        import gc
+
+        before = mod.memory_allocated(idx)
+        gc.collect()
+        after = mod.memory_allocated(idx)
+        _gc_may_free = after < before
+        return after + nbytes <= total - _MP2_ROW_HEADROOM_BYTES
+    except Exception:
+        return True
+
+
+def _mp2_energy_route(B: torch.Tensor) -> str:
+    """'rows', 'legacy' or 'aten' for :func:`trntensor.quantum.mp2_energy`.
+
+    XLA path / simulator: 'legacy' (the original kernel) whenever NKI is in
+    use, as before. Native path: device-resident ``B`` uses the row kernel
+    when it fits in SBUF and each row launch carries at least
+    ``_MP2_ROW_MIN_ROW_FLOP`` and the device has room for its input staging,
+    else aten; ``set_backend("nki")`` uses the row kernel whenever it fits in
+    SBUF. Host ``B`` under ``"auto"`` stays on aten on the
+    host.
+    """
+    if not (_use_nki() and HAS_NKI):
+        return "aten"
+    if not _on_native_path():
+        return "legacy"
+    choice = os.environ.get("TRNTENSOR_MP2_ENERGY", "auto").strip().lower()
+    if choice not in _MP2_ENERGY_CHOICES:
+        raise ValueError(
+            f"TRNTENSOR_MP2_ENERGY must be one of {_MP2_ENERGY_CHOICES}; got {choice!r}"
+        )
+    if choice != "auto":
+        return choice
+    dims = _mp2_row_dims(*B.shape)
+    fits = dims["sbuf_bytes"] <= _MP2_ROW_SBUF_BUDGET
+    if _nki_forced():
+        return "rows" if fits else "aten"
+    if B.device.type != _NEURON_DEVICE or ("mp2", tuple(B.shape)) in _native_kernel_failed:
+        return "aten"
+    if not fits or dims["row_flop"] < _MP2_ROW_MIN_ROW_FLOP:
+        return "aten"
+    return "rows" if _device_has_room(B.device, _mp2_row_staging_bytes(B, dims)) else "aten"
+
+
+def _mp2_row_feeds(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor, dims: dict):
+    """Device operands for `mp2_energy_row_kernel`: B[j].T for j = 0..nocc-1
+    followed by the first ``nd_pad`` again (each row's wrapped j window is then
+    a contiguous slice), the matching eps window and the padded eps_vir column
+    / row. All fp32. B[i].T is a view of the same buffer, so the feed costs
+    about 1.5x the padded B instead of 3x (it matters near the HBM limit)."""
+    nocc, nvir, naux = B.shape
+    nv, na = dims["nvir_pad"], dims["naux_pad"]
+    B = B.float()
+    if (nv, na) != (nvir, naux):
+        Bp = torch.zeros(nocc, nv, na, dtype=B.dtype, device=B.device)
+        Bp[:, :nvir, :naux] = B
+    else:
+        Bp = B
+    nd_pad = dims["nd_pad"]
+    BpT = Bp.permute(0, 2, 1)  # (nocc, naux_pad, nvir_pad) view
+    n_win = nocc + nd_pad
+    reps = -(-n_win // nocc)  # > 2 only when nd_pad > nocc (nocc ≤ 2)
+    if reps <= 2:
+        Bx = torch.cat([BpT, BpT[:nd_pad]], dim=0).contiguous()
+    else:
+        Bx = torch.cat([BpT] * reps, dim=0)[:n_win].contiguous()
+    del Bp, BpT
+    Bt = Bx[:nocc]
+    eo = eps_occ.to(device=B.device, dtype=B.dtype).reshape(1, nocc)
+    ex = torch.cat([eo] * reps, dim=1)[:, :n_win].contiguous()
+    ev = torch.zeros(nv, dtype=B.dtype, device=B.device)
+    ev[:nvir] = eps_vir.to(device=B.device, dtype=B.dtype)
+    return Bt, Bx, eo, ex, ev.reshape(nv, 1).contiguous(), ev.reshape(1, nv).contiguous()
+
+
+def _mp2_row_reference(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor):
+    """fp64 torch emulation of the row kernel's (i, d) walk and weights (CPU tests)."""
+    nocc = B.shape[0]
+    dims = _mp2_row_dims(*B.shape)
+    Bt, Bx, eo, ex, evc, evr = _mp2_row_feeds(B, eps_occ, eps_vir, dims)
+    w = torch.tensor(dims["weights"], dtype=torch.float64)
+    total = torch.zeros((), dtype=torch.float64)
+    for i in range(nocc):
+        for d in range(dims["nd_pad"]):
+            bi, bj = Bt[i].double(), Bx[i + d].double()
+            T = bi.T @ bj
+            denom = float(eo[0, i]) + float(ex[0, i + d]) - evc.double() - evr.double()
+            total = total + w[d] * (T * (2.0 * T - T.T) / denom).sum()
+    return total
+
+
+def _nki_mp2_energy_rows(
+    B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor
+) -> torch.Tensor:
+    """MP2 energy via `mp2_energy_row_kernel`, one launch per occupied row (native).
+
+    Never materializes T (nocc² nvir²) in device memory: each launch holds one
+    B[i].T, one B[j].T and one T strip block in SBUF. Device memory beyond the
+    inputs is the doubled, padded, transposed copy of B (2 * nocc * naux * nvir)
+    and a (128, ND) partial per row.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    nocc = B.shape[0]
+    dims = _mp2_row_dims(*B.shape)
+    if dims["sbuf_bytes"] > _MP2_ROW_SBUF_BUDGET:
+        raise ValueError(
+            f"mp2_energy_row needs {dims['sbuf_bytes']} SBUF bytes per partition "
+            f"(budget {_MP2_ROW_SBUF_BUDGET}) for B of shape {tuple(B.shape)}"
+        )
+    orig = B.device
+    if B.device.type != _NEURON_DEVICE:
+        B = B.to(_NEURON_DEVICE)
+    Bt, Bx, eo, ex, evc, evr = _mp2_row_feeds(B, eps_occ, eps_vir, dims)
+    nd_pad = dims["nd_pad"]
+    op = _get_native_ops()["mp2_energy_row"]
+    global _gc_may_free
+    _gc_may_free = True
+    acc = None
+    for i in range(nocc):
+        p = op(
+            Bt[i],
+            Bx[i : i + nd_pad],
+            eo[:, i : i + 1].contiguous(),
+            ex[:, i : i + nd_pad].contiguous(),
+            evc,
+            evr,
+        )
+        acc = p if acc is None else acc + p
+    w = torch.tensor(dims["weights"], dtype=acc.dtype).to(acc.device)
+    return (acc.sum(0) * w).sum().to(orig)
+
+
 def _nki_ao_to_mo_transform(
     eri: torch.Tensor,
     C_occ: torch.Tensor,
@@ -852,6 +1117,100 @@ def _nki_ao_to_mo_transform(
     return result[:, :nvir, :] if nvir_pad != nvir else result
 
 
+# Native `ao_to_mo_transform` routing (#51). TRNTENSOR_AO_TO_MO overrides:
+# auto | trn2 | aten | legacy (the original per-P kernel; deprecated on the
+# native path).
+_AO_TO_MO_CHOICES = ("auto", "trn2", "aten", "legacy")
+# SBUF bytes per partition `ao_to_mo_trn2_kernel` keeps live (C_occ, C_vir,
+# one stage-1 eri block, one X[i] strip); same budget as the MP2 kernel.
+_AO_TO_MO_SBUF_BUDGET = 144 * 1024
+# Under "auto" the kernel needs stage-1 work nocc·nbasis²·naux of at least
+# this many multiply-adds. Below it, the custom-op launch floor and the
+# padding copies lose to aten: nbasis=128, nocc=16, naux=256 (6.7e7) measured
+# 0.57 ms against 0.49 ms; nbasis=256, nocc=32, naux=512 (1.1e9) 0.92 ms
+# against 1.23 ms (#51).
+_AO_TO_MO_MIN_MACS = 5.0e8
+
+
+def _ao_to_mo_trn2_sbuf_bytes(nbasis: int, nocc: int, nvir: int, naux: int, itemsize: int) -> int:
+    nkb = _round_up(nbasis, TILE_K) // TILE_K
+    nxp = _round_up(naux, TILE_K)
+    tp = 128
+    for cand in (512, 256):
+        if nxp % (2 * cand) == 0:
+            tp = cand
+            break
+    nub = max(1, min(8, 2048 // tp))
+    cols = nkb * (nocc + _round_up(nvir, TILE_M) + nub * tp + tp) + nub * tp
+    return itemsize * cols
+
+
+def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
+    """'trn2', 'legacy' or 'aten' for :func:`trntensor.quantum.ao_to_mo_transform`.
+
+    XLA path / simulator: 'legacy' whenever NKI is in use (unchanged).
+    Native path: the Trn2 kernel for device-resident ``eri`` when
+    ``nocc ≤ 128``, its SBUF working set fits and the stage-1 work reaches
+    ``_AO_TO_MO_MIN_MACS``, else aten; ``set_backend("nki")`` drops the size
+    and residency conditions. Host ``eri``
+    under ``"auto"`` stays on aten on the host.
+    """
+    if not (_use_nki() and HAS_NKI):
+        return "aten"
+    if not _on_native_path():
+        return "legacy" if _use_fused_kernel() else "aten"
+    choice = os.environ.get("TRNTENSOR_AO_TO_MO", "auto").strip().lower()
+    if choice not in _AO_TO_MO_CHOICES:
+        raise ValueError(f"TRNTENSOR_AO_TO_MO must be one of {_AO_TO_MO_CHOICES}; got {choice!r}")
+    if choice != "auto":
+        return choice
+    fits = (
+        nocc <= 128
+        and _ao_to_mo_trn2_sbuf_bytes(eri.shape[0], nocc, nvir, eri.shape[2], eri.element_size())
+        <= _AO_TO_MO_SBUF_BUDGET
+    )
+    if not fits:
+        return "aten"
+    if _nki_forced():
+        return "trn2"
+    if ("ao2mo", tuple(eri.shape), nocc, nvir) in _native_kernel_failed:
+        return "aten"
+    big = nocc * eri.shape[0] ** 2 * eri.shape[2] >= _AO_TO_MO_MIN_MACS
+    return "trn2" if big and eri.device.type == _NEURON_DEVICE else "aten"
+
+
+def _nki_ao_to_mo_trn2(
+    eri: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch ``ao_to_mo_trn2_kernel`` (native path, #51).
+
+    Pads nbasis, nvir and naux to 128 multiples (zero padding contributes
+    nothing) and slices the result back to ``(nocc, nvir, naux)``.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    nbasis, _, naux = eri.shape
+    nocc = C_occ.shape[1]
+    nvir = C_vir.shape[1]
+    nbp, nvp, nxp = _round_up(nbasis, TILE_K), _round_up(nvir, TILE_M), _round_up(naux, TILE_K)
+    if (nbp, nxp) != (nbasis, naux):
+        eri_p = torch.zeros(nbp, nbp, nxp, dtype=eri.dtype, device=eri.device)
+        eri_p[:nbasis, :nbasis, :naux] = eri
+        eri = eri_p
+    if nbp != nbasis:
+        co = torch.zeros(nbp, nocc, dtype=C_occ.dtype, device=C_occ.device)
+        co[:nbasis] = C_occ
+        C_occ = co
+    if (nbp, nvp) != (nbasis, nvir):
+        cv = torch.zeros(nbp, nvp, dtype=C_vir.dtype, device=C_vir.device)
+        cv[:nbasis, :nvir] = C_vir
+        C_vir = cv
+    out = _launch(None, "ao_to_mo_trn2", eri.contiguous(), C_occ.contiguous(), C_vir.contiguous())
+    return out[:, :nvir, :naux] if (nvp, nxp) != (nvir, naux) else out
+
+
 def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
     """Batched 2D matmul ``A @ B`` over a leading batch dim.
 
@@ -874,6 +1233,9 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
         return _aten_on_device(torch.bmm, A, B)
     if route != "nki":
         return torch.bmm(A, B)
+
+    if _on_native_path():
+        _warn_native_kernel_deprecated("batched_matmul")
 
     from ._kernels import batched_matmul_kernel
 
