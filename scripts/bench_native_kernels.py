@@ -5,7 +5,10 @@ over (aws-neuron-sdk#1439), the warm median latency of:
 
     aten      the aten formulation trntensor's native ``auto`` uses
     nki_trn1  the original kernel (the XLA-path kernel, as on main)
-    nki_trn2  the native Trn2 kernel (program_id split, no DMA transposes)
+    tt_auto   the public trntensor entry point under set_backend("auto")
+    nki_trn2  the native Trn2 kernel (program_id split, no DMA transposes);
+              AO→MO and MP2 only. The Trn2 matmul candidate measured in #51
+              lost to aten at every size and was not kept.
 
 Families: matmul, ao2mo, mp2. ``--hold-gb G`` keeps G GB allocated on the
 device during the run (the memory-pressure regime of aws-neuron-sdk#1447).
@@ -80,7 +83,6 @@ def cases_matmul(dtype, sizes):
             {
                 "aten": lambda a, b: torch.matmul(a, b),
                 "nki_trn1": lambda a, b: _ops()["matmul"](a, b),
-                "nki_trn2": lambda a, b: _ops()["matmul_trn2"](a, b),
             },
         )
 
@@ -104,6 +106,7 @@ def cases_ao2mo(dtype, sizes):
         modes = {
             "aten": lambda eri, co, cv: quantum._cpu_ao_to_mo_transform(eri, co, cv),
             "nki_trn2": lambda eri, co, cv: dispatch._nki_ao_to_mo_trn2(eri, co, cv),
+            "tt_auto": lambda eri, co, cv: quantum.ao_to_mo_transform(eri, co, cv),
         }
         if nb <= 128:  # the original kernel compiles for many minutes beyond this
             modes["nki_trn1"] = lambda eri, co, cv: dispatch._nki_ao_to_mo_transform(eri, co, cv)
@@ -132,6 +135,7 @@ def cases_mp2(dtype, sizes):
         modes = {
             "aten": lambda B, eo, ev: quantum._cpu_mp2_energy(B, eo, ev),
             "nki_trn2": lambda B, eo, ev: dispatch._nki_mp2_energy_rows(B, eo, ev),
+            "tt_auto": lambda B, eo, ev: quantum.mp2_energy(B, eo, ev),
         }
         if no <= 32:
             modes["nki_trn1"] = lambda B, eo, ev: dispatch._nki_mp2_energy(B, eo, ev)

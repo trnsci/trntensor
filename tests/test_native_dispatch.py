@@ -23,7 +23,14 @@ from trntensor.nki import _kernels, dispatch
 
 _REAL_FIND_SPEC = importlib.util.find_spec
 
-EXPECTED_OPS = {"matmul", "batched_matmul", "mp2_energy", "ao_to_mo_transform"}
+EXPECTED_OPS = {
+    "matmul",
+    "batched_matmul",
+    "mp2_energy",
+    "ao_to_mo_transform",
+    "mp2_energy_row",
+    "ao_to_mo_trn2",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +129,8 @@ def native_host(monkeypatch):
         "batched_matmul_kernel",
         "mp2_energy_kernel",
         "ao_to_mo_transform_kernel",
+        "mp2_energy_row_kernel",
+        "ao_to_mo_trn2_kernel",
     ):
         monkeypatch.setattr(_kernels, kname, no_raw_kernel, raising=False)
     # Force NKI: under "auto" the native path runs the fused quantum
@@ -364,21 +373,66 @@ class TestPublicApiOnNativePath:
         assert [o.shape for o in outs] == [(64, 16), (64, 8)]
         assert [c[0] for c in native_host] == ["matmul", "matmul"]
 
-    def test_ao_to_mo_transform_routes_and_slices(self, native_host, monkeypatch):
+    def test_ao_to_mo_transform_routes_to_trn2_op(self, native_host, monkeypatch):
+        def ao_to_mo(eri, C_occ, C_vir):
+            assert eri.shape[0] % 128 == 0 and eri.shape[2] % 128 == 0
+            assert C_vir.shape[1] % 128 == 0
+            return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+
+        _install_ops(monkeypatch, native_host, ao_to_mo_trn2=ao_to_mo)
+        torch.manual_seed(0)
+        eri, C_occ, C_vir = torch.randn(40, 40, 6), torch.randn(40, 5), torch.randn(40, 9)
+        out = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        assert out.shape == (5, 9, 6)
+        torch.testing.assert_close(
+            out, torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri), atol=1e-4, rtol=1e-4
+        )
+        assert [c[0] for c in native_host] == ["ao_to_mo_trn2"]
+
+    def test_ao_to_mo_transform_legacy_routes_and_slices(self, native_host, monkeypatch):
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
+        monkeypatch.setattr(dispatch, "_native_kernel_deprecations_emitted", set())
+
         def ao_to_mo(eri, C_occ, C_vir):
             return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
 
         _install_ops(monkeypatch, native_host, ao_to_mo_transform=ao_to_mo)
         torch.manual_seed(0)
         eri, C_occ, C_vir = torch.randn(40, 40, 6), torch.randn(40, 5), torch.randn(40, 9)
-        out = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
+        with pytest.warns(FutureWarning, match="deprecated on the native"):
+            out = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
         torch.testing.assert_close(
             out, torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri), atol=1e-4, rtol=1e-4
         )
         assert [c[0] for c in native_host] == ["ao_to_mo_transform"]
 
-    def test_mp2_energy_routes_to_op(self, native_host, monkeypatch):
+    def test_mp2_energy_routes_to_row_op(self, native_host, monkeypatch):
         from trntensor.quantum import _cpu_mp2_energy
+
+        def row(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row):
+            # Torch stand-in: per-partition partials (128, ND), all in row 0.
+            out = torch.zeros(128, Bw.shape[0])
+            for d in range(Bw.shape[0]):
+                T = bt_i.T @ Bw[d]
+                denom = eps_occ_i[0, 0] + eps_occ_w[0, d] - eps_vir_col - eps_vir_row
+                out[0, d] = (T * (2 * T - T.T) / denom).sum()
+            return out
+
+        _install_ops(monkeypatch, native_host, mp2_energy_row=row)
+        torch.manual_seed(1)
+        nocc, nvir, naux = 5, 7, 10
+        B = torch.randn(nocc, nvir, naux) * 0.1
+        eps_occ = -torch.rand(nocc) - 0.5
+        eps_vir = torch.rand(nvir) + 0.1
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(e, _cpu_mp2_energy(B, eps_occ, eps_vir), atol=1e-5, rtol=1e-4)
+        assert [c[0] for c in native_host] == ["mp2_energy_row"] * nocc
+
+    def test_mp2_energy_legacy_routes_to_op(self, native_host, monkeypatch):
+        from trntensor.quantum import _cpu_mp2_energy
+
+        monkeypatch.setenv("TRNTENSOR_MP2_ENERGY", "legacy")
+        monkeypatch.setattr(dispatch, "_native_kernel_deprecations_emitted", set())
 
         def mp2(B_T, eps_occ_b, eps_vir, eps_vir_b):
             # Torch stand-in on the kernel's padded, transposed layout.
@@ -399,7 +453,8 @@ class TestPublicApiOnNativePath:
         B = torch.randn(nocc, nvir, naux) * 0.1
         eps_occ = -torch.rand(nocc) - 0.5
         eps_vir = torch.rand(nvir) + 0.1
-        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        with pytest.warns(FutureWarning, match="deprecated on the native"):
+            e = trntensor.mp2_energy(B, eps_occ, eps_vir)
         torch.testing.assert_close(e, _cpu_mp2_energy(B, eps_occ, eps_vir), atol=1e-5, rtol=1e-4)
         assert [c[0] for c in native_host] == ["mp2_energy"]
 

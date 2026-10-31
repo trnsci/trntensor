@@ -118,6 +118,8 @@ supported in maintenance mode."
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Force the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. Emit the one-time XLA-path and `to_xla` / `from_xla` deprecation warnings. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting (not trntensor's). Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. Set it with `pip install -e`; the test suite sets it by default. |
+| `TRNTENSOR_MP2_ENERGY=auto\|rows\|aten\|legacy` | Native path: force the `mp2_energy` executor (`rows` = the Trn2 row kernel, `legacy` = the original kernel, deprecated there). |
+| `TRNTENSOR_AO_TO_MO=auto\|trn2\|aten\|legacy` | Native path: force the `ao_to_mo_transform` executor (`trn2` = the Trn2 kernel, `legacy` = the original kernel, deprecated there). |
 | `TRNTENSOR_FORCE_BACKEND=pytorch\|nki\|auto` | Override the backend selection at runtime without calling `set_backend()`. Used by benchmarks to sweep both paths on the same machine. |
 | `TRNTENSOR_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU instead of XLA → NEFF → hardware. Catches Python-trace-level errors without AWS round-trips. MLIR verifier errors remain hardware-only. |
 
@@ -146,15 +148,25 @@ NeuronCore and two host threads, with `scripts/bench_native_einsum.py` and
   The default of 500 M sits between these. A host with more threads moves the
   crossover up. Re-measure on your host with `scripts/autotune_dispatch.py`.
 
-Under `"auto"` on the native path, the fused quantum kernels (`mp2_energy`,
-`ao_to_mo_transform`) also run as aten, because both measured slower than
-aten on the device:
+Kernel status on the native path after #51:
 
-- AO→MO was 6–20× slower.
-- MP2 energy was 1.0–1.5× slower, reaching parity at best.
+- **matmul / bmm: retired in favour of aten.** A Trn2 rewrite used both
+  physical cores through the `program_id` split, Tensor Engine transposes of
+  A and B-tile reuse across four stationaries. It was 1.2–4.3× faster than
+  the original kernel and still slower than aten at every size: 4096³ fp32
+  took 4.10 ms against 3.80 ms, and 4096³ bf16 1.61 ms against 1.43 ms.
+  It was not kept. `set_backend("nki")` still runs the original kernels on
+  the native path, with a one-time `FutureWarning`. A later release will
+  route them to aten.
+- **AO→MO: kept, rewritten for Trn2** (`ao_to_mo_trn2_kernel`). It is
+  1.1–1.6× faster than the two aten einsums at nbasis 128–768, and native
+  `"auto"` uses it for device-resident `eri`.
+- **MP2 energy: kept, rewritten for Trn2** (`mp2_energy_row_kernel`). It is
+  1.25–1.9× faster than aten once each row launch carries at least 3 GFLOP,
+  and native `"auto"` uses it there.
 
-`set_backend("nki")` still runs the NKI kernels. The kernels are unchanged,
-and the XLA path keeps them under `"auto"`.
+The original AO→MO and MP2 kernels remain the XLA-path (Trn1) kernels. See
+[Quantum-chemistry primitives](quantum.md) for the tables.
 
 ## Kernels (internal)
 

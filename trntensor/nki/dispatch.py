@@ -309,28 +309,34 @@ _native_kernel_deprecations_emitted: set[str] = set()
 
 NATIVE_KERNEL_DEPRECATION_MESSAGE = (
     "trntensor: the NKI {name} kernel is deprecated on the native TorchNeuron "
-    "path (Trn2/Trn3) and will be removed from it in a future release; aten on "
-    "the neuron device is faster at every measured size (trnsci/trntensor#51). "
-    'set_backend("auto") already uses aten. The PyTorch/XLA path (Trn1) is '
-    "unaffected. This warning is shown once per kernel per process."
+    "path (Trn2/Trn3) and will be removed from it in a future release; {why} "
+    "(trnsci/trntensor#51). The PyTorch/XLA path (Trn1) is unaffected. This "
+    "warning is shown once per kernel per process."
+)
+_ATEN_IS_FASTER = (
+    'aten on the neuron device is faster at every measured size, and set_backend("auto") '
+    "already uses it"
 )
 
 
-def _warn_native_kernel_deprecated(name: str) -> None:
+def _warn_native_kernel_deprecated(name: str, why: str = _ATEN_IS_FASTER) -> None:
     if name in _native_kernel_deprecations_emitted:
         return
     _native_kernel_deprecations_emitted.add(name)
-    warnings.warn(NATIVE_KERNEL_DEPRECATION_MESSAGE.format(name=name), FutureWarning, stacklevel=3)
+    warnings.warn(
+        NATIVE_KERNEL_DEPRECATION_MESSAGE.format(name=name, why=why),
+        FutureWarning,
+        stacklevel=3,
+    )
 
 
 def _use_fused_kernel() -> bool:
-    """Whether the fused quantum-chemistry kernels (``mp2_energy``,
-    ``ao_to_mo_transform``) should run under the current settings.
+    """Whether the fused ``ao_to_mo_transform`` kernel should run under the
+    current settings (``mp2_energy`` routes through :func:`_mp2_energy_route`).
 
-    On the native TorchNeuron path, ``"auto"`` uses the aten formulation:
-    on Trn2 the fused kernels measured slower than aten on the device
-    (AO→MO 6-20x; MP2 energy 1.0-1.5x, parity at best). They still run when
-    NKI is forced. Other paths keep the kernels under ``"auto"``.
+    On the native TorchNeuron path, ``"auto"`` uses the aten formulation
+    (#41, #51); the kernel still runs when NKI is forced. Other paths keep
+    the kernel under ``"auto"``.
     """
     if not (_use_nki() and HAS_NKI):
         return False
@@ -862,7 +868,7 @@ def _mp2_row_dims(nocc: int, nvir: int, naux: int) -> dict:
 # carries enough work. TRNTENSOR_MP2_ENERGY overrides: auto | rows | aten |
 # legacy (the original single-launch kernel; deprecated on the native path).
 _MP2_ENERGY_CHOICES = ("auto", "rows", "aten", "legacy")
-_MP2_ROW_MIN_ROW_FLOP = 2.0e9
+_MP2_ROW_MIN_ROW_FLOP = 3.0e9
 
 
 def _mp2_energy_route(B: torch.Tensor) -> str:
@@ -896,9 +902,11 @@ def _mp2_energy_route(B: torch.Tensor) -> str:
 
 
 def _mp2_row_feeds(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor, dims: dict):
-    """Device operands for `mp2_energy_row_kernel`: B[j].T stacked twice (each
-    row's j window is then a contiguous slice), the matching eps window and the
-    padded eps_vir column / row. All fp32."""
+    """Device operands for `mp2_energy_row_kernel`: B[j].T for j = 0..nocc-1
+    followed by the first ``nd_pad`` again (each row's wrapped j window is then
+    a contiguous slice), the matching eps window and the padded eps_vir column
+    / row. All fp32. B[i].T is a view of the same buffer, so the feed costs
+    about 1.5x the padded B instead of 3x (it matters near the HBM limit)."""
     nocc, nvir, naux = B.shape
     nv, na = dims["nvir_pad"], dims["naux_pad"]
     B = B.float()
@@ -907,10 +915,18 @@ def _mp2_row_feeds(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor
         Bp[:, :nvir, :naux] = B
     else:
         Bp = B
-    Bt = Bp.permute(0, 2, 1).contiguous()  # (nocc, naux_pad, nvir_pad)
-    Bx = torch.cat([Bt, Bt], dim=0)
+    nd_pad = dims["nd_pad"]
+    BpT = Bp.permute(0, 2, 1)  # (nocc, naux_pad, nvir_pad) view
+    n_win = nocc + nd_pad
+    reps = -(-n_win // nocc)  # > 2 only when nd_pad > nocc (nocc ≤ 2)
+    if reps <= 2:
+        Bx = torch.cat([BpT, BpT[:nd_pad]], dim=0).contiguous()
+    else:
+        Bx = torch.cat([BpT] * reps, dim=0)[:n_win].contiguous()
+    del Bp, BpT
+    Bt = Bx[:nocc]
     eo = eps_occ.to(device=B.device, dtype=B.dtype).reshape(1, nocc)
-    ex = torch.cat([eo, eo], dim=1)
+    ex = torch.cat([eo] * reps, dim=1)[:, :n_win].contiguous()
     ev = torch.zeros(nv, dtype=B.dtype, device=B.device)
     ev[:nvir] = eps_vir.to(device=B.device, dtype=B.dtype)
     return Bt, Bx, eo, ex, ev.reshape(nv, 1).contiguous(), ev.reshape(1, nv).contiguous()
@@ -1031,6 +1047,58 @@ def _nki_ao_to_mo_transform(
         ao_to_mo_transform_kernel, "ao_to_mo_transform", eri_feed, C_occ_feed, C_vir_feed
     )
     return result[:, :nvir, :] if nvir_pad != nvir else result
+
+
+# Native `ao_to_mo_transform` routing (#51). TRNTENSOR_AO_TO_MO overrides:
+# auto | trn2 | aten | legacy (the original per-P kernel; deprecated on the
+# native path).
+_AO_TO_MO_CHOICES = ("auto", "trn2", "aten", "legacy")
+# SBUF bytes per partition `ao_to_mo_trn2_kernel` keeps live (C_occ, C_vir,
+# one stage-1 eri block, one X[i] strip); same budget as the MP2 kernel.
+_AO_TO_MO_SBUF_BUDGET = 144 * 1024
+
+
+def _ao_to_mo_trn2_sbuf_bytes(nbasis: int, nocc: int, nvir: int, naux: int, itemsize: int) -> int:
+    nkb = _round_up(nbasis, TILE_K) // TILE_K
+    nxp = _round_up(naux, TILE_K)
+    tp = 128
+    for cand in (512, 256):
+        if nxp % (2 * cand) == 0:
+            tp = cand
+            break
+    nub = max(1, min(8, 2048 // tp))
+    cols = nkb * (nocc + _round_up(nvir, TILE_M) + nub * tp + tp) + nub * tp
+    return itemsize * cols
+
+
+def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
+    """'trn2', 'legacy' or 'aten' for :func:`trntensor.quantum.ao_to_mo_transform`.
+
+    XLA path / simulator: 'legacy' whenever NKI is in use (unchanged).
+    Native path: the Trn2 kernel for device-resident ``eri`` when
+    ``nocc ≤ 128`` and its SBUF working set fits, else aten;
+    ``set_backend("nki")`` also sends host ``eri`` to the kernel. Host ``eri``
+    under ``"auto"`` stays on aten on the host.
+    """
+    if not (_use_nki() and HAS_NKI):
+        return "aten"
+    if not _on_native_path():
+        return "legacy" if _use_fused_kernel() else "aten"
+    choice = os.environ.get("TRNTENSOR_AO_TO_MO", "auto").strip().lower()
+    if choice not in _AO_TO_MO_CHOICES:
+        raise ValueError(f"TRNTENSOR_AO_TO_MO must be one of {_AO_TO_MO_CHOICES}; got {choice!r}")
+    if choice != "auto":
+        return choice
+    fits = (
+        nocc <= 128
+        and _ao_to_mo_trn2_sbuf_bytes(eri.shape[0], nocc, nvir, eri.shape[2], eri.element_size())
+        <= _AO_TO_MO_SBUF_BUDGET
+    )
+    if not fits:
+        return "aten"
+    if _nki_forced() or eri.device.type == _NEURON_DEVICE:
+        return "trn2"
+    return "aten"
 
 
 def _nki_ao_to_mo_trn2(

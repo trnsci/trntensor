@@ -473,6 +473,13 @@ if HAS_NKI:
                         nl.broadcast_to(ev_row[0:1, b_off : b_off + TILE], (TILE, TILE)),
                     )
                     num = nl.multiply(t, nl.subtract(nl.multiply(t, 2.0), tt))
+                    # Scalar Engine reciprocal (about 1.5e-6 relative), which
+                    # keeps the Vector Engine free for the rest of the fold.
+                    # It saturates outside about |x| in [2^-42, 2^41]; MP2
+                    # denominators are orbital-energy gaps well inside that,
+                    # and padded entries have a zero numerator. The Vector
+                    # Engine's nisa.reciprocal (correctly rounded, full range)
+                    # measured ~10% slower end to end on Trn2 (#51).
                     term = nl.multiply(num, nl.reciprocal(denom))
                     acc_ab[0:TILE, a * NA + b : a * NA + b + 1] = nl.sum(
                         term, axis=1, keepdims=True
@@ -514,6 +521,8 @@ if HAS_NKI:
         NPC = NAUX // TP
         NKB = NB // TILE
         NAV = NVIR // TILE
+        # ν per stage-1 DMA: NUB * TP * 4 bytes per partition per μ-tile.
+        NUB = max(1, min(8, 2048 // TP))
         n_prog, pid, _axis = _programs(NPC)
         NPC_per = NPC // n_prog
 
@@ -532,20 +541,27 @@ if HAS_NKI:
 
         for pc in nl.affine_range(NPC_per):
             p_off = (pid * NPC_per + pc) * TP
-            # Stage 1: X[:, ν, Pc] for every ν.
-            for nu in nl.affine_range(NB):
-                px = nl.zeros((NOCC, TP), dtype=nl.float32, buffer=nl.psum)
+            # Stage 1: X[:, ν, Pc] for every ν, NUB ν per DMA (one
+            # (128, NUB, TP) eri block per μ-tile instead of NUB small loads).
+            for vb in nl.affine_range(NB // NUB):
+                v0 = vb * NUB
+                e_blk = nl.ndarray((TILE, NKB, NUB, TP), dtype=eri.dtype, buffer=nl.sbuf)
                 for k in nl.affine_range(NKB):
-                    e_t = nl.load(eri[k * TILE : (k + 1) * TILE, nu, p_off : p_off + TP])
-                    nisa.nc_matmul(
-                        dst=px,
-                        stationary=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
-                        moving=e_t,
-                        accumulate=True,
+                    e_blk[0:TILE, k, 0:NUB, 0:TP] = nl.load(
+                        eri[k * TILE : (k + 1) * TILE, v0 : v0 + NUB, p_off : p_off + TP]
                     )
-                x_sb = nl.ndarray((NOCC, TP), dtype=eri.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(src=px, dst=x_sb)
-                nl.store(x_hbm[0:NOCC, nu, p_off : p_off + TP], value=x_sb)
+                x_sb = nl.ndarray((NOCC, NUB, TP), dtype=eri.dtype, buffer=nl.sbuf)
+                for u in nl.affine_range(NUB):
+                    px = nl.zeros((NOCC, TP), dtype=nl.float32, buffer=nl.psum)
+                    for k in nl.affine_range(NKB):
+                        nisa.nc_matmul(
+                            dst=px,
+                            stationary=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
+                            moving=e_blk[0:TILE, k, u, 0:TP],
+                            accumulate=True,
+                        )
+                    nisa.tensor_copy(src=px, dst=x_sb[0:NOCC, u, 0:TP])
+                nl.store(x_hbm[0:NOCC, v0 : v0 + NUB, p_off : p_off + TP], value=x_sb)
             # Stage 2: B[i, a-tile, Pc].
             for i in nl.affine_range(NOCC):
                 x_i = nl.ndarray((TILE, NKB * TP), dtype=eri.dtype, buffer=nl.sbuf)
@@ -568,70 +584,3 @@ if HAS_NKI:
                     nisa.tensor_copy(src=pb, dst=b_sb)
                     nl.store(B_out[i, av * TILE : (av + 1) * TILE, p_off : p_off + TP], value=b_sb)
         return B_out
-
-    def _matmul_trn2_tile_m(n_m_tiles, K, itemsize):
-        """M tiles per stationary block: up to 4, A^T block ≤ 64 KiB/partition."""
-        tm = 4
-        while tm > 1 and (n_m_tiles % tm != 0 or K * tm * itemsize > 64 * 1024):
-            tm //= 2
-        return tm
-
-    @nki.jit
-    def matmul_trn2_kernel(a, b):
-        """``C = A @ B`` for the native path (Trn2), no DMA transposes.
-
-        A row-blocks (``TM`` 128-row tiles) are loaded with plain DMAs and
-        transposed on the Tensor Engine into an SBUF-resident ``A^T`` block,
-        which stays stationary while every N tile of B streams past; each
-        B tile is loaded once per M block and reused across its ``TM``
-        stationaries. M blocks (else N tiles) are split across the programs
-        of the logical core.
-
-        M, K multiples of 128; N ≤ 512 or a multiple of 512.
-        """
-        M, K = a.shape
-        _, N = b.shape
-        TILE = 128
-        TN = N if N <= 512 else 512
-        NK = K // TILE
-        TM = _matmul_trn2_tile_m(M // TILE, K, 4 if a.dtype == nl.float32 else 2)
-        NMB = M // (TILE * TM)
-        NN = N // TN
-        n_prog, pid, axis = _programs(NMB, NN)
-        MB_per = NMB // n_prog if axis == 0 else NMB
-        NN_per = NN // n_prog if axis == 1 else NN
-        m_base = pid * MB_per if axis == 0 else 0
-        n_base = pid * NN_per if axis == 1 else 0
-
-        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
-        for mb in nl.affine_range(MB_per):
-            m0 = (m_base + mb) * TM * TILE
-            aT = nl.ndarray((TILE, NK * TM * TILE), dtype=a.dtype, buffer=nl.sbuf)
-            for mt in nl.affine_range(TM):
-                a_rows = nl.load(a[m0 + mt * TILE : m0 + (mt + 1) * TILE, 0:K])
-                for kt in nl.affine_range(NK):
-                    ptr = nl.ndarray((TILE, TILE), dtype=a.dtype, buffer=nl.psum)
-                    nisa.nc_transpose(dst=ptr, data=a_rows[0:TILE, kt * TILE : (kt + 1) * TILE])
-                    nisa.tensor_copy(
-                        src=ptr,
-                        dst=aT[0:TILE, (kt * TM + mt) * TILE : (kt * TM + mt + 1) * TILE],
-                    )
-            for nn in nl.affine_range(NN_per):
-                n0 = (n_base + nn) * TN
-                ps = [nl.zeros((TILE, TN), dtype=nl.float32, buffer=nl.psum) for _ in range(TM)]
-                for kt in nl.affine_range(NK):
-                    b_t = nl.load(b[kt * TILE : (kt + 1) * TILE, n0 : n0 + TN])
-                    for mt in range(TM):
-                        nisa.nc_matmul(
-                            dst=ps[mt],
-                            stationary=aT[
-                                0:TILE, (kt * TM + mt) * TILE : (kt * TM + mt + 1) * TILE
-                            ],
-                            moving=b_t,
-                            accumulate=True,
-                        )
-                for mt in range(TM):
-                    c_sb = nl.ndarray((TILE, TN), dtype=a.dtype, buffer=nl.sbuf)
-                    nisa.tensor_copy(src=ps[mt], dst=c_sb)
-                    nl.store(c[m0 + mt * TILE : m0 + (mt + 1) * TILE, n0 : n0 + TN], value=c_sb)
-        return c

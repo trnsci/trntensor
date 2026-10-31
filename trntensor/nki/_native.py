@@ -77,15 +77,6 @@ def ao_to_mo_transform(eri: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tens
 
 
 @nki_op(
-    "trntensor::matmul_trn2",
-    mutates_args={},
-    fake_fn=lambda a, b: a.new_empty((a.shape[0], b.shape[1])),
-)
-def matmul_trn2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return _k.matmul_trn2_kernel(a, b)
-
-
-@nki_op(
     "trntensor::mp2_energy_row",
     mutates_args={},
     fake_fn=lambda bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row: bt_i.new_empty(
@@ -118,7 +109,6 @@ OPS = {
     "batched_matmul": batched_matmul,
     "mp2_energy": mp2_energy,
     "ao_to_mo_transform": ao_to_mo_transform,
-    "matmul_trn2": matmul_trn2,
     "mp2_energy_row": mp2_energy_row,
     "ao_to_mo_trn2": ao_to_mo_trn2,
 }
