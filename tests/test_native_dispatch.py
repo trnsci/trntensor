@@ -546,6 +546,93 @@ class TestNativeRoute:
         assert dispatch._use_fused_kernel() is True
 
 
+class TestNativeKernelRetirement:
+    """#51: native policy for the matmul/bmm/AO→MO kernels and the MP2 row kernel."""
+
+    @pytest.fixture(autouse=True)
+    def _native(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_native_kernel_deprecations_emitted", set())
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.delenv("TRNTENSOR_FORCE_BACKEND", raising=False)
+        monkeypatch.delenv("TRNTENSOR_MP2_ENERGY", raising=False)
+
+    def _forced_matmul(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE", 0)
+        monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS_NATIVE_PINNED", 0)
+        monkeypatch.setattr(dispatch, "_launch", lambda k, name, a, b, **kw: a @ b)
+        for name in ("matmul_kernel", "batched_matmul_kernel"):
+            monkeypatch.setattr(_kernels, name, None, raising=False)
+
+    def test_forced_native_matmul_warns_once(self, monkeypatch):
+        self._forced_matmul(monkeypatch)
+        A, B = torch.randn(128, 128), torch.randn(128, 128)
+        with pytest.warns(FutureWarning, match="matmul kernel is deprecated"):
+            dispatch.nki_matmul(A, B)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            dispatch.nki_matmul(A, B)
+        with pytest.warns(FutureWarning, match="batched_matmul kernel is deprecated"):
+            dispatch.nki_batched_matmul(A[None], B[None])
+
+    def test_xla_matmul_does_not_warn(self, monkeypatch):
+        self._forced_matmul(monkeypatch)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            dispatch.nki_matmul(torch.randn(128, 128), torch.randn(128, 128))
+
+    def test_mp2_route_auto_by_row_work(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        small = torch.empty(16, 128, 512, device="meta")
+        large = torch.empty(64, 448, 1536, device="meta")
+        assert dispatch._mp2_energy_route(small) == "aten"
+        assert dispatch._mp2_energy_route(large) == "rows"
+        # Host B stays on aten under auto.
+        assert dispatch._mp2_energy_route(torch.empty(64, 448, 1536)) == "aten"
+        # Forced NKI: the row kernel whenever it fits in SBUF.
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        assert dispatch._mp2_energy_route(small) == "rows"
+        too_big = torch.empty(8, 1024, 4096, device="meta")
+        assert dispatch._mp2_row_dims(*too_big.shape)["sbuf_bytes"] > dispatch._MP2_ROW_SBUF_BUDGET
+        assert dispatch._mp2_energy_route(too_big) == "aten"
+
+    def test_mp2_route_env_override_and_xla(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        B = torch.empty(4, 8, 8)
+        monkeypatch.setenv("TRNTENSOR_MP2_ENERGY", "legacy")
+        assert dispatch._mp2_energy_route(B) == "legacy"
+        monkeypatch.setenv("TRNTENSOR_MP2_ENERGY", "bogus")
+        with pytest.raises(ValueError, match="TRNTENSOR_MP2_ENERGY"):
+            dispatch._mp2_energy_route(B)
+        monkeypatch.delenv("TRNTENSOR_MP2_ENERGY")
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        assert dispatch._mp2_energy_route(B) == "legacy"
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: False)
+        assert dispatch._mp2_energy_route(B) == "aten"
+
+    @pytest.mark.parametrize("nocc", [1, 2, 5, 6, 7])
+    def test_mp2_row_walk_matches_reference(self, nocc):
+        from trntensor.quantum import _cpu_mp2_energy
+
+        g = torch.Generator().manual_seed(nocc)
+        B = torch.randn(nocc, 20, 40, generator=g, dtype=torch.float64) * 0.1
+        eo = -torch.rand(nocc, generator=g, dtype=torch.float64) - 1.0
+        ev = torch.rand(20, generator=g, dtype=torch.float64) + 0.5
+        dims = dispatch._mp2_row_dims(nocc, 20, 40)
+        assert dims["nd_pad"] % 2 == 0
+        torch.testing.assert_close(
+            dispatch._mp2_row_reference(B, eo, ev).double(),
+            _cpu_mp2_energy(B, eo, ev).double(),
+            rtol=1e-6,
+            atol=1e-9,
+        )
+
+
 class TestResidency:
     def test_to_device_native_places_on_neuron(self, monkeypatch):
         monkeypatch.setattr(dispatch, "HAS_NKI", True)

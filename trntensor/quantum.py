@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from .nki.dispatch import _use_fused_kernel
+from .nki.dispatch import _mp2_energy_route, _use_fused_kernel
 
 
 def mp2_energy(
@@ -66,11 +66,16 @@ def mp2_energy(
     if eps_vir.shape != (nvir,):
         raise ValueError(f"eps_vir must have shape ({nvir},); got {tuple(eps_vir.shape)}")
 
-    if _use_fused_kernel():
-        from .nki.dispatch import _nki_mp2_energy
+    route = _mp2_energy_route(B)
+    if route != "aten":
+        from .nki import dispatch as _d
 
         try:
-            return _nki_mp2_energy(B, eps_occ, eps_vir)
+            if route == "rows":
+                return _d._nki_mp2_energy_rows(B, eps_occ, eps_vir)
+            if _d._on_native_path():
+                _d._warn_native_kernel_deprecated("mp2_energy")
+            return _d._nki_mp2_energy(B, eps_occ, eps_vir)
         except Exception:
             import os
 

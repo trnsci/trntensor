@@ -360,3 +360,278 @@ if HAS_NKI:
                 nl.store(B_out[0:NOCC, a_off : a_off + TILE_N, p], value=out_sbuf)
 
         return B_out
+
+
+# ── Trn2 (native TorchNeuron) kernels, #51 ───────────────────────────────────
+#
+# Launched gridless on the native path. At LNC=2 (the Trn2 default) NKI traces
+# each kernel once per physical core of the logical core (``num_programs() ==
+# 2``) and every program takes its share of the work; at LNC=1 there is one
+# program. No DMA transposes: operands are either laid out by the host so the
+# contraction index is the leading (partition) axis, or transposed on the
+# Tensor Engine from SBUF. PSUM tiles are fresh ``nl.zeros`` per output block,
+# at most one 2 KiB bank per partition, accumulated with ``accumulate=True``.
+
+if HAS_NKI:
+
+    def _programs(*counts):
+        """(n_prog, pid, axis) for splitting work across the logical core.
+
+        ``axis`` is the index of the first entry of ``counts`` divisible by
+        ``num_programs()``; with none divisible (or one program) the kernel
+        runs as a single program over everything (n_prog 1, axis -1).
+        """
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        if n_prog > 1:
+            for axis, count in enumerate(counts):
+                if count % n_prog == 0:
+                    return n_prog, nl.program_id(0), axis
+        return 1, 0, -1
+
+    @nki.jit
+    def mp2_energy_row_kernel(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row):
+        """DF-MP2 pair energies for one occupied row ``i`` over a window of ``j``.
+
+        Same design as trnblas ``_pair_energy_sym_kernel`` (trnblas#55/#58).
+        The host launches it once per ``i`` with ``j = i + d (mod nocc)``,
+        ``d = 0..ND-1`` (pair symmetry ``e_ij = e_ji``), and weights each ``d``.
+
+        bt_i:        (NAUX, NVIR) = B[i].T; loaded into SBUF once.
+        Bw:          (ND, NAUX, NVIR) window of B[j].T; ND even.
+        eps_occ_i:   (1, 1); eps_occ_w: (1, ND).
+        eps_vir_col: (NVIR, 1); eps_vir_row: (1, NVIR).
+        NAUX, NVIR multiples of 128 (zero padded by the host).
+
+        Per pair, one GEMM fills ``T = B[i] B[j].T`` in SBUF a 128-row strip
+        at a time; ``T.T`` blocks are Tensor Engine transposes of the
+        SBUF-resident ``T``. ``T`` never reaches HBM. Each program takes half
+        of the ``j`` window at LNC=2. Returns per-partition partials
+        ``(128, ND)``.
+        """
+        ND = Bw.shape[0]
+        NAUX = Bw.shape[1]
+        NVIR = Bw.shape[2]
+        TILE = 128
+        TN = 512 if NVIR % 512 == 0 else 128
+        NA = NVIR // TILE
+        NB = NVIR // TN
+        NK = NAUX // TILE
+        n_prog, pid, _axis = _programs(ND)
+        NJ = ND // n_prog
+        e_partial = nl.ndarray((TILE, ND), dtype=nl.float32, buffer=nl.shared_hbm)
+        eps_i = nl.load(eps_occ_i[0:1, 0:1])
+        ev_row = nl.load(eps_vir_row[0:1, 0:NVIR])
+        bi_sb = nl.ndarray((TILE, NK * NVIR), dtype=nl.float32, buffer=nl.sbuf)
+        for k in nl.affine_range(NK):
+            bi_sb[0:TILE, k * NVIR : (k + 1) * NVIR] = nl.load(
+                bt_i[k * TILE : (k + 1) * TILE, 0:NVIR]
+            )
+        acc_j = nl.zeros((TILE, NJ), dtype=nl.float32, buffer=nl.sbuf)
+        for jj in nl.affine_range(NJ):
+            j = pid * NJ + jj
+            eps_j = nl.load(eps_occ_w[0:1, j : j + 1])
+            eo = nl.add(eps_i, eps_j)
+            bj_sb = nl.ndarray((TILE, NK * NVIR), dtype=nl.float32, buffer=nl.sbuf)
+            for k in nl.affine_range(NK):
+                bj_sb[0:TILE, k * NVIR : (k + 1) * NVIR] = nl.load(
+                    Bw[j, k * TILE : (k + 1) * TILE, 0:NVIR]
+                )
+            t_all = nl.ndarray((TILE, NA * NVIR), dtype=nl.float32, buffer=nl.sbuf)
+            for a in nl.affine_range(NA):
+                a_off = a * TILE
+                for b in nl.affine_range(NB):
+                    b_off = b * TN
+                    pt = nl.zeros((TILE, TN), dtype=nl.float32, buffer=nl.psum)
+                    for k in nl.affine_range(NK):
+                        nisa.nc_matmul(
+                            dst=pt,
+                            stationary=bi_sb[0:TILE, k * NVIR + a_off : k * NVIR + a_off + TILE],
+                            moving=bj_sb[0:TILE, k * NVIR + b_off : k * NVIR + b_off + TN],
+                            accumulate=True,
+                        )
+                    nisa.tensor_copy(
+                        src=pt, dst=t_all[0:TILE, a * NVIR + b_off : a * NVIR + b_off + TN]
+                    )
+            acc_ab = nl.zeros((TILE, NA * NA), dtype=nl.float32, buffer=nl.sbuf)
+            for a in nl.affine_range(NA):
+                a_off = a * TILE
+                ev_a = nl.load(eps_vir_col[a_off : a_off + TILE, 0:1])
+                for b in nl.affine_range(NA):
+                    b_off = b * TILE
+                    # T.T[a-strip, b-strip] = (T[b-strip, a-strip]).T
+                    ptt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(
+                        dst=ptt, data=t_all[0:TILE, b * NVIR + a_off : b * NVIR + a_off + TILE]
+                    )
+                    tt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=ptt, dst=tt)
+                    t = t_all[0:TILE, a * NVIR + b_off : a * NVIR + b_off + TILE]
+                    denom = nl.subtract(
+                        nl.subtract(
+                            nl.broadcast_to(eo, (TILE, TILE)), nl.broadcast_to(ev_a, (TILE, TILE))
+                        ),
+                        nl.broadcast_to(ev_row[0:1, b_off : b_off + TILE], (TILE, TILE)),
+                    )
+                    num = nl.multiply(t, nl.subtract(nl.multiply(t, 2.0), tt))
+                    term = nl.multiply(num, nl.reciprocal(denom))
+                    acc_ab[0:TILE, a * NA + b : a * NA + b + 1] = nl.sum(
+                        term, axis=1, keepdims=True
+                    )
+            acc_j[0:TILE, jj : jj + 1] = nl.sum(acc_ab, axis=1, keepdims=True)
+        nl.store(e_partial[0:TILE, pid * NJ : pid * NJ + NJ], value=acc_j)
+        return e_partial
+
+    @nki.jit
+    def ao_to_mo_trn2_kernel(eri, C_occ, C_vir):
+        """``B[i, a, P] = Σ_{μ,ν} C_occ[μ,i] C_vir[ν,a] eri[μ,ν,P]`` (native, Trn2).
+
+        Two plain GEMM stages per auxiliary chunk of ``TP`` columns:
+
+        1. ``X[i, ν, Pc] = Σ_μ C_occ[μ, i] · eri[μ, ν, Pc]``: stationary
+           ``C_occ`` μ-tile (resident in SBUF), moving ``eri[μ-tile, ν, Pc]``.
+           X goes to kernel-scratch HBM, i-major.
+        2. ``B[i, a, Pc] = Σ_ν C_vir[ν, a] · X[i, ν, Pc]``: stationary ``C_vir``
+           tile (resident), moving ``X[i, ν-tile, Pc]`` (ν on partitions).
+
+        Every load has the contraction index on the partition axis, so there
+        are no DMA transposes. The aux chunks are split across the programs
+        of the logical core (both physical cores at LNC=2); each program
+        reads back only the X it wrote.
+
+        NBASIS, NVIR multiples of 128; NOCC ≤ 128; NAUX a multiple of 128.
+        """
+        NB, _, NAUX = eri.shape
+        _, NOCC = C_occ.shape
+        _, NVIR = C_vir.shape
+        TILE = 128
+        # Widest aux chunk (≤ 512, one PSUM bank) that still gives an even
+        # chunk count, so both programs get work at LNC=2.
+        TP = 128
+        for tp in (512, 256):
+            if NAUX % (2 * tp) == 0:
+                TP = tp
+                break
+        NPC = NAUX // TP
+        NKB = NB // TILE
+        NAV = NVIR // TILE
+        n_prog, pid, _axis = _programs(NPC)
+        NPC_per = NPC // n_prog
+
+        B_out = nl.ndarray((NOCC, NVIR, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
+        x_hbm = nl.ndarray((NOCC, NB, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
+
+        co_sb = nl.ndarray((TILE, NKB * NOCC), dtype=C_occ.dtype, buffer=nl.sbuf)
+        cv_sb = nl.ndarray((TILE, NKB * NVIR), dtype=C_vir.dtype, buffer=nl.sbuf)
+        for k in nl.affine_range(NKB):
+            co_sb[0:TILE, k * NOCC : (k + 1) * NOCC] = nl.load(
+                C_occ[k * TILE : (k + 1) * TILE, 0:NOCC]
+            )
+            cv_sb[0:TILE, k * NVIR : (k + 1) * NVIR] = nl.load(
+                C_vir[k * TILE : (k + 1) * TILE, 0:NVIR]
+            )
+
+        for pc in nl.affine_range(NPC_per):
+            p_off = (pid * NPC_per + pc) * TP
+            # Stage 1: X[:, ν, Pc] for every ν.
+            for nu in nl.affine_range(NB):
+                px = nl.zeros((NOCC, TP), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(NKB):
+                    e_t = nl.load(eri[k * TILE : (k + 1) * TILE, nu, p_off : p_off + TP])
+                    nisa.nc_matmul(
+                        dst=px,
+                        stationary=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
+                        moving=e_t,
+                        accumulate=True,
+                    )
+                x_sb = nl.ndarray((NOCC, TP), dtype=eri.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=px, dst=x_sb)
+                nl.store(x_hbm[0:NOCC, nu, p_off : p_off + TP], value=x_sb)
+            # Stage 2: B[i, a-tile, Pc].
+            for i in nl.affine_range(NOCC):
+                x_i = nl.ndarray((TILE, NKB * TP), dtype=eri.dtype, buffer=nl.sbuf)
+                for k in nl.affine_range(NKB):
+                    x_i[0:TILE, k * TP : (k + 1) * TP] = nl.load(
+                        x_hbm[i, k * TILE : (k + 1) * TILE, p_off : p_off + TP]
+                    )
+                for av in nl.affine_range(NAV):
+                    pb = nl.zeros((TILE, TP), dtype=nl.float32, buffer=nl.psum)
+                    for k in nl.affine_range(NKB):
+                        nisa.nc_matmul(
+                            dst=pb,
+                            stationary=cv_sb[
+                                0:TILE, k * NVIR + av * TILE : k * NVIR + (av + 1) * TILE
+                            ],
+                            moving=x_i[0:TILE, k * TP : (k + 1) * TP],
+                            accumulate=True,
+                        )
+                    b_sb = nl.ndarray((TILE, TP), dtype=eri.dtype, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=pb, dst=b_sb)
+                    nl.store(B_out[i, av * TILE : (av + 1) * TILE, p_off : p_off + TP], value=b_sb)
+        return B_out
+
+    def _matmul_trn2_tile_m(n_m_tiles, K, itemsize):
+        """M tiles per stationary block: up to 4, A^T block ≤ 64 KiB/partition."""
+        tm = 4
+        while tm > 1 and (n_m_tiles % tm != 0 or K * tm * itemsize > 64 * 1024):
+            tm //= 2
+        return tm
+
+    @nki.jit
+    def matmul_trn2_kernel(a, b):
+        """``C = A @ B`` for the native path (Trn2), no DMA transposes.
+
+        A row-blocks (``TM`` 128-row tiles) are loaded with plain DMAs and
+        transposed on the Tensor Engine into an SBUF-resident ``A^T`` block,
+        which stays stationary while every N tile of B streams past; each
+        B tile is loaded once per M block and reused across its ``TM``
+        stationaries. M blocks (else N tiles) are split across the programs
+        of the logical core.
+
+        M, K multiples of 128; N ≤ 512 or a multiple of 512.
+        """
+        M, K = a.shape
+        _, N = b.shape
+        TILE = 128
+        TN = N if N <= 512 else 512
+        NK = K // TILE
+        TM = _matmul_trn2_tile_m(M // TILE, K, 4 if a.dtype == nl.float32 else 2)
+        NMB = M // (TILE * TM)
+        NN = N // TN
+        n_prog, pid, axis = _programs(NMB, NN)
+        MB_per = NMB // n_prog if axis == 0 else NMB
+        NN_per = NN // n_prog if axis == 1 else NN
+        m_base = pid * MB_per if axis == 0 else 0
+        n_base = pid * NN_per if axis == 1 else 0
+
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        for mb in nl.affine_range(MB_per):
+            m0 = (m_base + mb) * TM * TILE
+            aT = nl.ndarray((TILE, NK * TM * TILE), dtype=a.dtype, buffer=nl.sbuf)
+            for mt in nl.affine_range(TM):
+                a_rows = nl.load(a[m0 + mt * TILE : m0 + (mt + 1) * TILE, 0:K])
+                for kt in nl.affine_range(NK):
+                    ptr = nl.ndarray((TILE, TILE), dtype=a.dtype, buffer=nl.psum)
+                    nisa.nc_transpose(dst=ptr, data=a_rows[0:TILE, kt * TILE : (kt + 1) * TILE])
+                    nisa.tensor_copy(
+                        src=ptr,
+                        dst=aT[0:TILE, (kt * TM + mt) * TILE : (kt * TM + mt + 1) * TILE],
+                    )
+            for nn in nl.affine_range(NN_per):
+                n0 = (n_base + nn) * TN
+                ps = [nl.zeros((TILE, TN), dtype=nl.float32, buffer=nl.psum) for _ in range(TM)]
+                for kt in nl.affine_range(NK):
+                    b_t = nl.load(b[kt * TILE : (kt + 1) * TILE, n0 : n0 + TN])
+                    for mt in range(TM):
+                        nisa.nc_matmul(
+                            dst=ps[mt],
+                            stationary=aT[
+                                0:TILE, (kt * TM + mt) * TILE : (kt * TM + mt + 1) * TILE
+                            ],
+                            moving=b_t,
+                            accumulate=True,
+                        )
+                for mt in range(TM):
+                    c_sb = nl.ndarray((TILE, TN), dtype=a.dtype, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=ps[mt], dst=c_sb)
+                    nl.store(c[m0 + mt * TILE : m0 + (mt + 1) * TILE, n0 : n0 + TN], value=c_sb)
+        return c

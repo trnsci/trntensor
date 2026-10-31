@@ -299,6 +299,30 @@ def _nki_forced() -> bool:
     return _backend == "nki"
 
 
+# Native-path kernel retirement (#51). On Trn2 these trntensor kernels measured
+# slower than aten at every size, including a rewrite with the program_id
+# split and Tensor Engine transposes, so native ``"auto"`` never runs them.
+# ``set_backend("nki")`` still runs them, with a one-time FutureWarning; a
+# later release routes them to aten on the native path. The XLA path (Trn1)
+# keeps them unchanged and does not warn.
+_native_kernel_deprecations_emitted: set[str] = set()
+
+NATIVE_KERNEL_DEPRECATION_MESSAGE = (
+    "trntensor: the NKI {name} kernel is deprecated on the native TorchNeuron "
+    "path (Trn2/Trn3) and will be removed from it in a future release; aten on "
+    "the neuron device is faster at every measured size (trnsci/trntensor#51). "
+    'set_backend("auto") already uses aten. The PyTorch/XLA path (Trn1) is '
+    "unaffected. This warning is shown once per kernel per process."
+)
+
+
+def _warn_native_kernel_deprecated(name: str) -> None:
+    if name in _native_kernel_deprecations_emitted:
+        return
+    _native_kernel_deprecations_emitted.add(name)
+    warnings.warn(NATIVE_KERNEL_DEPRECATION_MESSAGE.format(name=name), FutureWarning, stacklevel=3)
+
+
 def _use_fused_kernel() -> bool:
     """Whether the fused quantum-chemistry kernels (``mp2_energy``,
     ``ao_to_mo_transform``) should run under the current settings.
@@ -690,6 +714,9 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
         result = torch.matmul(A, B)
         return _stochastic_round_cpu(result, A.dtype) if use_sr else result
 
+    if _on_native_path():
+        _warn_native_kernel_deprecated("matmul")
+
     from ._kernels import matmul_kernel
 
     M_pad = _round_up(M, TILE_M)
@@ -791,6 +818,160 @@ def _nki_mp2_energy(
     return partial.sum()
 
 
+# ── Native MP2 energy: per-row symmetric kernel, both cores at LNC=2 (#51) ──
+#
+# SBUF bytes per partition `mp2_energy_row_kernel` keeps live: B[i].T and
+# B[j].T (NK * NVIR each) plus the T strip block (NA * NVIR), all fp32. Trn2
+# has 192 KiB per partition; leave room for the compiler's temporaries.
+_MP2_ROW_SBUF_BUDGET = 144 * 1024
+
+
+def _mp2_row_dims(nocc: int, nvir: int, naux: int) -> dict:
+    """Padded sizes, j-window length and per-d weights for `mp2_energy_row_kernel`.
+
+    Row i takes j = i + d (mod nocc) for d = 0..nocc//2, so every unordered
+    pair {i, j} is visited by exactly one (i, d), twice for d = nocc/2 when
+    nocc is even. e_ij = e_ji, so off-diagonal d get weight 2 except that
+    doubled d, which gets 1. The window is padded to an even length (one j
+    per LNC=2 program) with weight-0 entries.
+    """
+    nvir_pad = _round_up(nvir, TILE_M)
+    naux_pad = _round_up(naux, TILE_K)
+    half = nocc // 2
+    nd = half + 1
+    nd_pad = nd + (nd % 2)
+    weights = [2.0] * nd_pad
+    weights[0] = 1.0
+    if half > 0 and nocc % 2 == 0:
+        weights[half] = 1.0
+    for d in range(nd, nd_pad):
+        weights[d] = 0.0
+    na, nk = nvir_pad // TILE_M, naux_pad // TILE_K
+    return dict(
+        nvir_pad=nvir_pad,
+        naux_pad=naux_pad,
+        nd_pad=nd_pad,
+        weights=weights,
+        sbuf_bytes=4 * nvir_pad * (2 * nk + na),
+        row_flop=2.0 * nd * nvir_pad * nvir_pad * naux_pad,
+    )
+
+
+# Native `mp2_energy` routing (#51). The row kernel launches once per occupied
+# row, so it pays ~nocc custom-op launch floors and wins only once each row
+# carries enough work. TRNTENSOR_MP2_ENERGY overrides: auto | rows | aten |
+# legacy (the original single-launch kernel; deprecated on the native path).
+_MP2_ENERGY_CHOICES = ("auto", "rows", "aten", "legacy")
+_MP2_ROW_MIN_ROW_FLOP = 2.0e9
+
+
+def _mp2_energy_route(B: torch.Tensor) -> str:
+    """'rows', 'legacy' or 'aten' for :func:`trntensor.quantum.mp2_energy`.
+
+    XLA path / simulator: 'legacy' (the original kernel) whenever NKI is in
+    use, as before. Native path: device-resident ``B`` uses the row kernel
+    when it fits in SBUF and each row launch carries at least
+    ``_MP2_ROW_MIN_ROW_FLOP``, else aten; ``set_backend("nki")`` uses the row
+    kernel whenever it fits. Host ``B`` under ``"auto"`` stays on aten on the
+    host.
+    """
+    if not (_use_nki() and HAS_NKI):
+        return "aten"
+    if not _on_native_path():
+        return "legacy"
+    choice = os.environ.get("TRNTENSOR_MP2_ENERGY", "auto").strip().lower()
+    if choice not in _MP2_ENERGY_CHOICES:
+        raise ValueError(
+            f"TRNTENSOR_MP2_ENERGY must be one of {_MP2_ENERGY_CHOICES}; got {choice!r}"
+        )
+    if choice != "auto":
+        return choice
+    dims = _mp2_row_dims(*B.shape)
+    fits = dims["sbuf_bytes"] <= _MP2_ROW_SBUF_BUDGET
+    if _nki_forced():
+        return "rows" if fits else "aten"
+    if B.device.type != _NEURON_DEVICE:
+        return "aten"
+    return "rows" if fits and dims["row_flop"] >= _MP2_ROW_MIN_ROW_FLOP else "aten"
+
+
+def _mp2_row_feeds(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor, dims: dict):
+    """Device operands for `mp2_energy_row_kernel`: B[j].T stacked twice (each
+    row's j window is then a contiguous slice), the matching eps window and the
+    padded eps_vir column / row. All fp32."""
+    nocc, nvir, naux = B.shape
+    nv, na = dims["nvir_pad"], dims["naux_pad"]
+    B = B.float()
+    if (nv, na) != (nvir, naux):
+        Bp = torch.zeros(nocc, nv, na, dtype=B.dtype, device=B.device)
+        Bp[:, :nvir, :naux] = B
+    else:
+        Bp = B
+    Bt = Bp.permute(0, 2, 1).contiguous()  # (nocc, naux_pad, nvir_pad)
+    Bx = torch.cat([Bt, Bt], dim=0)
+    eo = eps_occ.to(device=B.device, dtype=B.dtype).reshape(1, nocc)
+    ex = torch.cat([eo, eo], dim=1)
+    ev = torch.zeros(nv, dtype=B.dtype, device=B.device)
+    ev[:nvir] = eps_vir.to(device=B.device, dtype=B.dtype)
+    return Bt, Bx, eo, ex, ev.reshape(nv, 1).contiguous(), ev.reshape(1, nv).contiguous()
+
+
+def _mp2_row_reference(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor):
+    """fp64 torch emulation of the row kernel's (i, d) walk and weights (CPU tests)."""
+    nocc = B.shape[0]
+    dims = _mp2_row_dims(*B.shape)
+    Bt, Bx, eo, ex, evc, evr = _mp2_row_feeds(B, eps_occ, eps_vir, dims)
+    w = torch.tensor(dims["weights"], dtype=torch.float64)
+    total = torch.zeros((), dtype=torch.float64)
+    for i in range(nocc):
+        for d in range(dims["nd_pad"]):
+            bi, bj = Bt[i].double(), Bx[i + d].double()
+            T = bi.T @ bj
+            denom = float(eo[0, i]) + float(ex[0, i + d]) - evc.double() - evr.double()
+            total = total + w[d] * (T * (2.0 * T - T.T) / denom).sum()
+    return total
+
+
+def _nki_mp2_energy_rows(
+    B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor
+) -> torch.Tensor:
+    """MP2 energy via `mp2_energy_row_kernel`, one launch per occupied row (native).
+
+    Never materializes T (nocc² nvir²) in device memory: each launch holds one
+    B[i].T, one B[j].T and one T strip block in SBUF. Device memory beyond the
+    inputs is the doubled, padded, transposed copy of B (2 * nocc * naux * nvir)
+    and a (128, ND) partial per row.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    nocc = B.shape[0]
+    dims = _mp2_row_dims(*B.shape)
+    if dims["sbuf_bytes"] > _MP2_ROW_SBUF_BUDGET:
+        raise ValueError(
+            f"mp2_energy_row needs {dims['sbuf_bytes']} SBUF bytes per partition "
+            f"(budget {_MP2_ROW_SBUF_BUDGET}) for B of shape {tuple(B.shape)}"
+        )
+    orig = B.device
+    if B.device.type != _NEURON_DEVICE:
+        B = B.to(_NEURON_DEVICE)
+    Bt, Bx, eo, ex, evc, evr = _mp2_row_feeds(B, eps_occ, eps_vir, dims)
+    nd_pad = dims["nd_pad"]
+    op = _get_native_ops()["mp2_energy_row"]
+    acc = None
+    for i in range(nocc):
+        p = op(
+            Bt[i],
+            Bx[i : i + nd_pad],
+            eo[:, i : i + 1].contiguous(),
+            ex[:, i : i + nd_pad].contiguous(),
+            evc,
+            evr,
+        )
+        acc = p if acc is None else acc + p
+    w = torch.tensor(dims["weights"], dtype=acc.dtype).to(acc.device)
+    return (acc.sum(0) * w).sum().to(orig)
+
+
 def _nki_ao_to_mo_transform(
     eri: torch.Tensor,
     C_occ: torch.Tensor,
@@ -852,6 +1033,38 @@ def _nki_ao_to_mo_transform(
     return result[:, :nvir, :] if nvir_pad != nvir else result
 
 
+def _nki_ao_to_mo_trn2(
+    eri: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch ``ao_to_mo_trn2_kernel`` (native path, #51).
+
+    Pads nbasis, nvir and naux to 128 multiples (zero padding contributes
+    nothing) and slices the result back to ``(nocc, nvir, naux)``.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    nbasis, _, naux = eri.shape
+    nocc = C_occ.shape[1]
+    nvir = C_vir.shape[1]
+    nbp, nvp, nxp = _round_up(nbasis, TILE_K), _round_up(nvir, TILE_M), _round_up(naux, TILE_K)
+    if (nbp, nxp) != (nbasis, naux):
+        eri_p = torch.zeros(nbp, nbp, nxp, dtype=eri.dtype, device=eri.device)
+        eri_p[:nbasis, :nbasis, :naux] = eri
+        eri = eri_p
+    if nbp != nbasis:
+        co = torch.zeros(nbp, nocc, dtype=C_occ.dtype, device=C_occ.device)
+        co[:nbasis] = C_occ
+        C_occ = co
+    if (nbp, nvp) != (nbasis, nvir):
+        cv = torch.zeros(nbp, nvp, dtype=C_vir.dtype, device=C_vir.device)
+        cv[:nbasis, :nvir] = C_vir
+        C_vir = cv
+    out = _launch(None, "ao_to_mo_trn2", eri.contiguous(), C_occ.contiguous(), C_vir.contiguous())
+    return out[:, :nvir, :naux] if (nvp, nxp) != (nvir, naux) else out
+
+
 def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
     """Batched 2D matmul ``A @ B`` over a leading batch dim.
 
@@ -874,6 +1087,9 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
         return _aten_on_device(torch.bmm, A, B)
     if route != "nki":
         return torch.bmm(A, B)
+
+    if _on_native_path():
+        _warn_native_kernel_deprecated("batched_matmul")
 
     from ._kernels import batched_matmul_kernel
 
