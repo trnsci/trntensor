@@ -148,11 +148,44 @@ def einsum(
         operands = tuple(op.to(target) for op in operands)
     plan = plan_contraction(subscripts, *operands, precision=precision)
     result = _execute_contraction(subscripts, operands, plan)
+    if alpha == 1.0 and out is None:
+        return result
+    return _scale_add(result, alpha, beta, out, operands)
+
+
+def _owns(result: torch.Tensor, others) -> bool:
+    """True when ``result`` may be overwritten: no autograd history to keep and
+    no storage shared with an operand or ``out`` (``torch.einsum`` can return a
+    view of its input, e.g. ``"ij->ji"``)."""
+    if result.requires_grad:
+        return False
+    ptr = result.untyped_storage().data_ptr()
+    return all(t.untyped_storage().data_ptr() != ptr for t in others if isinstance(t, torch.Tensor))
+
+
+def _scale_add(result, alpha, beta, out, operands):
+    """``alpha * result + beta * out``, in place when ``result`` is a fresh tensor.
+
+    Same float ops in the same order as ``result.mul(alpha).add(out, alpha=beta)``,
+    so the same bits. Out of place each step allocated and page-faulted a fresh
+    result-sized host tensor, which cost more than the contraction's download:
+    on Trn2, 4096³ host einsum took 32 ms bare and 68 ms with
+    ``alpha=2, beta=1, out=C`` (trnblas#61 found the same in its epilogues).
+    """
+    inplace = _owns(result, (*operands, out)) and torch.result_type(result, alpha) == result.dtype
+    if inplace and out is not None:
+        inplace = (
+            torch.broadcast_shapes(result.shape, out.shape) == result.shape
+            and torch.result_type(result, out) == result.dtype
+            and out.device == result.device
+        )
+    if not inplace:
+        if alpha != 1.0:
+            result = result.mul(alpha)
+        return result if out is None else result.add(out, alpha=beta)
     if alpha != 1.0:
-        result = result.mul(alpha)
-    if out is not None:
-        result = result.add(out, alpha=beta)
-    return result
+        result.mul_(alpha)
+    return result if out is None else result.add_(out, alpha=beta)
 
 
 def _execute_sharded(

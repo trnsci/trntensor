@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Host results at the host-link rate (#56).** On the native TorchNeuron
+  path, results of 1 MiB and up that come back to the host (`einsum` /
+  `multi_einsum` with host operands on the `aten`-on-device route, kernel
+  launches, `from_device`) are copied into memory from the accelerator's
+  caching host allocator (`torch.empty(..., pin_memory=True)`), the fix
+  trnblas#64 made. A copy into fresh pageable memory runs at about 4 GB/s on
+  Trn2 because every page faults; into that memory it runs at 13-14 GB/s.
+  Each call still returns a fresh tensor, and results are bit-identical.
+  `TRNTENSOR_PINNED_OUTPUT=0` turns it off.
+- **`einsum`'s `alpha` / `beta` / `out` epilogue runs in place** on a fresh
+  result (same float ops, same bits). Out of place each step allocated and
+  page-faulted another result-sized host tensor.
+- Trn2, host operands, warm medians: `einsum("ij,jk->ik")` 4096³ 32 -> 20 ms,
+  8192×1024×8192 80 -> 29 ms; with `alpha=2, beta=1, out=C` 69 -> 29 ms and
+  230 -> 63 ms; 16×1024³ bmm 30 -> 17 ms; `from_device` of 256 MB 68 -> 19 ms.
+  `ao_to_mo_transform` and `mp2_energy` with host inputs run on the host and
+  are unchanged.
+
 ### Added
 
 - **Packed (μ≥ν) three-centre integrals in `ao_to_mo_transform` (#54).**
