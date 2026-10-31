@@ -610,6 +610,7 @@ class TestNativeKernelRetirement:
         monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
         monkeypatch.setattr(dispatch, "_native_kernel_deprecations_emitted", set())
+        monkeypatch.setattr(dispatch, "_native_kernel_failed", set())
         monkeypatch.setattr(dispatch, "_backend", "auto")
         monkeypatch.delenv("TRNTENSOR_FORCE_BACKEND", raising=False)
         monkeypatch.delenv("TRNTENSOR_MP2_ENERGY", raising=False)
@@ -668,6 +669,27 @@ class TestNativeKernelRetirement:
         monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
         assert dispatch._mp2_energy_route(B) == "legacy"
         monkeypatch.setattr(dispatch, "_use_nki", lambda: False)
+        assert dispatch._mp2_energy_route(B) == "aten"
+
+    def test_failed_kernel_shape_falls_back_and_is_remembered(self, monkeypatch):
+        from trntensor.quantum import _cpu_mp2_energy
+
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
+        monkeypatch.setattr(dispatch, "_MP2_ROW_MIN_ROW_FLOP", 0)
+        monkeypatch.delenv("TRNTENSOR_REQUIRE_NKI", raising=False)
+        attempts = []
+
+        def oom(*a, **k):
+            attempts.append(1)
+            raise RuntimeError("NRT_RESOURCE")
+
+        monkeypatch.setattr(dispatch, "_nki_mp2_energy_rows", oom)
+        B = torch.randn(4, 8, 16) * 0.1
+        eo, ev = -torch.rand(4) - 1.0, torch.rand(8) + 0.5
+        for _ in range(3):
+            torch.testing.assert_close(trntensor.mp2_energy(B, eo, ev), _cpu_mp2_energy(B, eo, ev))
+        assert attempts == [1]
         assert dispatch._mp2_energy_route(B) == "aten"
 
     def test_ao_to_mo_route(self, monkeypatch):

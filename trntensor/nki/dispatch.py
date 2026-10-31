@@ -868,6 +868,18 @@ def _mp2_row_dims(nocc: int, nvir: int, naux: int) -> dict:
 # carries enough work. TRNTENSOR_MP2_ENERGY overrides: auto | rows | aten |
 # legacy (the original single-launch kernel; deprecated on the native path).
 _MP2_ENERGY_CHOICES = ("auto", "rows", "aten", "legacy")
+# Shapes whose Trn2 kernel launch failed in this process (e.g. its input
+# staging hit NRT_RESOURCE with the device nearly full). "auto" sends them
+# straight to aten instead of paying the failed attempt again: at nocc=96,
+# nvir=672, naux=2304 with 20 of 24 GB held, each failed attempt cost ~2.3 s
+# on top of aten's 1.3 s (#51).
+_native_kernel_failed: set[tuple] = set()
+
+
+def _note_native_kernel_failure(key: tuple) -> None:
+    _native_kernel_failed.add(key)
+
+
 _MP2_ROW_MIN_ROW_FLOP = 3.0e9
 
 
@@ -896,7 +908,7 @@ def _mp2_energy_route(B: torch.Tensor) -> str:
     fits = dims["sbuf_bytes"] <= _MP2_ROW_SBUF_BUDGET
     if _nki_forced():
         return "rows" if fits else "aten"
-    if B.device.type != _NEURON_DEVICE:
+    if B.device.type != _NEURON_DEVICE or ("mp2", tuple(B.shape)) in _native_kernel_failed:
         return "aten"
     return "rows" if fits and dims["row_flop"] >= _MP2_ROW_MIN_ROW_FLOP else "aten"
 
@@ -1105,6 +1117,8 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int) -> str:
         return "aten"
     if _nki_forced():
         return "trn2"
+    if ("ao2mo", tuple(eri.shape), nocc, nvir) in _native_kernel_failed:
+        return "aten"
     big = nocc * eri.shape[0] ** 2 * eri.shape[2] >= _AO_TO_MO_MIN_MACS
     return "trn2" if big and eri.device.type == _NEURON_DEVICE else "aten"
 

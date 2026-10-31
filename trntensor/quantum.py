@@ -93,6 +93,8 @@ def mp2_energy(
 
             if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
                 raise
+            if route == "rows":
+                _d._note_native_kernel_failure(("mp2", tuple(B.shape)))
     return _cpu_mp2_energy(B, eps_occ, eps_vir)
 
 
@@ -215,6 +217,8 @@ def ao_to_mo_transform(
 
             if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
                 raise
+            if route == "trn2":
+                _d._note_native_kernel_failure(("ao2mo", tuple(eri.shape), nocc, nvir))
     return _cpu_ao_to_mo_transform(eri, C_occ, C_vir)
 
 
