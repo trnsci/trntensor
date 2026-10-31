@@ -908,10 +908,17 @@ def _device_has_room(device: torch.device, nbytes: int) -> bool:
         mod = getattr(torch, _NEURON_DEVICE)
         idx = device.index if device.index is not None else mod.current_device()
         total = mod.get_device_properties(idx).total_memory
-        used = mod.memory_allocated(idx)
+        if mod.memory_allocated(idx) + nbytes <= total - _MP2_ROW_HEADROOM_BYTES:
+            return True
+        # The first launch of a kernel shape leaves its inputs in a reference
+        # cycle (measured on TorchNeuron, #51: the ~1 GiB staging buffer at
+        # nocc=96 stays allocated until a gc pass). Collect once and recheck.
+        import gc
+
+        gc.collect()
+        return mod.memory_allocated(idx) + nbytes <= total - _MP2_ROW_HEADROOM_BYTES
     except Exception:
         return True
-    return used + nbytes <= total - _MP2_ROW_HEADROOM_BYTES
 
 
 def _mp2_energy_route(B: torch.Tensor) -> str:
