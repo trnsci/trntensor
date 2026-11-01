@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fix:** in every release through 0.21.0, on every backend, `einsum` planned matmul/bmm without checking index order, so transposed or permuted outputs came back in the wrong layout (`ij,jk->ki` returned `A@B`, silently for square operands) and non-canonical batched operands raised. 228 of 364 two-operand cases were wrong or raised (#65, #64). Also: `df_exchange` tiling minimises partial SYRK tiles, so K at n_ao=970 drops from 118 to 94 ms (#66).
+
 ### Fixed
 
 - **`einsum` returned the wrong layout for transposed or permuted outputs**
