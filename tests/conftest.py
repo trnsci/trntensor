@@ -30,6 +30,25 @@ if os.environ["NKI_ENABLE_TRACE_CACHE"] != "0" and "NKI_TRACE_CACHE_URL" not in 
     atexit.register(shutil.rmtree, _trace_cache_dir, ignore_errors=True)
 
 
+def pytest_addoption(parser):
+    # Reference-conformance suite (tests/test_conformance.py, trnsci/trnsci#105).
+    # The CPU CI job runs it on the pytorch backend with host inputs; a Trn2 run
+    # passes --backend nki|auto and --conformance-device neuron to execute the
+    # same cases against the same independent references.
+    group = parser.getgroup("trntensor conformance")
+    group.addoption(
+        "--backend",
+        default="pytorch",
+        choices=("pytorch", "nki", "auto"),
+        help="trntensor backend for tests/test_conformance.py (default: pytorch)",
+    )
+    group.addoption(
+        "--conformance-device",
+        default="cpu",
+        help="device for conformance-test inputs, e.g. neuron (default: cpu)",
+    )
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "neuron: requires Neuron hardware")
     config.addinivalue_line(
