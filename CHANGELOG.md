@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: new fused DF exchange and Coulomb builds, `trntensor.df_exchange` / `df_coulomb`, which read packed integrals in place without building the square: K at n_ao=970 is 2.6× faster (304 → 118 ms) at unchanged error, and DF-RHF SCF at n_ao=970 converges in 4.71 s instead of 9.68 s (#62, #60).
+
 ### Added
 
 - **`trntensor.df_exchange(B, C_occ, alpha=1.0)`: the DF exchange matrix
