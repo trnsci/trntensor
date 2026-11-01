@@ -6,7 +6,10 @@ public-facing dispatch is in `trntensor.nki.dispatch`.
 
 ## `set_backend(backend: str)`
 
-- `"auto"` — use NKI if `nki` is importable, else PyTorch
+- `"auto"` — the default. When `nki` is importable, each call is routed by
+  measured thresholds (see [Environment variables](#environment-variables)
+  and the tables below); on the native path matmul/bmm run on aten, and the
+  fused chemistry kernels run where they beat it. Otherwise PyTorch
 - `"pytorch"` — always use `torch.matmul` / `torch.einsum`
 - `"nki"` — require NKI; raises `RuntimeError` on non-Neuron hosts
 
@@ -29,7 +32,10 @@ detected on the first kernel launch (never at import):
   (`torch_neuronx.device_count() > 0`). Each kernel is a PyTorch custom op
   on `device="neuron"`, also callable directly and inside
   `torch.compile(backend="neuron")`: `torch.ops.trntensor.matmul`,
-  `batched_matmul`, `mp2_energy`, `ao_to_mo_transform`. The ops are
+  `batched_matmul`, `mp2_energy`, `ao_to_mo_transform`, `mp2_energy_row`,
+  `ao_to_mo_trn2`, `ao_to_mo_trn2_packed`, `df_half_packed`,
+  `df_exchange_syrk`, `df_coulomb_d`, `df_coulomb_j` (`matmul` / `batched_matmul` are
+  deprecated there, see below). The ops are
   registered only once this path is selected, and this path never imports
   `torch_xla`.
 - **XLA (Trn1)** — chosen when `torch_xla` is installed and the native
@@ -117,7 +123,7 @@ supported in maintenance mode."
 | `TRNTENSOR_MIN_NKI_FLOPS_NATIVE_PINNED=<int>\|never` | Native path: M·K·N at which the NKI kernel replaces aten on the device. Below it, device-resident operands run `torch.matmul` / `torch.bmm` (aten) on `neuron`. Default: `never`, because on Trn2 aten beat the NKI kernels at every measured size. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Force the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. Emit the one-time XLA-path and `to_xla` / `from_xla` deprecation warnings. |
-| `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting (not trntensor's). Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. Set it with `pip install -e`; the test suite sets it by default. |
+| `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting (not trntensor's). Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. Set it with `pip install -e`, or if you write your own NKI kernel factories ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)). The test suite keeps the cache on, with a fresh cache directory per session. |
 | `TRNTENSOR_MP2_ENERGY=auto\|rows\|aten\|legacy` | Native path: force the `mp2_energy` executor (`rows` = the Trn2 row kernel, `legacy` = the original kernel, deprecated there). |
 | `TRNTENSOR_AO_TO_MO=auto\|trn2\|aten\|legacy` | Native path: force the `ao_to_mo_transform` executor (`trn2` = the Trn2 kernel, or `ao_to_mo_trn2_packed_kernel` for a packed 2-D `eri`; `legacy` = the original kernel, deprecated there; `aten` and `legacy` unpack a packed `eri` first). |
 | `TRNTENSOR_DF_EXCHANGE=auto\|trn2\|aten` | Native path: force the `df_exchange` executor (`trn2` = `df_half_packed_kernel` + `df_exchange_syrk_kernel` on packed integrals; `aten` = row gather + einsum + one GEMM). `auto` uses the kernels for device-resident packed `B` from `nocc·nbasis²·naux` = 1e7 (#60). |
@@ -279,11 +285,9 @@ The original AO→MO and MP2 kernels remain the XLA-path (Trn1) kernels. See
   `J = B d`, each streaming packed `B` once in 128-row tiles on the Vector
   Engine.
 
-The DF-MP2 pair pattern `einsum("ap,bp->ab")` is served by
-`matmul_kernel` through the planner's `transB=True` route — no
-dedicated kernel needed. Fused energy-denominator kernel is tracked
-in [#13][i13].
-
-[i13]: https://github.com/trnsci/trntensor/issues/13
+The DF-MP2 pair pattern `einsum("ap,bp->ab")` is planned as `matmul` with
+`transB=True`: aten on the native path, `matmul_kernel` on the XLA path
+above the FLOP threshold. The fused contraction + energy-denominator
+kernel (#13) is `trntensor.mp2_energy`.
 
 [m2]: https://github.com/trnsci/trntensor/milestone/2
