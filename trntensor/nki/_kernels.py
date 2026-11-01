@@ -666,3 +666,412 @@ if HAS_NKI:
         TP = eri_v.shape[1]
         NUB = ao_to_mo_trn2_nub(TP)
         return _ao_to_mo_trn2_body(eri_v, img, C_occ, C_vir, NB, NPC * TP, TP, NUB)
+
+
+# ---------------------------------------------------------------------------
+# DF exchange (K) from packed integrals (#60)
+# ---------------------------------------------------------------------------
+#
+# K[μ, ν] = Σ_{i, P} X[i, μ, P] X[i, ν, P],  X[i, ν, P] = Σ_λ C[λ, i] B[λν, P],
+# with B the packed μ≥ν three-centre integrals. Two launches:
+#
+# 1. ``df_half_packed_kernel`` gathers packed rows in place (the batched
+#    indirect DMA of ``ao_to_mo_trn2_packed_kernel``) and forms the
+#    half-transformed ``Xt[P, i, ν]`` with the aux index on partitions: the
+#    gathered ``(128 λ, TP P)`` block is the stationary operand and the
+#    resident ``C_occ`` λ-tile the moving one, so no transposes are needed.
+# 2. ``df_exchange_syrk_kernel`` accumulates ``K = Σ_{P-tile, i} Xt[:, i, :]ᵀ
+#    Xt[:, i, :]`` in PSUM: 128 aux rows per contraction, upper-triangle
+#    128-row strips only, mirrored on the Tensor Engine on the way out.
+#
+# Launch 1 splits aux chunks (or ν groups) and launch 2 the occupied index
+# across the programs of the logical core, so both physical cores work at
+# LNC=2. Each program of launch 2 keeps its own running partial K. Traced
+# loops unroll, so the dispatcher runs the pair over groups of aux chunks
+# (``df_group_chunks``) to bound compile time and the ``Xt`` scratch.
+
+DF_K_SBUF_BUDGET = 160 * 1024  # bytes per partition for launch 1's buffers
+DF_K_LAUNCH_INSTR = 48_000  # estimated instructions per half-transform launch
+
+
+def df_half_sbuf_bytes(nb: int, nocc: int, tp: int, nub: int, nvc: int) -> int:
+    """SBUF bytes per partition for ``df_half_packed_kernel`` (double-buffered)."""
+    nkb = nb // TILE_K
+    ns = -(-tp // TILE_K)
+    return 4 * (nkb * nocc + 2 * nkb * nvc + 2 * nkb * nub * tp + 2 * ns * nocc * nvc)
+
+
+def df_half_tiling(naux: int, nb: int, nocc: int) -> tuple[int, int, int] | None:
+    """``(TP, NUB, NVC)`` for ``df_half_packed_kernel``, or None if nothing fits.
+
+    ``TP`` divides ``naux`` (the packed rows are viewed as ``(npair·NPC, TP)``
+    without a padding copy) and is in ``[32, 512]`` (or ``naux`` itself when
+    smaller); an ``naux`` with no such divisor gets None. ``NUB`` (ν per gather, a power of
+    two ≤ 8) sets the batch of one indirect DMA, ``128·NUB`` rows; ``NVC``
+    (a power of two ≤ 128 dividing ``nb``) is the ν run kept in SBUF and
+    stored per DMA. Choice, in order: fewest ≤128-row aux tiles
+    ``NPC·ceil(TP/128)`` (Tensor Engine work), then the largest gather batch
+    (on Trn2 at n_ao = 490, NUB 2 → 4 → 8 took the K build from 19 to 15 to
+    12 ms), then the widest ``NVC``, then the widest ``TP``, all within
+    ``DF_K_SBUF_BUDGET``.
+    """
+    best = None
+    for tp in range(min(naux, 512), min(naux, 32) - 1, -1):
+        if naux % tp:
+            continue
+        tiles = (naux // tp) * -(-tp // TILE_K)
+        for nub in (8, 4, 2, 1):
+            if nub * tp > 4096:
+                continue
+            nvc = 128
+            while nvc >= nub and (
+                nb % nvc or df_half_sbuf_bytes(nb, nocc, tp, nub, nvc) > DF_K_SBUF_BUDGET
+            ):
+                nvc //= 2
+            if nvc < nub:
+                continue
+            key = (tiles, -nub, -nvc, -tp)
+            if best is None or key < best[0]:
+                best = (key, (tp, nub, nvc))
+            break
+    return None if best is None else best[1]
+
+
+def df_group_chunks(npc: int, nb: int, tp: int, nub: int, nvc: int) -> int:
+    """Aux chunks per launch pair: the most whose estimated instruction count
+    (both programs of an LNC=2 core) stays under ``DF_K_LAUNCH_INSTR``.
+
+    The kernels' loops are unrolled when traced, so this bounds the compile
+    time (about 2 minutes per 50k instructions on Trn2) and the ``Xt``
+    scratch; the dispatcher loops over the groups.
+    """
+    nkb = nb // TILE_K
+    ns = -(-tp // TILE_K)
+    per_chunk = (nb // nub) * (nkb + nub * ns * (nkb + 1))
+    return max(1, min(npc, DF_K_LAUNCH_INSTR // max(1, per_chunk)))
+
+
+def df_exchange_blocks(nb: int, banks: int) -> list[list[tuple[int, int, int]]]:
+    """Passes of ``(m, ν0, w)`` K blocks for ``df_exchange_syrk_kernel``.
+
+    Strip ``m`` (rows ``128m..128m+127``) covers columns ``ν ≥ 128m`` in
+    ≤512-wide blocks (one PSUM bank each); consecutive blocks are grouped
+    into passes of at most ``banks`` PSUM banks.
+    """
+    blocks = []
+    for m in range(nb // TILE_K):
+        for v0 in range(m * TILE_K, nb, TILE_N):
+            blocks.append((m, v0, min(TILE_N, nb - v0)))
+    return [blocks[i : i + banks] for i in range(0, len(blocks), banks)]
+
+
+if HAS_NKI:
+
+    @nki.jit
+    def df_half_packed_kernel(eri_v, img, C_occ, nub: int = 8):
+        """``Xt[P, i, ν] = Σ_λ C_occ[λ, i] B[λν, P]`` from packed integrals (#60).
+
+        ``eri_v``: packed ``(npair, naux)`` viewed as ``(npair·NPC, TP)``.
+        ``img``: ``(G, NVG, 128, NKB·NVC)`` uint32 gather indices for G
+        consecutive aux chunks (a slice of ``dispatch._df_gather_images``):
+        for chunk ``c`` and ν group ``g``, the ``(128, NUB)`` block at
+        columns ``k·NVC + b·NUB`` gathers ``B[k·128 + p, g·NVC + b·NUB + u,
+        chunk]`` into ``(p, u)``. ``C_occ``: ``(NB, NOCC)``, NB a multiple
+        of 128 (zero rows past nbasis), NOCC ≤ 512. ``nub``: ν per gather,
+        the block width the indices were built for.
+
+        Returns ``Xt`` ``(G·TP, NVG, NOCC, NVC)``: ``Xt[P, g, i, v] = X[i, g·NVC
+        + v, P]`` for the aux rows of these chunks. Each stored SBUF block is
+        one contiguous ``NOCC·NVC`` run per row; with ν innermost the run
+        would be only ``NVC`` elements, and at n_ao = 970 (NVC = 16) those
+        64-byte DMA writes made this launch 5x slower. Columns ν past
+        nbasis hold finite junk that only reaches K's padding.
+        """
+        NB, NOCC = C_occ.shape
+        G, NVG = img.shape[0], img.shape[1]
+        TP = eri_v.shape[1]
+        TILE = 128
+        NKB = NB // TILE
+        NVC = NB // NVG
+        NUB = nub
+        NS = (TP + TILE - 1) // TILE
+        n_prog, pid, axis = _programs(G, NVG)
+        G_per = G // n_prog if axis == 0 else G
+        NVG_per = NVG // n_prog if axis == 1 else NVG
+
+        xt = nl.ndarray((G * TP, NVG, NOCC, NVC), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        co_sb = nl.ndarray((TILE, NKB * NOCC), dtype=C_occ.dtype, buffer=nl.sbuf)
+        for k in nl.affine_range(NKB):
+            co_sb[0:TILE, k * NOCC : (k + 1) * NOCC] = nl.load(
+                C_occ[k * TILE : (k + 1) * TILE, 0:NOCC]
+            )
+
+        for pc in nl.affine_range(G_per):
+            c = pid * G_per + pc if axis == 0 else pc
+            for gi in nl.affine_range(NVG_per):
+                g = pid * NVG_per + gi if axis == 1 else gi
+                idx_sb = nl.ndarray((TILE, NKB * NVC), dtype=nl.uint32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=idx_sb, src=img[c, g])
+                x_sb = nl.ndarray((TILE, NS, NOCC, NVC), dtype=nl.float32, buffer=nl.sbuf)
+                for vb in nl.affine_range(NVC // NUB):
+                    e_blk = nl.ndarray((TILE, NKB, NUB, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
+                    for k in nl.affine_range(NKB):
+                        nisa.dma_copy(
+                            dst=e_blk[0:TILE, k, 0:NUB, 0:TP],
+                            src=eri_v.ap(
+                                pattern=[[TP, TILE * NUB], [1, TP]],
+                                vector_offset=idx_sb[
+                                    0:TILE, k * NVC + vb * NUB : k * NVC + vb * NUB + NUB
+                                ],
+                                indirect_dim=0,
+                            ),
+                        )
+                    for u in nl.affine_range(NUB):
+                        for s in range(NS):
+                            ms = min(TILE, TP - s * TILE)
+                            px = nl.zeros((ms, NOCC), dtype=nl.float32, buffer=nl.psum)
+                            for k in nl.affine_range(NKB):
+                                nisa.nc_matmul(
+                                    dst=px,
+                                    stationary=e_blk[0:TILE, k, u, s * TILE : s * TILE + ms],
+                                    moving=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
+                                    accumulate=True,
+                                )
+                            nisa.tensor_copy(src=px, dst=x_sb[0:ms, s, 0:NOCC, vb * NUB + u])
+                for s in range(NS):
+                    ms = min(TILE, TP - s * TILE)
+                    r0 = c * TP + s * TILE
+                    nl.store(xt[r0 : r0 + ms, g, 0:NOCC, 0:NVC], value=x_sb[0:ms, s, 0:NOCC, 0:NVC])
+        return xt
+
+    @nki.jit
+    def df_exchange_syrk_kernel(xt, kin, banks: int = 6):
+        """``out[p] = kin[p] + Σ_{P, i ∈ program p} X[i, :, P] X[i, :, P]ᵀ`` (#60).
+
+        ``xt``: ``(NR, NVG, NOCC, NVC)`` from ``df_half_packed_kernel``; the
+        last 128-row aux tile may be partial. ``kin``: ``(2, NB, NB)``
+        running partial sums (symmetric), so a chain of launches over aux
+        groups accumulates without extra adds; ``K = out[0] + out[1]`` at
+        the end.
+
+        Per aux tile and group of ``GI`` occupied orbitals one DMA brings
+        ``(rows, ν, GI)`` in ≥1 KiB runs; an engine copy then lays each
+        orbital's row out contiguously in ν for the Tensor Engine. PSUM
+        holds the K blocks of one pass (``df_exchange_blocks``: the
+        upper-triangle 128-row strips in ≤512-wide blocks). Each finished
+        strip is stored and its off-diagonal 128×128 tiles are transposed on
+        the Tensor Engine into the lower triangle; diagonal tiles are stored
+        as ``0.5·(T + Tᵀ)``, so each ``out[p]`` is exactly symmetric. The
+        occupied index is split across the programs (NOCC even at LNC=2; the
+        dispatcher pads it with a zero orbital); with one program ``out[1] =
+        kin[1]``.
+        """
+        NR, NVG, NOCC, NVC = xt.shape
+        NB = NVG * NVC
+        TILE = 128
+        NTF = NR // TILE
+        TAIL = NR - NTF * TILE
+        n_prog, pid, _axis = _programs(NOCC)
+        NO_per = NOCC // n_prog
+        GI = max(1, min(NO_per, 16384 // NB))
+        NGF = NO_per // GI
+        GR = NO_per - NGF * GI
+        out = nl.ndarray((2, NB, NB), dtype=nl.float32, buffer=nl.shared_hbm)
+        if n_prog == 1:
+            for m in nl.affine_range(NB // TILE):
+                kc = nl.ndarray((TILE, NB), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=kc, src=kin[1, m * TILE : (m + 1) * TILE, 0:NB])
+                nl.store(out[1, m * TILE : (m + 1) * TILE, 0:NB], value=kc)
+
+        for blocks in df_exchange_blocks(NB, banks):
+            lo = blocks[0][0] * TILE
+            g_lo = lo // NVC
+            W = NB - lo
+            accs = [
+                nl.zeros((TILE, w), dtype=nl.float32, buffer=nl.psum) for (_m, _v0, w) in blocks
+            ]
+            for r0, nt, ms in ((0, NTF, TILE), (NTF * TILE, 1 if TAIL else 0, TAIL)):
+                for t in nl.affine_range(nt):
+                    for i_base, ng, gi in ((0, NGF, GI), (NGF * GI, 1 if GR else 0, GR)):
+                        for ig in nl.affine_range(ng):
+                            i0 = pid * NO_per + i_base + ig * gi
+                            xg = nl.ndarray(
+                                (ms, NVG - g_lo, gi, NVC), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.dma_copy(
+                                dst=xg,
+                                src=xt[
+                                    r0 + t * TILE : r0 + t * TILE + ms,
+                                    g_lo:NVG,
+                                    i0 : i0 + gi,
+                                    0:NVC,
+                                ],
+                            )
+                            for ii in nl.affine_range(gi):
+                                xr = nl.ndarray((ms, W), dtype=nl.float32, buffer=nl.sbuf)
+                                nisa.tensor_copy(
+                                    dst=xr.reshape_dim(1, (NVG - g_lo, NVC)),
+                                    src=xg[0:ms, 0 : NVG - g_lo, ii, 0:NVC],
+                                )
+                                for b, (m, v0, w) in enumerate(blocks):
+                                    a0 = m * TILE - lo
+                                    nisa.nc_matmul(
+                                        dst=accs[b],
+                                        stationary=xr[0:ms, a0 : a0 + TILE],
+                                        moving=xr[0:ms, v0 - lo : v0 - lo + w],
+                                        accumulate=True,
+                                    )
+            for b, (m, v0, w) in enumerate(blocks):
+                kb = nl.ndarray((TILE, w), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=kb, src=kin[pid, m * TILE : (m + 1) * TILE, v0 : v0 + w])
+                ks = nl.ndarray((TILE, w), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=ks, data1=accs[b], data2=kb, op=nl.add)
+                if v0 == m * TILE:
+                    # The diagonal tile is computed whole and the Tensor
+                    # Engine's fp32 products are not bitwise symmetric in
+                    # (μ, ν); store 0.5·(T + Tᵀ) so K is exactly symmetric.
+                    pd = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(dst=pd, data=ks[0:TILE, 0:TILE])
+                    kd = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_tensor(dst=kd, data1=ks[0:TILE, 0:TILE], data2=pd, op=nl.add)
+                    nisa.tensor_scalar(
+                        dst=ks[0:TILE, 0:TILE], data=kd, op0=nl.multiply, operand0=0.5
+                    )
+                nl.store(out[pid, m * TILE : (m + 1) * TILE, v0 : v0 + w], value=ks)
+                for c0 in range(v0, v0 + w, TILE):
+                    if c0 // TILE <= m:
+                        continue
+                    pt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(dst=pt, data=ks[0:TILE, c0 - v0 : c0 - v0 + TILE])
+                    kt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=pt, dst=kt)
+                    nl.store(out[pid, c0 : c0 + TILE, m * TILE : (m + 1) * TILE], value=kt)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# DF Coulomb (J) from packed integrals (#60)
+# ---------------------------------------------------------------------------
+#
+# d[P] = Σ_r B[r, P] p[r] and J[r] = Σ_P B[r, P] d[P] over the packed rows
+# r = μ(μ+1)/2 + ν. Both stream B once in contiguous 128-row tiles (rows on
+# partitions, aux on the free axis) and do the arithmetic as one fused
+# multiply-add or multiply-reduce per tile on the Vector Engine, so they run
+# at DMA rate. Full row tiles are split evenly across the programs; the
+# dispatcher handles the few leftover rows with aten.
+
+DF_J_COLS = 4096  # aux columns per SBUF tile (16 KiB per partition)
+DF_J_RED = 128  # aux columns per J partial sum (fewer terms per fp32 chain)
+DF_D_GROUP = 32  # row tiles per partial d accumulator
+
+if HAS_NKI:
+
+    @nki.jit
+    def df_coulomb_d_kernel(B, pw):
+        """``out[p, P] = Σ_{r ∈ program p} B[r, P] pw[r]`` over full 128-row tiles.
+
+        ``B``: packed ``(NR, NAUX)``; ``pw``: ``(NR, 1)`` weighted packed
+        density. Uses rows ``[0, NT2·128)``, ``NT2 = 2·(NR // 256)``, at any
+        program count; the dispatcher adds the leftover rows. Returns ``(2,
+        1, NAUX)`` (``out[1] = 0`` with one program); ``d = out[0] +
+        out[1]``.
+        """
+        NR, NAUX = B.shape
+        TILE = 128
+        n_prog, pid, _axis = _programs(2)
+        NT_per = (NR // (2 * TILE)) * 2 // n_prog
+        out = nl.ndarray((2, 1, NAUX), dtype=nl.float32, buffer=nl.shared_hbm)
+        if n_prog == 1:
+            z = nl.zeros((1, NAUX), dtype=nl.float32, buffer=nl.sbuf)
+            nl.store(out[1, 0:1, 0:NAUX], value=z)
+        ones = nl.ndarray((TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=ones, value=1.0)
+        NG = NT_per // DF_D_GROUP
+        for c0 in range(0, NAUX, DF_J_COLS):
+            w = min(DF_J_COLS, NAUX - c0)
+            acc = nl.zeros((TILE, w), dtype=nl.float32, buffer=nl.sbuf)
+            # Tiles in groups of DF_D_GROUP, each into a fresh accumulator
+            # that is then added to ``acc``: shorter fp32 chains (on Trn2 at
+            # n_ao = 970 one chain of 1840 tiles gave J 2.4e-6 off fp64).
+            for t0, ng, gs in ((0, NG, DF_D_GROUP), (NG * DF_D_GROUP, 1, NT_per - NG * DF_D_GROUP)):
+                if gs == 0 or ng == 0:
+                    continue
+                for tg in nl.sequential_range(ng):
+                    accg = nl.zeros((TILE, w), dtype=nl.float32, buffer=nl.sbuf)
+                    for tt in nl.sequential_range(gs):
+                        r0 = (pid * NT_per + t0 + tg * gs + tt) * TILE
+                        bt = nl.ndarray((TILE, w), dtype=B.dtype, buffer=nl.sbuf)
+                        nisa.dma_copy(dst=bt, src=B[r0 : r0 + TILE, c0 : c0 + w])
+                        pc = nl.ndarray((TILE, 1), dtype=pw.dtype, buffer=nl.sbuf)
+                        nisa.dma_copy(dst=pc, src=pw[r0 : r0 + TILE, 0:1])
+                        nisa.scalar_tensor_tensor(
+                            dst=accg,
+                            data=bt,
+                            op0=nl.multiply,
+                            operand0=pc,
+                            op1=nl.add,
+                            operand1=accg,
+                        )
+                    nisa.tensor_tensor(dst=acc, data1=acc, data2=accg, op=nl.add)
+            # Sum the 128 partitions on the Tensor Engine.
+            dsb = nl.ndarray((1, w), dtype=nl.float32, buffer=nl.sbuf)
+            for j0 in range(0, w, TILE_N):
+                jw = min(TILE_N, w - j0)
+                ps = nl.zeros((1, jw), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(
+                    dst=ps, stationary=ones, moving=acc[0:TILE, j0 : j0 + jw], accumulate=True
+                )
+                nisa.tensor_copy(src=ps, dst=dsb[0:1, j0 : j0 + jw])
+            nl.store(out[pid, 0:1, c0 : c0 + w], value=dsb)
+        return out
+
+    @nki.jit
+    def df_coulomb_j_kernel(B, d_b):
+        """``J[r] = Σ_P B[r, P] d[P]`` over full 128-row tiles.
+
+        ``d_b``: ``(128, NAUX)``, ``d`` replicated on every partition. Uses
+        the rows of :func:`df_coulomb_d_kernel`. Returns ``(128, NT2)`` with
+        ``J[t·128 + p] = out[p, t]``.
+        """
+        NR, NAUX = B.shape
+        TILE = 128
+        n_prog, pid, _axis = _programs(2)
+        NT2 = (NR // (2 * TILE)) * 2
+        NT_per = NT2 // n_prog
+        out = nl.ndarray((TILE, NT2), dtype=nl.float32, buffer=nl.shared_hbm)
+        db = nl.ndarray((TILE, NAUX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=db, src=d_b[0:TILE, 0:NAUX])
+        jall = nl.ndarray((TILE, NT_per), dtype=nl.float32, buffer=nl.sbuf)
+        for t in nl.affine_range(NT_per):
+            r0 = (pid * NT_per + t) * TILE
+            parts = nl.ndarray(
+                (TILE, (NAUX + DF_J_RED - 1) // DF_J_RED), dtype=nl.float32, buffer=nl.sbuf
+            )
+            # One DMA per DF_J_COLS-wide piece of the row tile (long
+            # contiguous runs), then one multiply-reduce per DF_J_RED
+            # columns (short fp32 chains). 128-column DMAs made this kernel
+            # descriptor-bound: 76 ms at n_ao = 970.
+            for b0 in range(0, NAUX, DF_J_COLS):
+                bw = min(DF_J_COLS, NAUX - b0)
+                bt = nl.ndarray((TILE, bw), dtype=B.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=bt, src=B[r0 : r0 + TILE, b0 : b0 + bw])
+                prod = nl.ndarray((TILE, bw), dtype=nl.float32, buffer=nl.sbuf)
+                for c0 in range(b0, b0 + bw, DF_J_RED):
+                    w = min(DF_J_RED, b0 + bw - c0)
+                    ci = c0 // DF_J_RED
+                    nisa.scalar_tensor_tensor(
+                        dst=prod[0:TILE, c0 - b0 : c0 - b0 + w],
+                        data=bt[0:TILE, c0 - b0 : c0 - b0 + w],
+                        op0=nl.multiply,
+                        operand0=1.0,
+                        op1=nl.multiply,
+                        operand1=db[0:TILE, c0 : c0 + w],
+                        reduce_op=nl.add,
+                        reduce_res=parts[0:TILE, ci : ci + 1],
+                    )
+            nisa.tensor_reduce(
+                dst=jall[0:TILE, t : t + 1], op=nl.add, data=parts, axis=1, keepdims=True
+            )
+        nl.store(out[0:TILE, pid * NT_per : (pid + 1) * NT_per], value=jall)
+        return out

@@ -120,6 +120,8 @@ supported in maintenance mode."
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting (not trntensor's). Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. Set it with `pip install -e`; the test suite sets it by default. |
 | `TRNTENSOR_MP2_ENERGY=auto\|rows\|aten\|legacy` | Native path: force the `mp2_energy` executor (`rows` = the Trn2 row kernel, `legacy` = the original kernel, deprecated there). |
 | `TRNTENSOR_AO_TO_MO=auto\|trn2\|aten\|legacy` | Native path: force the `ao_to_mo_transform` executor (`trn2` = the Trn2 kernel, or `ao_to_mo_trn2_packed_kernel` for a packed 2-D `eri`; `legacy` = the original kernel, deprecated there; `aten` and `legacy` unpack a packed `eri` first). |
+| `TRNTENSOR_DF_EXCHANGE=auto\|trn2\|aten` | Native path: force the `df_exchange` executor (`trn2` = `df_half_packed_kernel` + `df_exchange_syrk_kernel` on packed integrals; `aten` = row gather + einsum + one GEMM). `auto` uses the kernels for device-resident packed `B` from `nocc·nbasis²·naux` = 1e7 (#60). |
+| `TRNTENSOR_DF_COULOMB=auto\|trn2\|aten` | Native path: force the `df_coulomb` executor (`trn2` = `df_coulomb_d_kernel` + `df_coulomb_j_kernel`; `aten` = two GEMVs). `auto` uses the kernels for device-resident packed `B` from `npair·naux` = 1e7 (#60). |
 | `TRNTENSOR_HOST_ROUTE=auto\|host\|device` | Native path, `"auto"` backend, all operands on the host: where the work runs (#56). `auto` (default) uploads it once it reaches the measured thresholds below; `host` keeps it on the host; `device` always uploads. Covers `mp2_energy`, `ao_to_mo_transform`, `einsum` / `multi_einsum` (matmul, bmm, generic and multi-operand plans). Only float32 / bfloat16 / float16 operands are uploaded. `set_backend("pytorch")` and `set_backend("nki")` ignore it. |
 | `TRNTENSOR_PINNED_OUTPUT=0` | Native path: download results with plain `.to("cpu")` instead of into memory from the caching host allocator (`torch.empty(..., pin_memory=True)`, results of 1 MiB and up; #56). |
 | `TRNTENSOR_FORCE_BACKEND=pytorch\|nki\|auto` | Override the backend selection at runtime without calling `set_backend()`. Used by benchmarks to sweep both paths on the same machine. |
@@ -265,6 +267,16 @@ The original AO→MO and MP2 kernels remain the XLA-path (Trn1) kernels. See
 - `batched_matmul_kernel(a, b)` — per-batch-slice matmul. Batch dim
   iterated via `nl.affine_range`; each slice reuses the stationary-A
   tile layout.
+- `df_half_packed_kernel(eri_v, img, C_occ, nub)` and
+  `df_exchange_syrk_kernel(xt, kin, banks)` — the fused DF exchange build
+  behind `trntensor.df_exchange` (#60): packed-row gather and half transform
+  into `Xt[P, i, ν]` (aux on partitions), then the PSUM SYRK over aux tiles
+  with upper-triangle strips mirrored on the Tensor Engine. Tilings from
+  `df_half_tiling`, `df_group_chunks` and `df_exchange_blocks`.
+- `df_coulomb_d_kernel(B, pw)` and `df_coulomb_j_kernel(B, d_b)` — the DF
+  Coulomb build behind `trntensor.df_coulomb` (#60): `d = Bᵀ pw` and
+  `J = B d`, each streaming packed `B` once in 128-row tiles on the Vector
+  Engine.
 
 The DF-MP2 pair pattern `einsum("ap,bp->ab")` is served by
 `matmul_kernel` through the planner's `transB=True` route — no

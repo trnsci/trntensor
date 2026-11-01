@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`trntensor.df_exchange(B, C_occ, alpha=1.0)`: the DF exchange matrix
+  straight from packed three-centre integrals (#60).**
+  `K = alpha·Σ_{i,P} X X^T` with `X[i,ν,P] = Σ_λ C_occ[λ,i] B[λν,P]`; for a
+  closed-shell SCF, `alpha=2`.
+  - On the native TorchNeuron path it is two NKI launches per group of aux
+    chunks. `df_half_packed_kernel` gathers the packed rows in place
+    (batched indirect DMA, as in `ao_to_mo_trn2_packed_kernel`) and forms
+    the half-transformed `Xt[P, i, ν]` with the aux index on partitions.
+    `df_exchange_syrk_kernel` accumulates K in PSUM over 128-row aux tiles,
+    computes only the upper-triangle strips and mirrors them on the Tensor
+    Engine. No `(n, n, naux)` square is built, `B` is not copied or padded,
+    and both physical cores work at LNC=2 (`program_id` split, no grids).
+  - `"auto"` uses it for device-resident packed `B` from
+    `nocc·nbasis²·naux` = 1e7; `TRNTENSOR_DF_EXCHANGE=auto|trn2|aten`
+    overrides. Elsewhere it is a row gather, one einsum and one GEMM.
+  - Trn2, one logical core, PySCF C_kH_2k+2 cc-pVDZ / cc-pvdz-jkfit, fp32,
+    against the unpack + einsum + `trnblas.syrk` K of trnsolver's DF-RHF
+    example: n_ao = 250 / 490 / 970 went 3.17 → 2.18, 15.5 → 9.33 and
+    304 → 118 ms at LNC=2 (1.5x / 1.7x / 2.6x), and 4.71 → 3.46, 25.9 →
+    16.9 and 424 → 230 ms at LNC=1. K error against float64 is unchanged
+    (8.1e-7 vs 8.3e-7 relative to max |K| at 970).
+  - In that example (with `df_coulomb` below, LNC=2, time to convergence)
+    the SCF went 352 → 239 ms at n_ao = 250, 756 → 671 ms at 490 and
+    9.68 → 5.98 s at 970 (J/K stage 365 → 193 ms per iteration). The
+    float64 energy at the final orbitals is as close to PySCF as before
+    (+1.0e-7 vs +1.1e-7 Eh at 970).
+- **`trntensor.df_coulomb(B, D)`: the DF Coulomb matrix from the same packed
+  integrals (#60).** Two NKI launches each stream `B` once in contiguous
+  128-row tiles with one fused Vector Engine instruction per tile (`d = Bᵀp`,
+  then `J = B d`). `TRNTENSOR_DF_COULOMB=auto|trn2|aten`. It is about as
+  fast as the two GEMVs it replaces (970: 86.7 → 76.2 ms) at similar error
+  (2.8e-7 vs 1.9e-7); what it adds is a single aux block at n_ao = 970,
+  where the aten GEMV on one 8.8 GB block needed a 26.7 GB graph. A packed
+  `(npair,)` density gives a packed J, so blocked callers pack once.
+- Kernels: `df_half_packed_kernel`, `df_exchange_syrk_kernel`,
+  `df_coulomb_d_kernel`, `df_coulomb_j_kernel` (gridless, `num_programs()`
+  split, MLIR-verified at lnc=1 and lnc=2). Tiling helpers
+  `df_half_tiling`, `df_group_chunks`, `df_exchange_blocks`.
+
 ## [0.20.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

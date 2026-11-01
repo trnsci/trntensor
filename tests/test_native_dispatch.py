@@ -31,6 +31,10 @@ EXPECTED_OPS = {
     "mp2_energy_row",
     "ao_to_mo_trn2",
     "ao_to_mo_trn2_packed",
+    "df_half_packed",
+    "df_exchange_syrk",
+    "df_coulomb_d",
+    "df_coulomb_j",
 }
 
 
@@ -133,6 +137,10 @@ def native_host(monkeypatch):
         "mp2_energy_row_kernel",
         "ao_to_mo_trn2_kernel",
         "ao_to_mo_trn2_packed_kernel",
+        "df_half_packed_kernel",
+        "df_exchange_syrk_kernel",
+        "df_coulomb_d_kernel",
+        "df_coulomb_j_kernel",
     ):
         monkeypatch.setattr(_kernels, kname, no_raw_kernel, raising=False)
     # Force NKI: under "auto" the native path runs the fused quantum
@@ -436,6 +444,148 @@ class TestPublicApiOnNativePath:
         out = trntensor.ao_to_mo_transform(trntensor.pack_tril(eri), C_occ, C_vir)
         torch.testing.assert_close(out, trntensor.ao_to_mo_transform(eri, C_occ, C_vir))
         assert native_host == []
+
+    @pytest.mark.parametrize(
+        "nbasis,naux,nocc,group", [(40, 6, 5, 0), (130, 30, 7, 0), (40, 600, 6, 1)]
+    )
+    def test_df_exchange_routes_to_the_two_ops(
+        self, native_host, monkeypatch, nbasis, naux, nocc, group
+    ):
+        """#60: replaying the half kernel's batched gather from the index
+        images on CPU rebuilds Xt, and the SYRK stand-in's two partials add
+        up to K."""
+
+        def half_op(eri_v, img, C_occ, nub=8):
+            npc, nvg = img.shape[0], img.shape[1]
+            tp, nbp = eri_v.shape[1], C_occ.shape[0]
+            nvc, nkb = nbp // nvg, nbp // 128
+            assert img.dtype == torch.uint32 and img.shape == (npc, nvg, 128, nkb * nvc)
+            idx = img.view(torch.int32).long()
+            full = torch.empty(nbp, nbp, npc * tp)
+            for c in range(npc):
+                for g in range(nvg):
+                    for k in range(nkb):
+                        for b in range(nvc // nub):
+                            blk = idx[c, g, :, k * nvc + b * nub : k * nvc + (b + 1) * nub]
+                            rows = eri_v[blk.T.flatten()].reshape(128, nub, tp)
+                            v0 = g * nvc + b * nub
+                            full[k * 128 : (k + 1) * 128, v0 : v0 + nub, c * tp : (c + 1) * tp] = (
+                                rows
+                            )
+            x = torch.einsum("li,lnP->Pin", C_occ, full)  # (P, i, ν)
+            return x.reshape(npc * tp, -1, nvg, nvc).permute(0, 2, 1, 3).contiguous()
+
+        def syrk_op(xt, kin, banks=6):
+            nr, nvg, nop, nvc = xt.shape
+            assert nop % 2 == 0  # nocc padded even for the program split
+            xm = xt.permute(1, 3, 0, 2).reshape(nvg * nvc, -1)
+            k = xm @ xm.T
+            return kin + torch.stack([0.25 * k, 0.75 * k])
+
+        _install_ops(monkeypatch, native_host, df_half_packed=half_op, df_exchange_syrk=syrk_op)
+        if group:  # one aux chunk per launch pair
+            monkeypatch.setattr(dispatch, "df_group_chunks", lambda *a: group)
+        g = torch.Generator().manual_seed(nbasis)
+        eri = torch.randn(nbasis, nbasis, naux, generator=g)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C = torch.randn(nbasis, nocc, generator=g)
+        out = trntensor.df_exchange(trntensor.pack_tril(eri), C, alpha=2.0)
+        X = torch.einsum("li,lnP->inP", C, eri)
+        ref = 2.0 * torch.einsum("imP,inP->mn", X, X)
+        torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-4)
+        tp, nub, _nvc = _kernels.df_half_tiling(naux, -(-nbasis // 128) * 128, nocc + nocc % 2)
+        launches = naux // tp if group else 1
+        assert [c[0] for c in native_host] == ["df_half_packed", "df_exchange_syrk"] * launches
+        assert native_host[0][1] == {"nub": nub} and naux % tp == 0
+
+    @pytest.mark.parametrize("nbasis", [30, 40])
+    def test_df_coulomb_routes_to_the_two_ops(self, native_host, monkeypatch, nbasis):
+        """The kernels take 2·(npair // 256) full row tiles; the leftover rows
+        go through aten, and the result matches the reference J."""
+
+        def d_op(B, pw):
+            rows = (B.shape[0] // 256) * 256
+            d = B[:rows].T @ pw[:rows, 0]
+            return torch.stack([0.5 * d, 0.5 * d])[:, None, :]
+
+        def j_op(B, d_b):
+            rows = (B.shape[0] // 256) * 256
+            assert d_b.shape == (128, B.shape[1])
+            return (B[:rows] @ d_b[0]).reshape(-1, 128).T
+
+        _install_ops(monkeypatch, native_host, df_coulomb_d=d_op, df_coulomb_j=j_op)
+        g = torch.Generator().manual_seed(nbasis)
+        eri = torch.randn(nbasis, nbasis, 9, generator=g)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        D = torch.randn(nbasis, nbasis, generator=g)
+        D = D + D.T
+        J = trntensor.df_coulomb(trntensor.pack_tril(eri), D)
+        ref = torch.einsum("mnP,P->mn", eri, torch.einsum("lsP,ls->P", eri, D))
+        torch.testing.assert_close(J, ref, atol=1e-3, rtol=1e-4)
+        assert [c[0] for c in native_host] == ["df_coulomb_d", "df_coulomb_j"]
+
+    def test_df_coulomb_route(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        big = torch.empty(31375, 1206, device="meta")
+        assert dispatch._df_coulomb_route(big) == "trn2"
+        assert dispatch._df_coulomb_route(torch.empty(31375, 1206)) == "aten"
+        assert dispatch._df_coulomb_route(torch.empty(300, 116, device="meta")) == "aten"
+        assert dispatch._df_coulomb_route(torch.empty(200, 116, device="meta")) == "aten"
+        monkeypatch.setenv("TRNTENSOR_DF_COULOMB", "trn2")
+        assert dispatch._df_coulomb_route(torch.empty(300, 116, device="meta")) == "trn2"
+
+    def test_df_exchange_aten_route_skips_the_kernels(self, native_host, monkeypatch):
+        monkeypatch.setenv("TRNTENSOR_DF_EXCHANGE", "aten")
+        _install_ops(monkeypatch, native_host)
+        eri = torch.randn(12, 12, 5)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C = torch.randn(12, 3)
+        X = torch.einsum("li,lnP->inP", C, eri)
+        out = trntensor.df_exchange(trntensor.pack_tril(eri), C)
+        torch.testing.assert_close(out, torch.einsum("imP,inP->mn", X, X), atol=1e-4, rtol=1e-4)
+        assert native_host == []
+
+    def test_df_exchange_route(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        npair = 256 * 257 // 2
+        dev = torch.empty(npair, 1206, device="meta")
+        assert dispatch._df_exchange_route(dev, 41, 256) == "trn2"
+        assert dispatch._df_exchange_route(torch.empty(npair, 1206), 41, 256) == "aten"
+        assert dispatch._df_exchange_route(dev, 513, 256) == "aten"
+        monkeypatch.setenv("TRNTENSOR_DF_EXCHANGE", "aten")
+        assert dispatch._df_exchange_route(dev, 41, 256) == "aten"
+        monkeypatch.setenv("TRNTENSOR_DF_EXCHANGE", "bogus")
+        with pytest.raises(ValueError):
+            dispatch._df_exchange_route(dev, 41, 256)
+
+    @pytest.mark.parametrize(
+        "naux,nb,nocc", [(1206, 256, 41), (2366, 512, 81), (4686, 1024, 161), (768, 256, 32)]
+    )
+    def test_df_half_tiling_divides_and_fits(self, naux, nb, nocc):
+        tp, nub, nvc = _kernels.df_half_tiling(naux, nb, nocc)
+        assert naux % tp == 0 and tp <= 512 and nb % nvc == 0 and nvc % nub == 0
+        assert _kernels.df_half_sbuf_bytes(nb, nocc, tp, nub, nvc) <= _kernels.DF_K_SBUF_BUDGET
+        g = _kernels.df_group_chunks(naux // tp, nb, tp, nub, nvc)
+        assert 1 <= g <= naux // tp
+
+    @pytest.mark.parametrize("nb,banks", [(128, 6), (512, 6), (1024, 6), (1024, 2), (2048, 8)])
+    def test_df_exchange_blocks_cover_the_upper_triangle(self, nb, banks):
+        passes = _kernels.df_exchange_blocks(nb, banks)
+        cover = torch.zeros(nb // 128, nb // 128, dtype=torch.int64)
+        for blocks in passes:
+            assert 1 <= len(blocks) <= banks
+            for m, v0, w in blocks:
+                assert v0 >= 128 * m and w <= 512 and v0 + w <= nb
+                cover[m, v0 // 128 : (v0 + w) // 128] += 1
+        assert torch.equal(cover, torch.triu(torch.ones_like(cover)))
 
     def test_ao_to_mo_transform_legacy_routes_and_slices(self, native_host, monkeypatch):
         monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
@@ -1231,3 +1381,10 @@ class TestLazyRegistration:
             m(32896 * 3, 256), m(3, 128, 512, dtype=torch.int32), m(256, 16), m(256, 512)
         )
         assert bp.shape == (16, 512, 768)
+        xt = fake("df_half_packed")(
+            m(32896 * 6, 201), m(2, 4, 128, 128, dtype=torch.int32), m(256, 42)
+        )
+        assert xt.shape == (402, 4, 42, 64)
+        assert fake("df_exchange_syrk")(xt, m(2, 256, 256)).shape == (2, 256, 256)
+        assert fake("df_coulomb_d")(m(31375, 1206), m(31375, 1)).shape == (2, 1, 1206)
+        assert fake("df_coulomb_j")(m(31375, 1206), m(128, 1206)).shape == (128, 244)
