@@ -244,7 +244,7 @@ The symmetric `(nbasis, nbasis)` matrix, on `B`'s device.
 ### Example — the K build of a DF-RHF iteration
 
 ```python
-B_d = B_packed.to("neuron")          # once: (npair, naux), never unpacked
+B_d = B_packed.to("neuron")  # once: (npair, naux), never unpacked
 K = trntensor.df_exchange(B_d, C_occ_d, alpha=2.0)
 ```
 
