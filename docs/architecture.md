@@ -83,8 +83,11 @@ A third pattern — **user-level operand residency** — exposes that same data-
   accumulation error, K·u, would dominate.
 - **`"dd"`** — double-double accumulation via trnblas Phase 2 fused GEMM kernel.
   On Trainium hosts it raises `NotImplementedError` until trnblas#22 lands. On
-  CPU it runs a software Ozaki-2 emulation for `matmul` plans and falls back
-  to `"kahan"` for `bmm` / `torch` plans.
+  CPU, bf16/fp16 operands run a software Ozaki-2 emulation for `matmul` plans
+  (`"kahan"` for `bmm` / `torch` plans); fp32 operands run as `"kahan"`
+  (exact products, fp64 accumulation, inside K·u²); fp64 operands use exact
+  TwoProduct products with double-word accumulation on `matmul` / `bmm` plans
+  and `path` steps, and plain fp64 accumulation on generic `torch` plans.
 
 ```python
 # Accumulate DF-MP2 energy with ~15-digit precision

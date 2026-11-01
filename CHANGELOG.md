@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 ### Fixed
 
+- **`einsum(precision="dd")` on float32 / float64 operands was less accurate
+  than `"fast"`** (silent; 0.17.0 through 0.22.0, the CPU emulation; Trainium
+  raises `NotImplementedError`). The CPU route split every operand into two
+  bf16-precision pieces (~16 mantissa bits) and rounded float64 operands to
+  float32, so the error was ~1e-5 instead of the documented K·u² + u_out
+  (6e-8 fp32, 1.1e-16 fp64). float32 operands now accumulate in fp64 (exact
+  products, inside K·u²). float64 operands form exact TwoProduct products and
+  sum them in double-word arithmetic on `matmul` / `bmm` plans and `path`
+  steps; generic `torch` plans accumulate in fp64. bf16 / fp16 `"dd"` and
+  every `"fast"` result are unchanged (#84).
 - **`einsum(..., out=C)` with `beta=0` (the default) read `C`**, so NaN or
   inf in the buffer (e.g. `torch.empty`) made the result NaN (silent, every
   backend). Affects 0.3.0 through 0.22.0. `beta == 0` now ignores `out`, as

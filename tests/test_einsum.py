@@ -628,6 +628,82 @@ class TestPrecisionDD:
         torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
 
 
+def _exact_compwise_err(got, A, B):
+    """max |C - C_exact| / (|A||B|) with C_exact in exact rational arithmetic."""
+    from fractions import Fraction
+
+    M, K = A.shape
+    N = B.shape[1]
+    Af = [[Fraction(float(v)) for v in row] for row in A.double().tolist()]
+    Bf = [[Fraction(float(v)) for v in row] for row in B.double().tolist()]
+    scale = (A.double().abs() @ B.double().abs()).tolist()
+    worst = Fraction(0)
+    for i in range(M):
+        for j in range(N):
+            exact = sum((Af[i][k] * Bf[k][j] for k in range(K)), Fraction(0))
+            if scale[i][j] > 0:
+                worst = max(worst, abs(Fraction(float(got[i, j])) - exact) / Fraction(scale[i][j]))
+    return float(worst)
+
+
+class TestPrecisionDDWideOperands:
+    """precision='dd' on fp32/fp64 operands meets K·u² + u_out (#84)."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("K", [1, 5, 127, 1000])
+    def test_dd_meets_documented_bound(self, dtype, K):
+        g = torch.Generator().manual_seed(K)
+        A = torch.randn(9, K, generator=g, dtype=torch.float64).to(dtype)
+        B = torch.randn(K, 11, generator=g, dtype=torch.float64).to(dtype)
+        got = trntensor.einsum("ij,jk->ik", A, B, precision="dd")
+        assert got.dtype == dtype
+        err = _exact_compwise_err(got, A, B)
+        assert err <= trntensor.forward_error_bound("dd", dtype, K), err
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_dd_not_less_accurate_than_fast(self, dtype):
+        g = torch.Generator().manual_seed(11)
+        A = torch.randn(9, 300, generator=g, dtype=torch.float64).to(dtype)
+        B = torch.randn(300, 11, generator=g, dtype=torch.float64).to(dtype)
+        dd = trntensor.einsum("ij,jk->ik", A, B, precision="dd")
+        fast = trntensor.einsum("ij,jk->ik", A, B, precision="fast")
+        assert _exact_compwise_err(dd, A, B) <= _exact_compwise_err(fast, A, B)
+
+    def test_fast_unchanged(self):
+        g = torch.Generator().manual_seed(12)
+        for dtype in (torch.float32, torch.float64):
+            A = torch.randn(9, 64, generator=g, dtype=dtype)
+            B = torch.randn(64, 11, generator=g, dtype=dtype)
+            assert torch.equal(trntensor.einsum("ij,jk->ik", A, B), A @ B)
+
+    def test_dd_fp64_transposed_bmm_and_path(self):
+        g = torch.Generator().manual_seed(13)
+        A = torch.randn(40, 7, generator=g, dtype=torch.float64)
+        B = torch.randn(11, 40, generator=g, dtype=torch.float64)
+        got = trntensor.einsum("ki,jk->ij", A, B, precision="dd")
+        assert _exact_compwise_err(got, A.T, B.T) <= trntensor.forward_error_bound(
+            "dd", torch.float64, 40
+        )
+        X = torch.randn(3, 5, 40, generator=g, dtype=torch.float64)
+        Y = torch.randn(3, 40, 6, generator=g, dtype=torch.float64)
+        got = trntensor.einsum("bij,bjk->bik", X, Y, precision="dd")
+        bound = trntensor.forward_error_bound("dd", torch.float64, 40)
+        for b in range(3):
+            assert _exact_compwise_err(got[b], X[b], Y[b]) <= bound
+        C = torch.randn(6, 4, generator=g, dtype=torch.float64)
+        got = trntensor.einsum("ij,jk,kl->il", X[0], Y[0], C, precision="dd")
+        torch.testing.assert_close(got, X[0] @ Y[0] @ C, rtol=1e-13, atol=1e-13)
+
+    def test_dd_fp64_nonfinite_matches_fp64(self):
+        A = torch.tensor([[1.0, float("inf")], [2.0, 3.0]], dtype=torch.float64)
+        B = torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float64)
+        got = trntensor.einsum("ij,jk->ik", A, B, precision="dd")
+        torch.testing.assert_close(got, A @ B, equal_nan=True)
+        big = torch.full((1, 2), 1e300, dtype=torch.float64)
+        got = trntensor.einsum("ij,jk->ik", big, big.T.contiguous(), precision="dd")
+        assert torch.isinf(got).all()
+
+
 class TestMultiEinsumBatched:
     """Tests for homogeneous batching in multi_einsum (#33 Phase 3)."""
 
