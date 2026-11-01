@@ -5,7 +5,7 @@ Einstein summation, contraction planning, and tensor decompositions
 for scientific computing. Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 
 from .decompose import (
     cp_decompose,
@@ -28,7 +28,14 @@ from .plan import (
     plan_contraction,
     select_precision_for_error,
 )
-from .quantum import ao_to_mo_transform, mp2_energy, pack_tril, unpack_tril
+from .quantum import (
+    ao_to_mo_transform,
+    df_coulomb,
+    df_exchange,
+    mp2_energy,
+    pack_tril,
+    unpack_tril,
+)
 
 __all__ = [
     "einsum",
@@ -55,6 +62,8 @@ __all__ = [
     "from_xla",
     "mp2_energy",
     "ao_to_mo_transform",
+    "df_exchange",
+    "df_coulomb",
     "pack_tril",
     "unpack_tril",
     "ShardedTensor",

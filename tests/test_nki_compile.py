@@ -97,6 +97,35 @@ KERNEL_INPUTS = {
             ),
         ),
     ],
+    "df_half_packed_kernel": [
+        # (packed (npair·NPC, TP) rows, (NPC, NVG, 128, NKB·NVC) uint32 indices, C_occ)
+        (
+            "nb256_nocc41_naux402",
+            lambda: ((_r(32896, 402), _u32(1, 4, 128, 128), _r(256, 41)), {"nub": 2}),
+        ),
+        (
+            "nb256_nocc20_naux390_split_chunks",
+            lambda: ((_r(32896 * 2, 195), _u32(2, 2, 128, 256), _r(256, 20)), {"nub": 4}),
+        ),
+    ],
+    "df_exchange_syrk_kernel": [
+        # (Xt (rows, NVG, nocc, NVC), running partial Ks (2, NB, NB)); partial last tile
+        ("rows402_nocc6_nb256", lambda: ((_r(402, 2, 6, 128), _r(2, 256, 256)), {})),
+        (
+            "rows256_nocc34_nb640_banks2",
+            lambda: ((_r(256, 40, 34, 16), _r(2, 640, 640)), {"banks": 2}),
+        ),
+    ],
+    "df_coulomb_d_kernel": [
+        # (packed B (npair, naux), weighted packed density (npair, 1))
+        ("npair1000_naux450", lambda: ((_r(1000, 450), _r(1000, 1)), {})),
+        ("npair600_naux4500", lambda: ((_r(600, 4500), _r(600, 1)), {})),
+    ],
+    "df_coulomb_j_kernel": [
+        # (packed B (npair, naux), d replicated on 128 partitions)
+        ("npair1000_naux450", lambda: ((_r(1000, 450), _r(128, 450)), {})),
+        ("npair600_naux4500", lambda: ((_r(600, 4500), _r(128, 4500)), {})),
+    ],
     "ao_to_mo_trn2_kernel": [
         (
             "nb256_nocc32_nvir256_naux512",

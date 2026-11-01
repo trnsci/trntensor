@@ -95,7 +95,7 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 - [x] CP decomposition (ALS)
 - [x] Tucker decomposition (HOSVD)
 - [x] DF-MP2 einsum example
-- [x] NKI fused contraction kernels (`mp2_energy`, `ao_to_mo_transform`)
+- [x] NKI fused contraction kernels (`mp2_energy`, `ao_to_mo_transform`, `df_exchange`, `df_coulomb`)
 - [x] Device operand residency (`to_device` / `from_device`; `to_xla` / `from_xla` kept)
 - [x] Native TorchNeuron dispatch (Trn2/Trn3, `torch.ops.trntensor.*`) alongside PyTorch/XLA (Trn1)
 - [x] NKI CPU simulator + `nki-simulator` CI gate

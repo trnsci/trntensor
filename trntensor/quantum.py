@@ -376,3 +376,176 @@ def _cpu_ao_to_mo_transform(
     """
     half = torch.einsum("mi,mnP->inP", C_occ, eri)
     return torch.einsum("na,inP->iaP", C_vir, half)
+
+
+# Bytes of gathered packed rows the aten df_exchange path materialises at
+# once (one block of ν rows of the square).
+_DF_K_GATHER_BYTES = 1 << 30
+
+
+def df_exchange(
+    B: torch.Tensor,
+    C_occ: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Density-fitted exchange matrix from packed three-centre integrals.
+
+    Computes
+
+        K[μ, ν] = alpha · Σ_{i, P} X[i, μ, P] X[i, ν, P],
+        X[i, ν, P] = Σ_λ C_occ[λ, i] B[λν, P]
+
+    For a closed-shell density ``D = 2 C_occ C_occᵀ`` the SCF exchange
+    matrix is ``df_exchange(B, C_occ, alpha=2.0)``.
+
+    - Native TorchNeuron path (Trn2/Trn3): two NKI launches (#60). The
+      first gathers the packed rows in place with batched indirect DMA (as
+      ``ao_to_mo_transform``'s packed kernel does) and forms the
+      half-transformed ``Xt[P, i, ν]`` with the aux index on partitions; the
+      full square never exists. The second accumulates ``K`` in PSUM over
+      128-row aux tiles, computes only the upper-triangle strips and mirrors
+      them on the Tensor Engine. Both launches split their work across the
+      programs of the logical core (both physical cores at LNC=2).
+      ``"auto"`` uses it for device-resident ``B`` when a tiling fits (see
+      :func:`trntensor.nki.dispatch._df_exchange_route`).
+      ``TRNTENSOR_DF_EXCHANGE=auto|trn2|aten`` overrides the choice.
+    - Otherwise (and on the host) an aten formulation: gather blocks of
+      rows of the square, half-transform them with one einsum into
+      ``(ν, i, P)`` order, and one GEMM ``K = Xm Xmᵀ``.
+
+    Parameters
+    ----------
+    B : (npair, naux) or (naux, npair) tensor
+        Packed lower triangle (``μ(μ+1)/2 + ν`` row order, :func:`pack_tril`;
+        PySCF ``_cderi`` is the ``(naux, npair)`` form). A full
+        ``(nbasis, nbasis, naux)`` tensor is also accepted (aten route).
+    C_occ : (nbasis, nocc) tensor
+        Occupied orbital coefficients.
+    alpha : float
+        Scale factor.
+
+    Returns
+    -------
+    (nbasis, nbasis) tensor, symmetric.
+    """
+    if C_occ.dim() != 2:
+        raise ValueError(f"C_occ must be 2D; got {tuple(C_occ.shape)}")
+    nbasis, nocc = C_occ.shape
+    if B.dim() == 2:
+        B = _as_packed_rows(B, nbasis)
+    elif B.dim() == 3:
+        if B.shape[0] != nbasis or B.shape[1] != nbasis:
+            raise ValueError(
+                f"B must be (nbasis, nbasis, naux) with nbasis={nbasis}; got {tuple(B.shape)}"
+            )
+    else:
+        raise ValueError(f"B must be packed 2D or full 3D; got shape {tuple(B.shape)}")
+    if B.device != C_occ.device:
+        C_occ = C_occ.to(B.device)
+    if B.dim() == 2 and _dispatch._df_exchange_route(B, nocc, nbasis) == "trn2":
+        try:
+            K = _dispatch._nki_df_exchange(B, C_occ.to(B.dtype))
+            return K * alpha if alpha != 1.0 else K
+        except Exception:
+            import os
+
+            if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
+                raise
+            _dispatch._note_native_kernel_failure(("dfk", tuple(B.shape), nocc))
+    return _aten_df_exchange(B, C_occ, alpha)
+
+
+def _aten_df_exchange(B: torch.Tensor, C_occ: torch.Tensor, alpha: float) -> torch.Tensor:
+    """``df_exchange`` in aten ops on ``B``'s device (exact up to rounding)."""
+    nbasis, nocc = C_occ.shape
+    C = C_occ.to(B.dtype)
+    if B.dim() == 3:
+        X = torch.einsum("lvp,li->vip", B, C)
+    else:
+        from .nki.dispatch import _tril_rows
+
+        naux = B.shape[1]
+        rows = _tril_rows(nbasis).to(B.device)  # (ν, λ) -> packed row
+        nv = max(1, _DF_K_GATHER_BYTES // max(1, nbasis * naux * B.element_size()))
+        parts = []
+        for v0 in range(0, nbasis, nv):
+            v1 = min(nbasis, v0 + nv)
+            Bv = B.index_select(0, rows[v0:v1].reshape(-1)).reshape(v1 - v0, nbasis, naux)
+            parts.append(torch.einsum("vlp,li->vip", Bv, C))
+        X = parts[0] if len(parts) == 1 else torch.cat(parts)
+    Xm = X.reshape(nbasis, -1)
+    return torch.matmul(Xm, Xm.T) * alpha if alpha != 1.0 else torch.matmul(Xm, Xm.T)
+
+
+def df_coulomb(B: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
+    """Density-fitted Coulomb matrix from packed three-centre integrals.
+
+    Computes
+
+        J[μ, ν] = Σ_P B[μν, P] d[P],    d[P] = Σ_{λσ} D[λ, σ] B[λσ, P]
+
+    for a symmetric density ``D`` (closed shell: ``D = 2 C_occ C_occᵀ``).
+    With :func:`df_exchange` this is the J/K build of a DF-SCF iteration.
+
+    ``D`` may also be given packed: the ``(npair,)`` vector ``w·D[μ, ν]``
+    for ``ν ≤ μ`` (``w`` = 1 on the diagonal, 2 off it; :func:`pack_tril`
+    order). Then the packed ``(npair,)`` J comes back, so a caller that
+    splits the aux index into blocks packs and unpacks once, not per block:
+    on the device those are element gathers.
+
+    - Native TorchNeuron path (Trn2/Trn3): two NKI launches (#60), each
+      streaming the packed ``B`` once in contiguous 128-row tiles with one
+      fused multiply-add (``d``) or multiply-reduce (``J``) per tile on the
+      Vector Engine, rows split across both physical cores at LNC=2. The
+      < 256 leftover rows are small aten GEMVs. ``"auto"`` uses them for
+      device-resident ``B`` from ``npair·naux`` = 1e7.
+      ``TRNTENSOR_DF_COULOMB=auto|trn2|aten`` overrides the choice.
+    - Otherwise two GEMVs on ``B``'s device.
+
+    Parameters
+    ----------
+    B : (npair, naux) or (naux, npair) tensor
+        Packed lower triangle, as for :func:`df_exchange`.
+    D : (nbasis, nbasis) or (npair,) tensor
+        Symmetric density matrix (only its lower triangle is read), or its
+        weighted packed form.
+
+    Returns
+    -------
+    (nbasis, nbasis) tensor, symmetric; ``(npair,)`` for a packed ``D``.
+    """
+    from .nki.dispatch import _tril_rows
+
+    if B.dim() != 2:
+        raise ValueError(f"B must be packed 2D; got shape {tuple(B.shape)}")
+    if D.dim() == 1:
+        npair = D.shape[0]
+        nbasis = int(round(((8 * npair + 1) ** 0.5 - 1) / 2))
+        if nbasis * (nbasis + 1) // 2 != npair:
+            raise ValueError(f"packed D has {npair} entries, not nbasis(nbasis+1)/2")
+        B = _as_packed_rows(B, nbasis)
+        pw = D.to(B.dtype).to(B.device)
+    elif D.dim() == 2 and D.shape[0] == D.shape[1]:
+        nbasis = D.shape[0]
+        B = _as_packed_rows(B, nbasis)
+        r = torch.tril_indices(nbasis, nbasis)
+        lin = (r[0] * nbasis + r[1]).to(B.device)
+        w = torch.where(r[0] == r[1], 1.0, 2.0).to(B.dtype).to(B.device)
+        pw = D.to(B.device).reshape(-1).to(B.dtype).index_select(0, lin) * w
+    else:
+        raise ValueError(f"D must be (nbasis, nbasis) or packed (npair,); got {tuple(D.shape)}")
+    jp = None
+    if _dispatch._df_coulomb_route(B) == "trn2":
+        try:
+            jp = _dispatch._nki_df_coulomb(B, pw)
+        except Exception:
+            import os
+
+            if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
+                raise
+            _dispatch._note_native_kernel_failure(("dfj", tuple(B.shape)))
+    if jp is None:
+        jp = B @ (B.T @ pw)
+    if D.dim() == 1:
+        return jp
+    return jp.index_select(0, _tril_rows(nbasis).reshape(-1).to(B.device)).reshape(nbasis, nbasis)

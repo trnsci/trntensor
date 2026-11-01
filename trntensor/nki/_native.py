@@ -116,6 +116,51 @@ def ao_to_mo_trn2_packed(
     return _k.ao_to_mo_trn2_packed_kernel(eri_v, img, C_occ, C_vir)
 
 
+@nki_op(
+    "trntensor::df_half_packed",
+    mutates_args={},
+    fake_fn=lambda eri_v, img, C_occ, nub=8: eri_v.new_empty(
+        (
+            img.shape[0] * eri_v.shape[1],
+            img.shape[1],
+            C_occ.shape[1],
+            C_occ.shape[0] // img.shape[1],
+        )
+    ),
+)
+def df_half_packed(
+    eri_v: torch.Tensor, img: torch.Tensor, C_occ: torch.Tensor, nub: int = 8
+) -> torch.Tensor:
+    return _k.df_half_packed_kernel(eri_v, img, C_occ, nub=nub)
+
+
+@nki_op(
+    "trntensor::df_exchange_syrk",
+    mutates_args={},
+    fake_fn=lambda xt, kin, banks=6: kin.new_empty(kin.shape),
+)
+def df_exchange_syrk(xt: torch.Tensor, kin: torch.Tensor, banks: int = 6) -> torch.Tensor:
+    return _k.df_exchange_syrk_kernel(xt, kin, banks=banks)
+
+
+@nki_op(
+    "trntensor::df_coulomb_d",
+    mutates_args={},
+    fake_fn=lambda B, pw: B.new_empty((2, 1, B.shape[1]), dtype=torch.float32),
+)
+def df_coulomb_d(B: torch.Tensor, pw: torch.Tensor) -> torch.Tensor:
+    return _k.df_coulomb_d_kernel(B, pw)
+
+
+@nki_op(
+    "trntensor::df_coulomb_j",
+    mutates_args={},
+    fake_fn=lambda B, d_b: B.new_empty((128, (B.shape[0] // 256) * 2), dtype=torch.float32),
+)
+def df_coulomb_j(B: torch.Tensor, d_b: torch.Tensor) -> torch.Tensor:
+    return _k.df_coulomb_j_kernel(B, d_b)
+
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "matmul": matmul,
@@ -125,4 +170,8 @@ OPS = {
     "mp2_energy_row": mp2_energy_row,
     "ao_to_mo_trn2": ao_to_mo_trn2,
     "ao_to_mo_trn2_packed": ao_to_mo_trn2_packed,
+    "df_half_packed": df_half_packed,
+    "df_exchange_syrk": df_exchange_syrk,
+    "df_coulomb_d": df_coulomb_d,
+    "df_coulomb_j": df_coulomb_j,
 }

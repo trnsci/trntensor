@@ -177,3 +177,79 @@ class TestPackedAoToMo:
             trntensor.ao_to_mo_transform(torch.randn(21), C, C)
         with pytest.raises(ValueError, match="C_occ must have shape"):
             trntensor.ao_to_mo_transform(torch.randn(6, 6, 4), torch.randn(5, 2), C)
+
+
+class TestDfExchange:
+    """#60: K = Σ_{iP} X X^T from packed (μ≥ν) integrals."""
+
+    @staticmethod
+    def _case(n=13, naux=7, nocc=4, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        eri = torch.randn(n, n, naux, generator=g, dtype=torch.float64)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C = torch.randn(n, nocc, generator=g, dtype=torch.float64)
+        X = torch.einsum("li,lnP->inP", C, eri)
+        return eri, C, torch.einsum("imP,inP->mn", X, X)
+
+    @pytest.mark.parametrize("layout", ["packed", "cderi", "full"])
+    def test_matches_reference(self, layout):
+        import trntensor
+
+        eri, C, K = self._case()
+        pk = trntensor.pack_tril(eri)
+        B = {"packed": pk, "cderi": pk.T.contiguous(), "full": eri}[layout]
+        out = trntensor.df_exchange(B, C, alpha=2.0)
+        assert out.shape == (13, 13)
+        torch.testing.assert_close(out, 2.0 * K)
+
+    def test_gather_blocks(self, monkeypatch):
+        """Several ν blocks of gathered rows give the same K."""
+        import trntensor
+        import trntensor.quantum as q
+
+        eri, C, K = self._case(n=20, naux=9, nocc=3, seed=1)
+        monkeypatch.setattr(q, "_DF_K_GATHER_BYTES", 20 * 9 * 8 * 3)
+        torch.testing.assert_close(trntensor.df_exchange(trntensor.pack_tril(eri), C), K)
+
+    def test_shape_errors(self):
+        import trntensor
+
+        eri, C, _ = self._case()
+        with pytest.raises(ValueError):
+            trntensor.df_exchange(torch.zeros(10, 7), C)
+        with pytest.raises(ValueError):
+            trntensor.df_exchange(eri[:, :5], C)
+        with pytest.raises(ValueError):
+            trntensor.df_exchange(trntensor.pack_tril(eri), C[:, 0])
+
+
+class TestDfCoulomb:
+    """#60: J = Σ_P B[:, P] (Σ_{λσ} D_λσ B[λσ, P]) from packed integrals."""
+
+    @pytest.mark.parametrize("cderi", [False, True])
+    def test_matches_reference(self, cderi):
+        g = torch.Generator().manual_seed(5)
+        n = 11
+        eri = torch.randn(n, n, 6, generator=g, dtype=torch.float64)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        D = torch.randn(n, n, generator=g, dtype=torch.float64)
+        D = D + D.T
+        pk = trntensor.pack_tril(eri)
+        J = trntensor.df_coulomb(pk.T.contiguous() if cderi else pk, D)
+        ref = torch.einsum("mnP,P->mn", eri, torch.einsum("lsP,ls->P", eri, D))
+        torch.testing.assert_close(J, ref)
+        # Packed weighted density in, packed J out.
+        w = 2.0 * trntensor.pack_tril(D[:, :, None])[:, 0]
+        r = torch.tril_indices(n, n)
+        w[r[0] == r[1]] *= 0.5
+        torch.testing.assert_close(
+            trntensor.df_coulomb(pk, w), trntensor.pack_tril(ref[:, :, None])[:, 0]
+        )
+
+    def test_shape_errors(self):
+        with pytest.raises(ValueError):
+            trntensor.df_coulomb(torch.zeros(10, 3), torch.zeros(4, 5))
+        with pytest.raises(ValueError):
+            trntensor.df_coulomb(torch.zeros(10, 3), torch.zeros(11))
+        with pytest.raises(ValueError):
+            trntensor.df_coulomb(torch.zeros(4, 4, 3), torch.zeros(4, 4))
