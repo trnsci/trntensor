@@ -94,7 +94,7 @@ result = trntensor.einsum("ij,jk->ik", A, B, dtype=torch.float16)
 | `"fast"` | Native operand dtype; NKI kernels accumulate in fp32 via PSUM |
 | `"kahan"` | Contracts in fp64 and rounds once back to the operand dtype; bypasses NKI dispatch. Operands on a device without native fp64 (the Neuron device, XLA) are contracted on the host and the result moved back. Error ≤ K·2⁻⁵³ + u_out, so the result is as accurate as its dtype allows (~1 ulp), not ~16 digits, unless the operands are float64 |
 | `"sr"` | Stochastic rounding at the PSUM→SBUF downcast (BF16/FP16); mean-zero √K·u error instead of K·u. On Trainium requires `NEURON_RT_STOCHASTIC_ROUNDING_EN=1` at process start (see below) |
-| `"dd"` | Double-double accumulation via trnblas Phase 2 — raises `NotImplementedError` on Trainium hosts until trnblas#22 lands; on CPU, a software Ozaki-2 emulation for `matmul` plans (`"kahan"` for `bmm` / `torch` plans) |
+| `"dd"` | Double-double accumulation via trnblas Phase 2 — raises `NotImplementedError` on Trainium hosts until trnblas#22 lands; on CPU, by operand dtype: bf16/fp16 run a software Ozaki-2 emulation for `matmul` plans (`"kahan"` for `bmm` / `torch` plans); fp32 runs as `"kahan"` (fp32 products are exact in fp64, so fp64 accumulation, K·2⁻⁵³, is inside K·u²); fp64 forms each product exactly (TwoProduct) and sums in double-word arithmetic for `matmul` / `bmm` plans and `path` steps, while generic `torch` plans accumulate in plain fp64 (the `"kahan"` bound) |
 
 ```python
 # High-precision DF-MP2 energy accumulation
@@ -112,7 +112,7 @@ operand dtype, so `u_out = u`):
 |------|-------|
 | `"fast"` | K·u + u_out |
 | `"sr"` | √K·u + u_out (expected value) |
-| `"dd"` | K·u² + u_out |
+| `"dd"` | K·u² + u_out (fp64 `torch` plans: the `"kahan"` bound) |
 | `"kahan"` | K·2⁻⁵³ + u_out |
 
 `trntensor.forward_error_bound(mode, dtype, K)` returns these values.

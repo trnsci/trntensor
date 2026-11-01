@@ -178,9 +178,6 @@ XF_OUT = xfail_decide(77, "needs decision: einsum out= is never written")
 XF_CP_DTYPE = xfail_decide(78, "cp_decompose/cp_reconstruct hard-code float32 CPU buffers")
 XF_SHARD = xfail_decide(78, "output-parallel sharded einsum does not co-partition operands")
 XF_FLOPS = xfail_decide(83, "ContractionPlan.estimated_flops is never filled in")
-XF_DD_WIDE = xfail_decide(
-    84, "precision='dd' on fp32/fp64 operands is less accurate than 'fast' (bf16x2 split)"
-)
 
 
 # --------------------------------------------------------------------------- #
@@ -318,8 +315,6 @@ DTYPES = [
     torch.complex128,
 ]
 MODES = ["fast", "kahan", "sr", "dd", "target"]
-# subscripts whose plan runs the CPU Ozaki emulation (matmul plans, path steps)
-DD_MATMUL_SUBS = {"ij,jk->ik", "ji,jk->ik", "ij,kj->ik", "ij,jk,kl->il", "ij,jk", "Ab,bC->AC"}
 
 
 def _mode_cases():
@@ -333,8 +328,6 @@ def _mode_cases():
             marks = [XF_COMPLEX_PREC]
         elif dt == torch.int32 and mode == "kahan" and sub == "ii->":
             marks = [XF_INT_PREC]  # returns int32 where torch.einsum returns int64
-        elif dt == torch.float64 and mode == "dd" and sub in DD_MATMUL_SUBS:
-            marks = [XF_DD_WIDE]
         cases.append(pytest.param(sub, shapes, dt, mode, marks=marks, id=f"{sub}-{dt}-{mode}"))
     return cases
 
@@ -404,13 +397,13 @@ def test_mixed_dtype_operands(sub):
     [
         (torch.float32, "fast"),
         (torch.float32, "kahan"),
-        pytest.param(torch.float32, "dd", marks=XF_DD_WIDE),
+        (torch.float32, "dd"),
         (torch.bfloat16, "fast"),
         (torch.bfloat16, "kahan"),
         (torch.bfloat16, "dd"),
         (torch.float64, "fast"),
         (torch.float64, "kahan"),
-        pytest.param(torch.float64, "dd", marks=XF_DD_WIDE),
+        (torch.float64, "dd"),
     ],
     ids=str,
 )

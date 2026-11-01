@@ -423,8 +423,28 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
                 "GEMM kernels (trnblas#22). Use precision='kahan' (fp64 accumulation) "
                 "as an alternative."
             )
-        # CPU: Ozaki-2 for matmul; recurse for path (binary steps get Ozaki);
-        # kahan fallback for bmm and torch strategies.
+        dts = {op.dtype for op in operands}
+        if dts == {torch.float32}:
+            # fp32 x fp32 products are exact in fp64, so fp64 accumulation
+            # (K * 2**-53) already beats the dd bound K * u_fp32**2 (#84).
+            return _einsum_fp64(subscripts, operands)
+        if dts == {torch.float64}:
+            # Double-word accumulation of exact products (#84); the generic
+            # "torch" strategy has no dd kernel and accumulates in fp64.
+            from .nki.dispatch import _dd_matmul_fp64_cpu
+
+            if plan.strategy == "matmul":
+                A, B = operands
+                a = A.T if plan.transA else A
+                b = B.T if plan.transB else B
+                return _dd_matmul_fp64_cpu(a, b)
+            if plan.strategy == "bmm":
+                return _dd_matmul_fp64_cpu(*operands)
+            if plan.strategy == "path":
+                return _execute_path(subscripts, operands, plan)
+            return _einsum_fp64(subscripts, operands)
+        # bf16/fp16 (and other dtypes): Ozaki-2 for matmul; recurse for path
+        # (binary steps get Ozaki); kahan fallback for bmm and torch strategies.
         if plan.strategy == "matmul":
             A, B = operands
             a = A.T if plan.transA else A

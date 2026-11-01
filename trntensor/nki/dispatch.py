@@ -849,6 +849,89 @@ def _ozaki_matmul_cpu(A: torch.Tensor, B: torch.Tensor, k: int = 2) -> torch.Ten
     return result
 
 
+_DEKKER_SPLIT = 134217729.0  # 2**27 + 1: splits a float64 into two 26-bit halves
+_DD_CHUNK_ELEMS = 1 << 22  # products held at once by _dd_matmul_fp64_cpu
+
+
+def _two_sum(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Knuth TwoSum: s + e == a + b exactly, s = fl(a + b)."""
+    s = a + b
+    bb = s - a
+    return s, (a - (s - bb)) + (b - bb)
+
+
+def _fast_two_sum(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dekker Fast2Sum (|a| >= |b|): s + e == a + b exactly."""
+    s = a + b
+    return s, b - (s - a)
+
+
+def _two_prod(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dekker TwoProduct (no FMA): p + e == a * b exactly, barring over/underflow."""
+    p = a * b
+    t = _DEKKER_SPLIT * a
+    ah = t - (t - a)
+    al = a - ah
+    t = _DEKKER_SPLIT * b
+    bh = t - (t - b)
+    bl = b - bh
+    return p, ((ah * bh - p) + ah * bl + al * bh) + al * bl
+
+
+def _dw_add(xh, xl, yh, yl) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accurate double-word addition (Joldes-Muller-Popescu 2017, Alg. 6).
+
+    Relative error at most 3u^2 / (1 - 4u) of the exact sum, u = 2**-53.
+    """
+    sh, sl = _two_sum(xh, yh)
+    th, tl = _two_sum(xl, yl)
+    vh, vl = _fast_two_sum(sh, sl + th)
+    return _fast_two_sum(vh, tl + vl)
+
+
+def _dd_matmul_fp64_cpu(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """``A @ B`` for float64 operands with double-double (double-word) accumulation.
+
+    CPU stand-in for ``precision="dd"`` on float64 operands (#84). Each
+    product ``a_ik b_kj`` is formed exactly as a double-word with TwoProduct,
+    and the K products are summed with accurate double-word addition
+    (pairwise inside a chunk of K, sequentially across chunks), then rounded
+    once to float64. The accumulation error is at most about
+    ``3 K u^2 (|A||B|)_ij`` with u = 2**-53, so the result is within
+    ``K u^2 + u_out`` of the exact product to first order: in practice it is
+    the correctly rounded value or one ulp from it.
+
+    Batched ``(..., M, K) @ (..., K, N)`` operands are supported. Non-finite
+    operands, or products that overflow, fall back to ``torch.matmul`` for
+    the affected outputs (inf / nan semantics match plain float64).
+    """
+    if not (torch.isfinite(A).all() and torch.isfinite(B).all()):
+        return torch.matmul(A, B)
+    K = A.shape[-1]
+    out_shape = torch.broadcast_shapes(A.shape[:-1] + (1,), B.shape[:-2] + (1, B.shape[-1]))
+    hi = torch.zeros(out_shape, dtype=torch.float64, device=A.device)
+    lo = torch.zeros_like(hi)
+    if K == 0:
+        return hi
+    kc = max(1, min(K, _DD_CHUNK_ELEMS // max(1, hi.numel())))
+    for k0 in range(0, K, kc):
+        a = A[..., :, k0 : k0 + kc].unsqueeze(-1)  # (..., M, kc, 1)
+        b = B[..., k0 : k0 + kc, :].unsqueeze(-3)  # (..., 1, kc, N)
+        ph, pl = _two_prod(a, b)  # (..., M, kc, N)
+        while ph.shape[-2] > 1:
+            if ph.shape[-2] % 2:
+                pad = torch.zeros_like(ph[..., :1, :])
+                ph = torch.cat([ph, pad], dim=-2)
+                pl = torch.cat([pl, pad], dim=-2)
+            ph, pl = _dw_add(ph[..., 0::2, :], pl[..., 0::2, :], ph[..., 1::2, :], pl[..., 1::2, :])
+        hi, lo = _dw_add(hi, lo, ph[..., 0, :], pl[..., 0, :])
+    out = hi + lo
+    bad = ~torch.isfinite(out)
+    if bad.any():
+        out = torch.where(bad, torch.matmul(A, B), out)
+    return out
+
+
 def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
     """2D matmul ``A @ B`` routed through NKI when available.
 
