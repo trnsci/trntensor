@@ -391,6 +391,18 @@ def test_mixed_dtype_operands(sub):
 # --------------------------------------------------------------------------- #
 
 
+def _exact_matmul(A, B):
+    """Correctly rounded float64 A @ B (exact rational sums), for checking
+    the double-double bound: `A.double() @ B.double()` is itself off by about
+    1 ulp, which is above the `dd` bound for float64 operands (#84)."""
+    from fractions import Fraction
+
+    a = [[Fraction(float(x)) for x in row] for row in A.double().tolist()]
+    bt = [[Fraction(float(x)) for x in col] for col in B.double().T.tolist()]
+    out = [[float(sum(x * y for x, y in zip(r, c, strict=True))) for c in bt] for r in a]
+    return torch.tensor(out, dtype=torch.float64)
+
+
 @pytest.mark.parametrize("K", [1, 127, 1000])
 @pytest.mark.parametrize(
     "dtype,mode",
@@ -416,7 +428,7 @@ def test_forward_error_bound_holds(dtype, mode, K):
     B = torch.randn(K, 11, generator=gen).to(dtype)
     got = tt.einsum("ij,jk->ik", d(A), d(B), precision=mode)
     assert got.dtype == dtype
-    exact = A.double() @ B.double()
+    exact = _exact_matmul(A, B) if dtype == torch.float64 else A.double() @ B.double()
     scale = A.double().abs() @ B.double().abs()
     err = float(((host(got).double() - exact).abs() / scale.clamp_min(1e-300)).max())
     # small slack for the final rounding being half-ulp vs ulp
