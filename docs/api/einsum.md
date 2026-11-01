@@ -21,9 +21,14 @@ einsum(
 ```
 
 The planner selects `matmul`, `bmm`, `path`, or `torch.einsum` based on
-the subscript pattern and operand shapes. When a NKI backend is active and
-the pattern maps to a 2-index matmul, the kernel in
-`trntensor.nki._kernels.matmul_kernel` is used.
+the subscript pattern and operand shapes. `matmul` is planned only when the
+output lists A's free index then B's, and `bmm` only for exactly
+`bij,bjk->bik`; transposed or permuted outputs run through `torch.einsum`.
+Releases through 0.21.0 returned the wrong layout for those outputs on every
+backend (#64, fixed in 0.22.0). On the native TorchNeuron path, matmul/bmm
+run on aten on the `neuron` device (the NKI matmul kernels are deprecated
+there); on the XLA path (Trn1), `trntensor.nki._kernels.matmul_kernel` is used
+above the FLOP threshold.
 
 ### Arguments
 
@@ -70,12 +75,12 @@ trntensor.einsum("ij,jk->ik", A, B, beta=1.0, out=acc)
 
 ### `dtype` — mixed-precision compute
 
-Cast operands to a lower dtype to hit the NKI bf16 matmul path without
-changing the model's weight dtype. The result is returned in the requested
-dtype.
+Cast operands to a lower dtype to compute in bf16/fp16 (aten on the native
+device, the NKI bf16 matmul kernel on the XLA path) without changing the
+model's weight dtype. The result is returned in the requested dtype.
 
 ```python
-# Route through NKI bf16 kernel even if weights are fp32
+# Compute in bf16 even if weights are fp32
 result_bf16 = trntensor.einsum("ij,jk->ik", A, B, dtype="bf16")
 
 # Use torch.dtype directly
@@ -89,7 +94,7 @@ result = trntensor.einsum("ij,jk->ik", A, B, dtype=torch.float16)
 | `"fast"` | Native operand dtype; NKI kernels accumulate in fp32 via PSUM |
 | `"kahan"` | Contracts in fp64 and rounds once back to the operand dtype; bypasses NKI dispatch. Operands on a device without native fp64 (the Neuron device, XLA) are contracted on the host and the result moved back. Error ≤ K·2⁻⁵³ + u_out, so the result is as accurate as its dtype allows (~1 ulp), not ~16 digits, unless the operands are float64 |
 | `"sr"` | Stochastic rounding at the PSUM→SBUF downcast (BF16/FP16); mean-zero √K·u error instead of K·u. On Trainium requires `NEURON_RT_STOCHASTIC_ROUNDING_EN=1` at process start (see below) |
-| `"dd"` | Double-double accumulation via trnblas Phase 2 — raises `NotImplementedError` until trnblas#22 lands |
+| `"dd"` | Double-double accumulation via trnblas Phase 2 — raises `NotImplementedError` on Trainium hosts until trnblas#22 lands; on CPU, a software Ozaki-2 emulation for `matmul` plans (`"kahan"` for `bmm` / `torch` plans) |
 
 ```python
 # High-precision DF-MP2 energy accumulation
@@ -156,8 +161,9 @@ Execute several contractions in one call. Each contraction is a tuple
 of `(subscripts, *operands)`. Results are returned in input order.
 
 When NKI dispatch is active, operand tensors that appear in more than one
-contraction (by object identity) are pre-pinned to the XLA device once
-before executing the loop, eliminating redundant host↔device transfers.
+contraction (by object identity) are pre-pinned to the device (`neuron` on
+TorchNeuron, the XLA device on Trn1) once before executing the loop,
+eliminating redundant host↔device transfers.
 
 ```python
 results = trntensor.multi_einsum(
