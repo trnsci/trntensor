@@ -217,3 +217,35 @@ class TestCPExtended:
         factors, _ = trntensor.cp_decompose(T, rank=2, max_iter=30, nonneg=True, factors=init)
         for f in factors:
             assert (f >= 0).all()
+
+
+class TestComplexTuckerTT:
+    """Complex tensors: the Tucker core must use U^H, not U^T (audit 3)."""
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    def test_tucker_full_rank_identity(self, dtype):
+        g = torch.Generator().manual_seed(0)
+        x = torch.randn(4, 5, 3, generator=g, dtype=dtype)
+        core, factors = trntensor.tucker_decompose(x, (4, 5, 3))
+        tol = 1e-4 if dtype == torch.complex64 else 1e-10
+        torch.testing.assert_close(
+            trntensor.tucker_reconstruct(core, factors), x, rtol=tol, atol=tol
+        )
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    def test_tucker_core_is_projection(self, dtype):
+        g = torch.Generator().manual_seed(1)
+        x = torch.randn(4, 5, 3, generator=g, dtype=dtype)
+        core, U = trntensor.tucker_decompose(x, (2, 3, 2))
+        ref = torch.einsum("abc,ai,bj,ck->ijk", x, U[0].conj(), U[1].conj(), U[2].conj())
+        tol = 1e-4 if dtype == torch.complex64 else 1e-10
+        torch.testing.assert_close(core, ref, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    def test_tt_full_rank_identity(self, dtype):
+        g = torch.Generator().manual_seed(2)
+        x = torch.randn(3, 4, 2, 3, generator=g, dtype=dtype)
+        tol = 1e-4 if dtype == torch.complex64 else 1e-10
+        torch.testing.assert_close(
+            trntensor.tt_reconstruct(trntensor.tt_decompose(x, 64)), x, rtol=tol, atol=tol
+        )

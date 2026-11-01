@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tucker_decompose` returned a wrong core for complex tensors** (silent,
+  every backend): it projected with `Uᵀ` instead of `Uᴴ`, so even a
+  full-rank reconstruction was off by ~140 %. Affects every release through
+  0.22.0. `tt_decompose` now also accepts complex tensors instead of raising
+  (#73). Real tensors are unchanged.
+
 ## [0.22.0] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

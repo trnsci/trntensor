@@ -147,10 +147,12 @@ def tucker_decompose(
         U, S, Vh = torch.linalg.svd(T_mode, full_matrices=False)
         factors.append(U[:, : ranks[mode]])
 
-    # Core tensor: G = T ×_1 U_1^T ×_2 U_2^T ×_3 U_3^T ...
+    # Core tensor: G = T ×_1 U_1^H ×_2 U_2^H ×_3 U_3^H ... (the conjugate
+    # transpose: U^T is not the inverse of a complex unitary U; for real
+    # tensors .mH is .T)
     core = tensor.clone()
     for mode in range(ndim):
-        core = _mode_product(core, factors[mode].T, mode)
+        core = _mode_product(core, factors[mode].mH, mode)
 
     return core, factors
 
@@ -199,7 +201,7 @@ def tt_decompose(
         # Core G_k: shape (r_{k-1}, n_k, r_k)
         cores.append(U[:, :r_k].reshape(r_prev, n_k, r_k))
         # Remainder for next step
-        remainder = torch.diag(S[:r_k]) @ Vh[:r_k, :]
+        remainder = S[:r_k, None].to(Vh.dtype) * Vh[:r_k, :]  # diag(S) @ Vh; S is real
         # Reshape to (r_k * n_{k+1}, remaining_dims)
         remaining_size = 1
         for s in shape[k + 1 :]:
