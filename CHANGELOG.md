@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`einsum(..., out=C)` with `beta=0` (the default) read `C`**, so NaN or
+  inf in the buffer (e.g. `torch.empty`) made the result NaN (silent, every
+  backend). Affects 0.3.0 through 0.22.0. `beta == 0` now ignores `out`, as
+  in BLAS, cuTENSOR and trnblas (#71).
+
 ## [0.22.0] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
