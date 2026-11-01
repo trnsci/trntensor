@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`df_exchange` tiles naux to minimise the SYRK's partial aux tiles (#60).**
+- **`df_exchange` tiles naux to minimise the SYRK's partial aux tiles (#66, #60).**
   K at n_ao = 970 takes 93.8 ms instead of 118 ms at LNC=2, and 187 ms
   instead of 230 ms at LNC=1. The error against float64 is 6.2e-7 (was
   8.1e-7) relative to max |K|.
