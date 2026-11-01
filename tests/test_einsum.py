@@ -839,3 +839,28 @@ class TestOutputOrder:
         ins = subscripts.split("->")[0].split(",")
         ops = [torch.randn(*[sizes[c] for c in t]) for t in ins]
         assert trntensor.plan_contraction(subscripts, *ops).strategy == strategy
+
+
+class TestBetaZeroIgnoresOut:
+    """beta == 0 must not read ``out`` (BLAS / cuTENSOR convention, audit 3)."""
+
+    @pytest.mark.parametrize(
+        "subscripts,shapes",
+        [
+            ("ij,jk->ik", [(6, 5), (5, 7)]),
+            ("ij,jk->ki", [(6, 5), (5, 7)]),
+            ("bij,bjk->bik", [(3, 4, 5), (3, 5, 6)]),
+            ("ij,jk,kl->il", [(4, 5), (5, 6), (6, 3)]),
+            ("ij->ji", [(4, 6)]),
+        ],
+    )
+    @pytest.mark.parametrize("fill", [float("nan"), float("inf")])
+    @pytest.mark.parametrize("alpha", [1.0, 2.0])
+    def test_nonfinite_out_not_propagated(self, subscripts, shapes, fill, alpha):
+        g = torch.Generator().manual_seed(0)
+        ops = [torch.randn(s, generator=g) for s in shapes]
+        ref = alpha * torch.einsum(subscripts, *ops)
+        out = torch.full(ref.shape, fill)
+        got = trntensor.einsum(subscripts, *ops, alpha=alpha, beta=0.0, out=out)
+        torch.testing.assert_close(got, ref)
+        assert torch.isnan(out).all() or torch.isinf(out).all()  # out not written

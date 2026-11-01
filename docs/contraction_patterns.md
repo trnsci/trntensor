@@ -22,11 +22,16 @@ as the primary design surface.
 ```python
 import trntensor
 
-# Matrix multiply: routes to NKI matmul kernel when FLOPs ≥ 2 GFLOPs
+# Matrix multiply: aten on the native path (Trn2/Trn3); NKI matmul kernel on
+# the XLA path (Trn1) when FLOPs ≥ 2 GFLOPs
 C = trntensor.einsum("ij,jk->ik", A, B)
 
-# Batched matmul
+# Batched matmul (only this exact index order plans as bmm)
 C = trntensor.einsum("bij,bjk->bik", A, B)
+
+# Transposed / permuted outputs run through torch.einsum. Releases through
+# 0.21.0 returned the wrong layout for these on every backend (#64).
+Ct = trntensor.einsum("ij,jk->ki", A, B)
 
 # DF-MP2 pair contraction (ap,bp->ab  ≡  B[i] @ B[j].T)
 T = trntensor.einsum("ap,bp->ab", B_i, B_j)
@@ -43,13 +48,15 @@ X = trntensor.einsum("ijk,klm->ijlm", A, B)
 plan = trntensor.plan_contraction("ij,jk->ik", A, B)
 print(plan.strategy)  # "matmul" | "bmm" | "torch" | "path"
 print(plan.backend)  # "nki" | "pytorch"
-print(plan.estimated_flops)  # multiply-add pairs
+print(trntensor.estimate_flops("ij,jk->ik", A, B))  # multiply-add pairs
 print(plan.contraction_path)  # [(i,j), ...] for 3+ operand einsums
 ```
 
 `plan.backend` reflects what will actually run — not what the algorithm
 prefers. A 64×64 matmul is `strategy="matmul"` but `backend="pytorch"` because
-the per-dispatch XLA overhead exceeds the kernel work at that size.
+the per-dispatch overhead exceeds the kernel work at that size. On the native
+path every matmul/bmm reports `"pytorch"` by default: aten beat the NKI matmul
+kernels at every measured size.
 
 ### Backend overrides
 
@@ -57,7 +64,7 @@ the per-dispatch XLA overhead exceeds the kernel work at that size.
 # Force PyTorch path regardless of size (benchmarking baseline)
 TRNTENSOR_FORCE_BACKEND=pytorch python script.py
 
-# Lower the FLOP threshold (default 2 GFLOPs)
+# XLA path: lower the FLOP threshold (default 2 GFLOPs)
 TRNTENSOR_MIN_NKI_FLOPS=500000000 python script.py
 ```
 
@@ -75,26 +82,28 @@ program:
 # no HBM intermediate visible to Python.
 
 B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
-# Inside: two nc_matmul per auxiliary P, SBUF-resident C_occ and C_vir,
-# kernel-scratch HBM for the (i,ν) intermediate. One NKI dispatch.
+# Inside: two GEMM stages, kernel-scratch HBM for the intermediate.
+# Accepts packed (μ≥ν) integrals.
 
 E = trntensor.mp2_energy(B, eps_occ, eps_vir)
-# Inside: two nc_matmul in PSUM, PSUM→SBUF, Vector Engine elementwise
-# denominator, scalar SBUF accumulator. One NKI dispatch.
+# Inside: T in PSUM/SBUF, Vector Engine elementwise denominator, SBUF
+# accumulator. One launch (XLA) or one launch per occupied row (native).
 ```
 
 Neither `T_ijab` nor the per-pair `(i,ν)` intermediate appear as Python
 tensors. In cuTENSOR terms, this is three plans fused into one — a pattern
 cuTENSOR's `Plan` abstraction cannot name.
 
+The same idea covers DF-SCF: `df_exchange(B, C_occ)` and `df_coulomb(B, D)`
+build K and J straight from packed integrals without forming the
+`(n, n, naux)` square.
+
 ### Current shape constraints
 
-`ao_to_mo_transform`: `nbasis ≤ 512`, `nocc ≤ 128`, `nvir ≤ 512`.
-
-`mp2_energy`: `nvir ≤ 128`, `naux ≤ 128`.
-
-Sizes outside these ranges fall through to the CPU reference path. N-tiling
-and M-tiling for larger systems are tracked as follow-up issues.
+The `ao_to_mo_transform` kernels need
+`nocc ≤ 128`; `"auto"` also keeps aten (native) for problems too small to
+beat the launch floor. See [Quantum-chemistry primitives](api/quantum.md) for
+the current routing and limits of each primitive.
 
 ## Multi-contraction: shared-operand pre-pinning
 
@@ -115,7 +124,7 @@ results = trntensor.multi_einsum(
 
 `multi_einsum` inspects tensor object identity (`id()`). If the same tensor
 object appears in two or more contractions, it is transferred once and the
-XLA-resident copy is used for all subsequent contractions in the batch.
+device-resident copy is used for all subsequent contractions in the batch.
 
 On CPU (no NKI), `multi_einsum` behaves exactly like a loop over `einsum()`.
 
@@ -165,7 +174,8 @@ print(plan.contraction_path)  # [(0,1),(0,1)] — contract A@B first, then ×C
 ```
 
 Each binary step in the path calls `einsum()` recursively and gets its own
-backend routing (NKI if large enough, PyTorch otherwise).
+backend routing (on the XLA path NKI if large enough, PyTorch otherwise; on
+the native path aten).
 
 ## Decompositions
 

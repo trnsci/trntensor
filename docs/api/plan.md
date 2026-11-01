@@ -28,7 +28,7 @@ Call `clear_plan_cache()` to invalidate (e.g. after a backend change).
 |-------|--------------------|
 | `"fast"` | Default; NKI kernels eligible for matmul/bmm strategies |
 | `"kahan"` | Signals fp64 promotion at execution time; plan is still computed but `einsum` will use `torch.einsum` in fp64 regardless of strategy |
-| `"dd"` | Raises `NotImplementedError` at execution time (trnblas#22 pending) |
+| `"dd"` | On Trainium hosts raises `NotImplementedError` at execution time (trnblas#22 pending); on CPU, Ozaki-2 emulation for `matmul` plans, `"kahan"` otherwise |
 | `"sr"` | Stochastic rounding at the PSUM→SBUF downcast for matmul/bmm strategies. On Trainium requires `NEURON_RT_STOCHASTIC_ROUNDING_EN=1` at process start, otherwise one-time `RuntimeWarning` and round-to-nearest; see [einsum](einsum.md#stochastic-rounding-on-trainium-is-a-runtime-setting) |
 
 ```python
@@ -58,10 +58,16 @@ the planner returns.
 
 ### Strategy selection
 
-- **`"matmul"`** — 2-operand, 2D tensors, single contracted index → `torch.matmul` (or NKI kernel when backend is `"nki"`)
-- **`"bmm"`** — 2-operand, 3D tensors, single contracted index + single batch index → `torch.bmm` (or NKI batched kernel)
-- **`"torch"`** — 2-operand fallback for patterns that don't fit matmul/bmm → `torch.einsum`
-- **`"path"`** — 3+ operands → greedy binary contraction ordering; each binary step is dispatched through the full backend-selection stack so large sub-contractions still reach NKI
+- **`"matmul"`** — 2-operand, 2D tensors, single contracted index, output in the order `[A free, B free]` (e.g. `ij,jk->ik`, `ap,bp->ab`) → `torch.matmul` (or NKI kernel when backend is `"nki"`)
+- **`"bmm"`** — exactly `bij,bjk->bik` → `torch.bmm` (or NKI batched kernel)
+- **`"torch"`** — 2-operand fallback for patterns that don't fit matmul/bmm, including transposed or permuted outputs such as `ij,jk->ki` → `torch.einsum`
+- **`"path"`** — 3+ operands → greedy binary contraction ordering; each binary step is dispatched through the full backend-selection stack
+
+Before 0.22.0 the index-order conditions above were not checked, so
+transposed or permuted outputs came back in the wrong layout on every backend
+(#64). On the native TorchNeuron path `backend` reports `"pytorch"` for
+matmul/bmm by default: they run on aten on the device (the NKI matmul kernels are
+deprecated there).
 
 ## `estimate_flops(subscripts, *operands) -> int`
 

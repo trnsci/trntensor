@@ -71,7 +71,9 @@ def einsum(
         beta: Scalar multiplier applied to ``out`` before accumulation (default 0.0).
         out: Optional accumulation tensor. When provided the return value is
             ``alpha * contract(operands) + beta * out``. Must have the same
-            shape as the contraction result.
+            shape as the contraction result. With ``beta == 0`` (the
+            default) ``out`` is not read, as in BLAS and cuTENSOR, so NaN or
+            inf in it does not propagate.
         dtype: Optional compute dtype. When set, all operands are cast to this
             dtype before contracting and the result is returned in that dtype.
             Accepts ``torch.dtype`` instances or strings: ``"bf16"``,
@@ -150,6 +152,11 @@ def einsum(
         operands = tuple(op.to(target) for op in operands)
     plan = plan_contraction(subscripts, *operands, precision=precision)
     result = _execute_contraction(subscripts, operands, plan)
+    if beta == 0.0:
+        # BLAS / cuTENSOR / trnblas convention: with beta == 0 ``out`` is not
+        # read, so NaN or inf in it (e.g. a torch.empty buffer) cannot leak
+        # into the result through 0 * NaN.
+        out = None
     if alpha == 1.0 and out is None:
         return result
     return _scale_add(result, alpha, beta, out, operands)
