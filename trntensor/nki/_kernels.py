@@ -836,9 +836,9 @@ if HAS_NKI:
         the indices were built for. ``tail``: when non-zero, the last chunk
         of this launch is the short last chunk of naux, ``tail`` wide.
 
-        Chunk widths that are 128 multiples plus one short last chunk keep
-        the Tensor Engine work at ``ceil(naux / 128)`` aux tiles; a divisor
-        of naux such as 213 for 4686 needs 2 tiles per chunk (20% more).
+        128-multiple chunk widths with one short last chunk give the SYRK
+        launch full 128-row aux tiles in every group but the last one (see
+        :func:`df_half_tiling`).
 
         Returns ``Xt`` ``(NR, NVG, NOCC, NVC)``, ``NR = (G - 1)·tp + tail``
         with a tail (else ``G·tp``): ``Xt[P, g, i, v] = X[i, g·NVC + v, P]``
