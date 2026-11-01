@@ -333,8 +333,20 @@ def _plan_binary(
 
     A, B = operands
 
-    # Simple matmul: ij,jk->ik or ji,jk->ik etc.
-    if len(contracted) == 1 and len(batch) == 0 and A.dim() == 2 and B.dim() == 2:
+    # Simple matmul: ij,jk->ik or ji,jk->ik etc. The executor returns
+    # op(A) @ op(B), so the output must list A's free index then B's: a
+    # transposed output (->ki) or a free index summed away (->i) goes to
+    # torch.einsum instead (#64).
+    if (
+        len(contracted) == 1
+        and len(batch) == 0
+        and A.dim() == 2
+        and B.dim() == 2
+        and len(set_a) == 2
+        and len(set_b) == 2
+        and idx_out
+        == [c for c in idx_a if c not in contracted] + [c for c in idx_b if c not in contracted]
+    ):
         c_idx = list(contracted)[0]
         transA = idx_a.index(c_idx) == 0  # Contracted index is first → need transpose
         transB = idx_b.index(c_idx) == 1  # Contracted index is second → need transpose
@@ -347,8 +359,19 @@ def _plan_binary(
             output_indices=idx_out,
         )
 
-    # Batched matmul: bij,bjk->bik
-    if len(contracted) == 1 and len(batch) == 1 and A.dim() == 3 and B.dim() == 3:
+    # Batched matmul: exactly bij,bjk->bik (the executor is torch.bmm-shaped:
+    # batch first, A's contracted index last, B's first, output (b, i, k)) (#64).
+    if (
+        len(contracted) == 1
+        and len(batch) == 1
+        and A.dim() == 3
+        and B.dim() == 3
+        and len(set_a) == 3
+        and len(set_b) == 3
+        and idx_a[0] == idx_b[0] == idx_out[0]
+        and idx_a[2] == idx_b[1]
+        and idx_out == [idx_a[0], idx_a[1], idx_b[2]]
+    ):
         return ContractionPlan(
             subscripts=subscripts,
             strategy="bmm",
