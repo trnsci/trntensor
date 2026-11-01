@@ -104,6 +104,10 @@ class TestNativeDispatch:
             "mp2_energy_row",
             "ao_to_mo_trn2",
             "ao_to_mo_trn2_packed",
+            "df_half_packed",
+            "df_exchange_syrk",
+            "df_coulomb_d",
+            "df_coulomb_j",
         ):
             assert hasattr(torch.ops.trntensor, name)
 
@@ -222,6 +226,72 @@ class TestNativeTrn2Kernels:
         assert torch.equal(out.cpu(), full.cpu())
         ref = torch.einsum("na,inP->iaP", C_vir, torch.einsum("mi,mnP->inP", C_occ, eri))
         torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-4)
+
+    @pytest.mark.parametrize(
+        "nbasis,nocc,naux,group",
+        [(128, 8, 128, 0), (200, 21, 558, 0), (256, 41, 1206, 0), (300, 33, 600, 1)],
+    )
+    def test_df_exchange_kernels_match_reference(self, monkeypatch, nbasis, nocc, naux, group):
+        """#60: gather + half transform + PSUM SYRK against the fp64 K,
+        including odd nocc (padded), non-128 nbasis, partial aux tiles and
+        several launch groups."""
+        import trntensor
+        from trntensor.nki import dispatch
+
+        if group:
+            monkeypatch.setattr(dispatch, "df_group_chunks", lambda *a: group)
+        g = torch.Generator().manual_seed(nbasis + naux)
+        eri = torch.randn(nbasis, nbasis, naux, generator=g, dtype=torch.float64) * 0.1
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C = torch.randn(nbasis, nocc, generator=g, dtype=torch.float64) / nbasis**0.5
+        pk = trntensor.pack_tril(eri)
+        out = dispatch._nki_df_exchange(pk.float().to("neuron"), C.float().to("neuron"))
+        assert out.device.type == "neuron" and out.shape == (nbasis, nbasis)
+        X = torch.einsum("li,lnP->inP", C, eri)
+        ref = torch.einsum("imP,inP->mn", X, X)
+        K = out.cpu().double()
+        assert torch.equal(K, K.T)
+        assert float((K - ref).abs().max() / ref.abs().max()) < 2e-6
+
+    @pytest.mark.parametrize("nbasis,naux", [(64, 300), (250, 1206)])
+    def test_df_coulomb_kernels_match_reference(self, nbasis, naux):
+        import trntensor
+        from trntensor.nki import dispatch
+
+        g = torch.Generator().manual_seed(nbasis)
+        eri = torch.randn(nbasis, nbasis, naux, generator=g, dtype=torch.float64) * 0.1
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        D = torch.randn(nbasis, nbasis, generator=g, dtype=torch.float64)
+        D = D + D.T
+        pk = trntensor.pack_tril(eri)
+        r = torch.tril_indices(nbasis, nbasis)
+        pw = D[r[0], r[1]] * torch.where(r[0] == r[1], 1.0, 2.0).double()
+        jp = dispatch._nki_df_coulomb(pk.float().to("neuron"), pw.float().to("neuron"))
+        ref = pk @ (pk.T @ pw)
+        assert float((jp.cpu().double() - ref).abs().max() / ref.abs().max()) < 2e-6
+
+    def test_df_exchange_and_coulomb_auto_on_device(self):
+        """Under "auto", device-resident packed B above the thresholds runs
+        the kernels and the results stay on the device."""
+        import trntensor
+
+        prev = trntensor.get_backend()
+        trntensor.set_backend("auto")
+        try:
+            g = torch.Generator().manual_seed(11)
+            eri = torch.randn(200, 200, 558, generator=g) * 0.1
+            eri = 0.5 * (eri + eri.transpose(0, 1))
+            C = torch.randn(200, 21, generator=g) / 200**0.5
+            B = trntensor.pack_tril(eri).to("neuron")
+            K = trntensor.df_exchange(B, C.to("neuron"), alpha=2.0)
+            J = trntensor.df_coulomb(B, (2 * C @ C.T).to("neuron"))
+        finally:
+            trntensor.set_backend(prev)
+        assert K.device.type == "neuron" and J.device.type == "neuron"
+        Kr = trntensor.df_exchange(trntensor.pack_tril(eri), C, alpha=2.0)
+        Jr = trntensor.df_coulomb(trntensor.pack_tril(eri), 2 * C @ C.T)
+        torch.testing.assert_close(K.cpu(), Kr, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(J.cpu(), Jr, atol=1e-3, rtol=1e-4)
 
     def test_packed_host_cderi_uploads_and_routes_to_packed_kernel(self, monkeypatch):
         """PySCF-layout (naux, npair) host integrals with device orbitals:

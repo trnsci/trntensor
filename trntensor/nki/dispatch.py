@@ -33,6 +33,8 @@ from ._kernels import (
     TILE_N,
     ao_to_mo_trn2_nub,
     ao_to_mo_trn2_tiling,
+    df_group_chunks,
+    df_half_tiling,
 )
 
 if HAS_NKI:
@@ -1473,6 +1475,184 @@ def _nki_ao_to_mo_trn2_packed(
         C_vir.contiguous(),
     )
     return out[:, :nvir, :naux] if (nvp, nxp) != (nvir, naux) else out
+
+
+def _df_gather_images(
+    nbasis: int, nbp: int, naux: int, tp: int, nub: int, nvc: int, device=None
+) -> torch.Tensor:
+    """Gather indices for ``df_half_packed_kernel``: ``(NPC, NVG, 128, NKB·NVC)`` uint32.
+
+    Same row encoding as :func:`_tril_gather_images` (row ``NPC·pair + c`` of
+    the ``(npair·NPC, tp)`` view; ``(128, NUB)`` blocks read column-major,
+    written row-major), regrouped so one contiguous DMA per (chunk, ν group
+    of ``nvc``) brings every μ-tile's indices for that group. Cached per
+    shape and device (``4·NPC·nbp²`` bytes).
+    """
+    key = ("dfk", nbasis, nbp, naux, tp, nub, nvc, str(device))
+    hit = _gather_image_cache.get(key)
+    if hit is not None:
+        return hit
+    npc = naux // tp
+    nkb = nbp // TILE_K
+    nvg = nbp // nvc
+    rows = torch.zeros(nbp, nbp, dtype=torch.int64)
+    rows[:nbasis, :nbasis] = _tril_rows(nbasis)
+    q = torch.arange(TILE_K)[:, None]
+    m = torch.arange(nub)[None, :]
+    j = m * TILE_K + q  # (128, NUB)
+    dp, du = j // nub, j % nub
+    k = torch.arange(nkb)[:, None, None, None]
+    v0 = (torch.arange(nbp // nub) * nub)[None, :, None, None]
+    mu = k * TILE_K + dp[None, None]  # (NKB, NB/NUB, 128, NUB)
+    nu = v0 + du[None, None]
+    base = rows[mu, nu].reshape(nkb, nvg, nvc // nub, TILE_K, nub)
+    base = base.permute(1, 3, 0, 2, 4).reshape(nvg, TILE_K, nkb * nvc)
+    img = base[None] * npc + torch.arange(npc)[:, None, None, None]
+    if int(img.max()) >= 2**31:
+        raise ValueError("packed eri too large for 32-bit gather indices")
+    hit = img.to(torch.int32).view(torch.uint32).contiguous()
+    if device is not None:
+        hit = hit.to(device)
+    _gather_image_cache[key] = hit
+    return hit
+
+
+_DF_EXCHANGE_CHOICES = ("auto", "trn2", "aten")
+# Under "auto" the kernels need nocc·nbasis²·naux of at least this many
+# multiply-adds (stage 1). Trn2, one LNC=2 core, warm (#60): water
+# (24/116/5, 3.3e5) 1.32 ms kernels vs 1.16 ms aten; benzene (114/558/21,
+# 1.5e8) 1.35 vs 2.24 ms; n_ao 250 (5.0e9) 2.2 vs 9.0 ms.
+_DF_EXCHANGE_MIN_MACS = 1.0e7
+
+
+def _df_exchange_route(B: torch.Tensor, nocc: int, nbasis: int) -> str:
+    """'trn2' or 'aten' for :func:`trntensor.quantum.df_exchange` on packed ``B``.
+
+    'trn2' needs the native path, NKI in use, ``nocc ≤ 512`` and a kernel
+    tiling (``df_half_tiling``: a divisor of naux ≤ 512 and an SBUF fit).
+    Under ``"auto"`` it also needs ``B`` on the device and ``nocc·nbasis²·naux
+    ≥ _DF_EXCHANGE_MIN_MACS``; ``set_backend("nki")`` drops those two.
+    ``TRNTENSOR_DF_EXCHANGE=auto|trn2|aten`` overrides.
+    """
+    if not (_use_nki() and HAS_NKI) or not _on_native_path():
+        return "aten"
+    choice = os.environ.get("TRNTENSOR_DF_EXCHANGE", "auto").strip().lower()
+    if choice not in _DF_EXCHANGE_CHOICES:
+        raise ValueError(
+            f"TRNTENSOR_DF_EXCHANGE must be one of {_DF_EXCHANGE_CHOICES}; got {choice!r}"
+        )
+    if choice != "auto":
+        return choice
+    naux = B.shape[1]
+    if nocc > 512 or df_half_tiling(naux, _round_up(nbasis, TILE_K), nocc) is None:
+        return "aten"
+    if _nki_forced():
+        return "trn2"
+    if ("dfk", tuple(B.shape), nocc) in _native_kernel_failed:
+        return "aten"
+    big = nocc * nbasis**2 * naux >= _DF_EXCHANGE_MIN_MACS
+    return "trn2" if big and B.device.type == _NEURON_DEVICE else "aten"
+
+
+def _df_k_banks() -> int:
+    return int(os.environ.get("TRNTENSOR_DF_K_BANKS", "6"))
+
+
+def _nki_df_exchange(B: torch.Tensor, C_occ: torch.Tensor) -> torch.Tensor:
+    """K = Σ_{i,P} X X^T from packed ``(npair, naux)`` integrals on the native path (#60).
+
+    Per group of aux chunks (``df_group_chunks``), ``df_half_packed_kernel``
+    gathers and half-transforms into ``Xt`` and ``df_exchange_syrk_kernel``
+    adds that group into the two running partial Ks; ``K`` is their sum.
+    nbasis is padded through ``C_occ`` and the gather indices, nocc to an
+    even count with zero orbitals (the SYRK splits it across programs);
+    naux is not padded (the tiling uses a divisor of it).
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    npair, naux = B.shape
+    nbasis, nocc = C_occ.shape
+    nbp = _round_up(nbasis, TILE_K)
+    nop = nocc + nocc % 2
+    tiling = df_half_tiling(naux, nbp, nop)
+    if tiling is None:
+        raise ValueError(f"df_exchange: no kernel tiling for naux={naux}, nbasis={nbasis}")
+    tp, nub, nvc = tiling
+    if (nbp, nop) != (nbasis, nocc):
+        co = torch.zeros(nbp, nop, dtype=C_occ.dtype, device=C_occ.device)
+        co[:nbasis, :nocc] = C_occ
+        C_occ = co
+    C_occ = C_occ.contiguous()
+    dev = B.device if B.device.type == _NEURON_DEVICE else None
+    img = _df_gather_images(nbasis, nbp, naux, tp, nub, nvc, dev)
+    npc = naux // tp
+    grp = df_group_chunks(npc, nbp, tp, nub, nvc)
+    eri_v = B.contiguous().view(npair * npc, tp)
+    kin = torch.zeros(2, nbp, nbp, dtype=torch.float32, device=B.device)
+    banks = _df_k_banks()
+    for c0 in range(0, npc, grp):
+        xt = _launch(None, "df_half_packed", eri_v, img[c0 : c0 + grp], C_occ, nub=nub)
+        kin = _launch(None, "df_exchange_syrk", xt, kin, banks=banks)
+        del xt
+    K = kin[0] + kin[1]
+    return K[:nbasis, :nbasis] if nbp != nbasis else K
+
+
+# Under "auto" the J kernels need npair·naux of at least this many elements
+# of B (each kernel streams B once). Trn2, LNC=2 (#60): 3.8e7 elements
+# (n_ao 250) 2.90 ms vs 3.81 ms for two aten GEMVs; 2.2e9 (970) 46 vs 87 ms.
+_DF_COULOMB_MIN_ELEMS = 1.0e7
+
+
+def _df_coulomb_route(B: torch.Tensor) -> str:
+    """'trn2' or 'aten' for :func:`trntensor.quantum.df_coulomb` on packed ``B``.
+
+    'trn2' needs the native path, NKI in use and at least 256 packed rows;
+    under ``"auto"`` also ``B`` on the device and ``npair·naux ≥
+    _DF_COULOMB_MIN_ELEMS``. ``TRNTENSOR_DF_COULOMB=auto|trn2|aten`` overrides.
+    """
+    if not (_use_nki() and HAS_NKI) or not _on_native_path():
+        return "aten"
+    choice = os.environ.get("TRNTENSOR_DF_COULOMB", "auto").strip().lower()
+    if choice not in _DF_EXCHANGE_CHOICES:
+        raise ValueError(
+            f"TRNTENSOR_DF_COULOMB must be one of {_DF_EXCHANGE_CHOICES}; got {choice!r}"
+        )
+    if choice != "auto":
+        return choice
+    if B.shape[0] < 2 * TILE_K:
+        return "aten"
+    if _nki_forced():
+        return "trn2"
+    if ("dfj", tuple(B.shape)) in _native_kernel_failed:
+        return "aten"
+    big = B.shape[0] * B.shape[1] >= _DF_COULOMB_MIN_ELEMS
+    return "trn2" if big and B.device.type == _NEURON_DEVICE else "aten"
+
+
+def _nki_df_coulomb(B: torch.Tensor, pw: torch.Tensor) -> torch.Tensor:
+    """Packed ``J = B (Bᵀ pw)`` on the native path (#60): ``(npair,)``.
+
+    ``df_coulomb_d_kernel`` and ``df_coulomb_j_kernel`` take the rows of
+    ``2·(npair // 256)`` full 128-row tiles; the < 256 leftover rows are one
+    small aten GEMV each way.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    npair, naux = B.shape
+    B = B.contiguous()
+    pw = pw.reshape(npair, 1).to(B.dtype).contiguous()
+    rows = (npair // (2 * TILE_K)) * 2 * TILE_K
+    dpart = _launch(None, "df_coulomb_d", B, pw)
+    d = dpart[0, 0] + dpart[1, 0]
+    if rows < npair:
+        d = d + B[rows:].T @ pw[rows:, 0]
+    d_b = d.reshape(1, naux).expand(TILE_K, naux).contiguous()
+    jt = _launch(None, "df_coulomb_j", B, d_b)
+    j = jt.T.reshape(-1)
+    if rows < npair:
+        j = torch.cat([j, B[rows:] @ d])
+    return j
 
 
 def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
