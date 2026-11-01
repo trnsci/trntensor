@@ -267,12 +267,13 @@ The original AO→MO and MP2 kernels remain the XLA-path (Trn1) kernels. See
 - `batched_matmul_kernel(a, b)` — per-batch-slice matmul. Batch dim
   iterated via `nl.affine_range`; each slice reuses the stationary-A
   tile layout.
-- `df_half_packed_kernel(eri_v, img, C_occ, nub)` and
+- `df_half_packed_kernel(eri_v, img, C_occ, nub, tp, tail)` and
   `df_exchange_syrk_kernel(xt, kin, banks)` — the fused DF exchange build
   behind `trntensor.df_exchange` (#60): packed-row gather and half transform
   into `Xt[P, i, ν]` (aux on partitions), then the PSUM SYRK over aux tiles
   with upper-triangle strips mirrored on the Tensor Engine. Tilings from
-  `df_half_tiling`, `df_group_chunks` and `df_exchange_blocks`.
+  `df_half_tiling`, `df_group_chunks`, `df_groups`, `df_syrk_tiles` and
+  `df_exchange_blocks`.
 - `df_coulomb_d_kernel(B, pw)` and `df_coulomb_j_kernel(B, d_b)` — the DF
   Coulomb build behind `trntensor.df_coulomb` (#60): `d = Bᵀ pw` and
   `J = B d`, each streaming packed `B` once in 128-row tiles on the Vector

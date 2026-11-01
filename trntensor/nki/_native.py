@@ -116,12 +116,17 @@ def ao_to_mo_trn2_packed(
     return _k.ao_to_mo_trn2_packed_kernel(eri_v, img, C_occ, C_vir)
 
 
+def _df_half_rows(eri_v, img, tp, tail):
+    tp = tp or eri_v.shape[1]
+    return (img.shape[0] - 1) * tp + tail if tail else img.shape[0] * tp
+
+
 @nki_op(
     "trntensor::df_half_packed",
     mutates_args={},
-    fake_fn=lambda eri_v, img, C_occ, nub=8: eri_v.new_empty(
+    fake_fn=lambda eri_v, img, C_occ, nub=8, tp=0, tail=0: eri_v.new_empty(
         (
-            img.shape[0] * eri_v.shape[1],
+            _df_half_rows(eri_v, img, tp, tail),
             img.shape[1],
             C_occ.shape[1],
             C_occ.shape[0] // img.shape[1],
@@ -129,9 +134,14 @@ def ao_to_mo_trn2_packed(
     ),
 )
 def df_half_packed(
-    eri_v: torch.Tensor, img: torch.Tensor, C_occ: torch.Tensor, nub: int = 8
+    eri_v: torch.Tensor,
+    img: torch.Tensor,
+    C_occ: torch.Tensor,
+    nub: int = 8,
+    tp: int = 0,
+    tail: int = 0,
 ) -> torch.Tensor:
-    return _k.df_half_packed_kernel(eri_v, img, C_occ, nub=nub)
+    return _k.df_half_packed_kernel(eri_v, img, C_occ, nub=nub, tp=tp, tail=tail)
 
 
 @nki_op(

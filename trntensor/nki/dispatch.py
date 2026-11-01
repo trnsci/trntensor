@@ -34,6 +34,7 @@ from ._kernels import (
     ao_to_mo_trn2_nub,
     ao_to_mo_trn2_tiling,
     df_group_chunks,
+    df_groups,
     df_half_tiling,
 )
 
@@ -1482,17 +1483,22 @@ def _df_gather_images(
 ) -> torch.Tensor:
     """Gather indices for ``df_half_packed_kernel``: ``(NPC, NVG, 128, NKB·NVC)`` uint32.
 
-    Same row encoding as :func:`_tril_gather_images` (row ``NPC·pair + c`` of
-    the ``(npair·NPC, tp)`` view; ``(128, NUB)`` blocks read column-major,
-    written row-major), regrouped so one contiguous DMA per (chunk, ν group
-    of ``nvc``) brings every μ-tile's indices for that group. Cached per
-    shape and device (``4·NPC·nbp²`` bytes).
+    Chunk ``c`` of pair ``r`` starts at element ``r·naux + c·tp`` of the
+    packed tensor, which the kernel views as ``(npair·naux / W, W)`` rows,
+    ``W = gcd(naux, tp)``: its index is row ``(r·naux + c·tp) / W``. With
+    ``tp`` dividing naux that is row ``NPC·r + c`` of the ``(npair·NPC, tp)``
+    view (:func:`_tril_gather_images`); otherwise the last chunk is the
+    short ``naux mod tp`` one. ``(128, NUB)`` blocks are read column-major
+    and written row-major, regrouped so one contiguous DMA per (chunk, ν
+    group of ``nvc``) brings every μ-tile's indices for that group. Cached
+    per shape and device (``4·NPC·nbp²`` bytes).
     """
     key = ("dfk", nbasis, nbp, naux, tp, nub, nvc, str(device))
     hit = _gather_image_cache.get(key)
     if hit is not None:
         return hit
-    npc = naux // tp
+    w0 = math.gcd(naux, tp)
+    npc = -(-naux // tp)
     nkb = nbp // TILE_K
     nvg = nbp // nvc
     rows = torch.zeros(nbp, nbp, dtype=torch.int64)
@@ -1507,7 +1513,7 @@ def _df_gather_images(
     nu = v0 + du[None, None]
     base = rows[mu, nu].reshape(nkb, nvg, nvc // nub, TILE_K, nub)
     base = base.permute(1, 3, 0, 2, 4).reshape(nvg, TILE_K, nkb * nvc)
-    img = base[None] * npc + torch.arange(npc)[:, None, None, None]
+    img = (base[None] * naux + (torch.arange(npc) * tp)[:, None, None, None]) // w0
     if int(img.max()) >= 2**31:
         raise ValueError("packed eri too large for 32-bit gather indices")
     hit = img.to(torch.int32).view(torch.uint32).contiguous()
@@ -1529,7 +1535,7 @@ def _df_exchange_route(B: torch.Tensor, nocc: int, nbasis: int) -> str:
     """'trn2' or 'aten' for :func:`trntensor.quantum.df_exchange` on packed ``B``.
 
     'trn2' needs the native path, NKI in use, ``nocc ≤ 512`` and a kernel
-    tiling (``df_half_tiling``: a divisor of naux ≤ 512 and an SBUF fit).
+    tiling (``df_half_tiling``: an aux chunk width ≤ 512 and an SBUF fit).
     Under ``"auto"`` it also needs ``B`` on the device and ``nocc·nbasis²·naux
     ≥ _DF_EXCHANGE_MIN_MACS``; ``set_backend("nki")`` drops those two.
     ``TRNTENSOR_DF_EXCHANGE=auto|trn2|aten`` overrides.
@@ -1544,7 +1550,7 @@ def _df_exchange_route(B: torch.Tensor, nocc: int, nbasis: int) -> str:
     if choice != "auto":
         return choice
     naux = B.shape[1]
-    if nocc > 512 or df_half_tiling(naux, _round_up(nbasis, TILE_K), nocc) is None:
+    if nocc > 512 or df_half_tiling(naux, _round_up(nbasis, TILE_K), nocc, B.shape[0]) is None:
         return "aten"
     if _nki_forced():
         return "trn2"
@@ -1561,12 +1567,14 @@ def _df_k_banks() -> int:
 def _nki_df_exchange(B: torch.Tensor, C_occ: torch.Tensor) -> torch.Tensor:
     """K = Σ_{i,P} X X^T from packed ``(npair, naux)`` integrals on the native path (#60).
 
-    Per group of aux chunks (``df_group_chunks``), ``df_half_packed_kernel``
+    Per group of aux chunks (``df_groups``), ``df_half_packed_kernel``
     gathers and half-transforms into ``Xt`` and ``df_exchange_syrk_kernel``
     adds that group into the two running partial Ks; ``K`` is their sum.
     nbasis is padded through ``C_occ`` and the gather indices, nocc to an
     even count with zero orbitals (the SYRK splits it across programs);
-    naux is not padded (the tiling uses a divisor of it).
+    naux is not padded: the chunks are ``tp`` wide (a divisor of naux or a
+    128 multiple) and the last group's last chunk may be the short
+    ``naux mod tp`` one.
     """
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
@@ -1574,10 +1582,11 @@ def _nki_df_exchange(B: torch.Tensor, C_occ: torch.Tensor) -> torch.Tensor:
     nbasis, nocc = C_occ.shape
     nbp = _round_up(nbasis, TILE_K)
     nop = nocc + nocc % 2
-    tiling = df_half_tiling(naux, nbp, nop)
+    tiling = df_half_tiling(naux, nbp, nop, npair)
     if tiling is None:
         raise ValueError(f"df_exchange: no kernel tiling for naux={naux}, nbasis={nbasis}")
     tp, nub, nvc = tiling
+    tail = naux % tp
     if (nbp, nop) != (nbasis, nocc):
         co = torch.zeros(nbp, nop, dtype=C_occ.dtype, device=C_occ.device)
         co[:nbasis, :nocc] = C_occ
@@ -1585,13 +1594,15 @@ def _nki_df_exchange(B: torch.Tensor, C_occ: torch.Tensor) -> torch.Tensor:
     C_occ = C_occ.contiguous()
     dev = B.device if B.device.type == _NEURON_DEVICE else None
     img = _df_gather_images(nbasis, nbp, naux, tp, nub, nvc, dev)
-    npc = naux // tp
+    npc = -(-naux // tp)
     grp = df_group_chunks(npc, nbp, tp, nub, nvc)
-    eri_v = B.contiguous().view(npair * npc, tp)
+    w0 = math.gcd(naux, tp)
+    eri_v = B.contiguous().view(npair * naux // w0, w0)
     kin = torch.zeros(2, nbp, nbp, dtype=torch.float32, device=B.device)
     banks = _df_k_banks()
-    for c0 in range(0, npc, grp):
-        xt = _launch(None, "df_half_packed", eri_v, img[c0 : c0 + grp], C_occ, nub=nub)
+    for c0, c1 in df_groups(naux, tp, grp):
+        kw = {"nub": nub, "tp": tp, "tail": tail if c1 == npc else 0}
+        xt = _launch(None, "df_half_packed", eri_v, img[c0:c1], C_occ, **kw)
         kin = _launch(None, "df_exchange_syrk", xt, kin, banks=banks)
         del xt
     K = kin[0] + kin[1]
