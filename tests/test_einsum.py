@@ -839,3 +839,18 @@ class TestOutputOrder:
         ins = subscripts.split("->")[0].split(",")
         ops = [torch.randn(*[sizes[c] for c in t]) for t in ins]
         assert trntensor.plan_contraction(subscripts, *ops).strategy == strategy
+
+
+class TestMultiEinsumMixedDtypes:
+    """A homogeneous-shape batch with mixed dtypes must return each result in
+    the dtype ``einsum`` would (audit 3)."""
+
+    def test_mixed_dtype_batch_keeps_each_dtype(self):
+        g = torch.Generator().manual_seed(0)
+        A32, B32 = torch.randn(4, 5, generator=g), torch.randn(5, 6, generator=g)
+        A64, B64 = A32.double() * 2, B32.double()
+        r = trntensor.multi_einsum(("ij,jk->ik", A32, B32), ("ij,jk->ik", A64, B64))
+        assert r[0].dtype == torch.float32
+        assert r[1].dtype == torch.float64
+        torch.testing.assert_close(r[0], A32 @ B32)
+        torch.testing.assert_close(r[1], A64 @ B64)

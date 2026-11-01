@@ -600,6 +600,11 @@ def _try_batched_multi_einsum(
     shape_key = (contractions[0][1].shape, contractions[0][2].shape)
     if not all((c[1].shape, c[2].shape) == shape_key for c in contractions):
         return None
+    # torch.stack would promote a mixed batch (float32 results came back
+    # float64) or fail on mixed devices: each result must match einsum's.
+    meta_key = tuple((op.dtype, op.device) for op in contractions[0][1:])
+    if not all(tuple((op.dtype, op.device) for op in c[1:]) == meta_key for c in contractions):
+        return None
 
     from .nki.dispatch import nki_batched_matmul
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`multi_einsum` changed result dtypes for mixed-dtype batches** (silent,
+  every backend). Same-shape contractions were stacked without checking
+  dtype, so float32 results came back float64. Affects 0.17.0 through 0.22.0.
+  Batching now requires matching operand dtypes and devices (#75).
+
 ## [0.22.0] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
