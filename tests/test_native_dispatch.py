@@ -492,7 +492,8 @@ class TestPublicApiOnNativePath:
         out = trntensor.df_exchange(trntensor.pack_tril(eri), C, alpha=2.0)
         X = torch.einsum("li,lnP->inP", C, eri)
         ref = 2.0 * torch.einsum("imP,inP->mn", X, X)
-        torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-4)
+        # fp32 sums of up to 600·nocc terms: compare against max |K|.
+        assert float((out - ref).abs().max()) <= 1e-5 * float(ref.abs().max())
         tp, nub, _nvc = _kernels.df_half_tiling(naux, -(-nbasis // 128) * 128, nocc + nocc % 2)
         launches = naux // tp if group else 1
         assert [c[0] for c in native_host] == ["df_half_packed", "df_exchange_syrk"] * launches
