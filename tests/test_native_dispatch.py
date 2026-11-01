@@ -1496,3 +1496,62 @@ class TestLazyRegistration:
         assert fake("df_exchange_syrk")(xt, m(2, 256, 256)).shape == (2, 256, 256)
         assert fake("df_coulomb_d")(m(31375, 1206), m(31375, 1)).shape == (2, 1, 1206)
         assert fake("df_coulomb_j")(m(31375, 1206), m(128, 1206)).shape == (128, 244)
+
+
+class TestKernelRoutesTakeFp32:
+    """float64 operands reach the fp32 chemistry kernels as float32 and the
+    result comes back float64 (#87: inf on Trn2 through 0.22.0)."""
+
+    @staticmethod
+    def _fp32_only(fn):
+        def wrapped(*ts):
+            for t in ts:
+                assert t.dtype == torch.float32, t.dtype
+            return fn(*ts)
+
+        return wrapped
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_ao_to_mo_transform(self, monkeypatch, packed):
+        import trntensor.quantum as q
+
+        monkeypatch.setenv("TRNTENSOR_REQUIRE_NKI", "1")  # no silent aten fallback
+        monkeypatch.setattr(q, "_ao_to_mo_route", lambda *a: "trn2")
+
+        def ref(eri, co, cv):
+            if eri.dim() == 2:
+                eri = trntensor.unpack_tril(eri, co.shape[0])
+            return torch.einsum("mi,na,mnP->iaP", co, cv, eri)
+
+        name = "_nki_ao_to_mo_trn2_packed" if packed else "_nki_ao_to_mo_trn2"
+        monkeypatch.setattr(dispatch, name, self._fp32_only(ref))
+        g = torch.Generator().manual_seed(4)
+        eri = torch.randn(6, 6, 5, generator=g, dtype=torch.float64)
+        eri = eri + eri.transpose(0, 1)
+        co = torch.randn(6, 2, generator=g, dtype=torch.float64)
+        cv = torch.randn(6, 3, generator=g, dtype=torch.float64)
+        inp = trntensor.pack_tril(eri) if packed else eri
+        out = trntensor.ao_to_mo_transform(inp, co, cv)
+        assert out.dtype == torch.float64
+        torch.testing.assert_close(
+            out, torch.einsum("mi,na,mnP->iaP", co, cv, eri), atol=1e-4, rtol=1e-5
+        )
+
+    def test_df_exchange(self, monkeypatch):
+        monkeypatch.setenv("TRNTENSOR_REQUIRE_NKI", "1")  # no silent aten fallback
+        monkeypatch.setattr(dispatch, "_df_exchange_route", lambda *a: "trn2")
+
+        def k(B, co):
+            full = trntensor.unpack_tril(B, co.shape[0])
+            X = torch.einsum("mnP,mi->inP", full, co)
+            return torch.einsum("inP,imP->nm", X, X)
+
+        monkeypatch.setattr(dispatch, "_nki_df_exchange", self._fp32_only(k))
+        g = torch.Generator().manual_seed(5)
+        eri = torch.randn(5, 5, 4, generator=g, dtype=torch.float64)
+        eri = eri + eri.transpose(0, 1)
+        co = torch.randn(5, 2, generator=g, dtype=torch.float64)
+        K = trntensor.df_exchange(trntensor.pack_tril(eri), co, alpha=2.0)
+        ref = 2.0 * torch.einsum("lmp,li,knp,ki->mn", eri, co, eri, co)
+        assert K.dtype == torch.float64
+        torch.testing.assert_close(K, ref, atol=1e-4, rtol=1e-5)
