@@ -31,17 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     16.9 and 424 → 230 ms at LNC=1. K error against float64 is unchanged
     (8.1e-7 vs 8.3e-7 relative to max |K| at 970).
   - In that example (with `df_coulomb` below, LNC=2, time to convergence)
-    the SCF went 352 → 239 ms at n_ao = 250, 756 → 671 ms at 490 and
-    9.68 → 5.98 s at 970 (J/K stage 365 → 193 ms per iteration). The
-    float64 energy at the final orbitals is as close to PySCF as before
-    (+1.0e-7 vs +1.1e-7 Eh at 970).
+    the SCF went 352 → 229 ms at n_ao = 250, 756 → 587 ms at 490 and
+    9.68 → 4.71 s at 970 (J/K stage 365 → 163 ms per iteration).
 - **`trntensor.df_coulomb(B, D)`: the DF Coulomb matrix from the same packed
   integrals (#60).** Two NKI launches each stream `B` once in contiguous
   128-row tiles with one fused Vector Engine instruction per tile (`d = Bᵀp`,
-  then `J = B d`). `TRNTENSOR_DF_COULOMB=auto|trn2|aten`. It is about as
-  fast as the two GEMVs it replaces (970: 86.7 → 76.2 ms) at similar error
-  (2.8e-7 vs 1.9e-7); what it adds is a single aux block at n_ao = 970,
-  where the aten GEMV on one 8.8 GB block needed a 26.7 GB graph. A packed
+  then `J = B d`). `TRNTENSOR_DF_COULOMB=auto|trn2|aten`. Against the two
+  GEMVs per aux block it replaces: 3.81 → 2.90, 12.6 → 8.83 and 86.7 →
+  46.0 ms at n_ao = 250 / 490 / 970 (LNC=2), 126 → 81.7 ms at 970 (LNC=1),
+  error 2.8e-7 vs 1.9e-7 relative to max |J|. It also runs on a single
+  8.8 GB block, where the aten GEMV needed a 26.7 GB graph. A packed
   `(npair,)` density gives a packed J, so blocked callers pack once.
 - Kernels: `df_half_packed_kernel`, `df_exchange_syrk_kernel`,
   `df_coulomb_d_kernel`, `df_coulomb_j_kernel` (gridless, `num_programs()`

@@ -332,28 +332,29 @@ the aux index in blocks then packs and unpacks once per call instead of per
 block; on the device those are element gathers.
 
 - **Native TorchNeuron**: two launches, `df_coulomb_d_kernel` and
-  `df_coulomb_j_kernel`. Each streams `B` once in contiguous 128-row tiles,
-  rows split across the programs, with one fused Vector Engine instruction
-  per tile and 128-column chunk (multiply-add for `d`, multiply-reduce for
-  `J`). The partial sums are kept short: `d` in groups of 32 tiles, `J` in
-  128-column chunks. At n_ao = 970 a single fp32 chain over all 4686 columns
-  gave J 2.4e-6 off float64, and 512-column chunks gave 5.7e-7. The < 256
+  `df_coulomb_j_kernel`. Each streams `B` once in contiguous 128-row tiles
+  (DMAs up to 4096 columns wide), rows split across the programs, with fused
+  Vector Engine instructions: a multiply-add per tile for `d`, a
+  multiply-reduce per 128 columns for `J`. The partial sums are kept short:
+  `d` in groups of 32 tiles, `J` in 128-column chunks. At n_ao = 970 one
+  fp32 chain over all 4686 columns gave J 2.4e-6 off float64 and
+  512-column chunks 5.7e-7; 128-column chunks give 2.8e-7. The < 256
   leftover rows run as aten GEMVs. `"auto"` uses the kernels for
   device-resident `B` from `npair·naux` = 1e7.
   `TRNTENSOR_DF_COULOMB=auto|trn2|aten` overrides.
 - **Otherwise**: two GEMVs.
 
-Measured on Trn2 (LNC=2, fp32, warm; J of `scf_df_rhf.py`'s `DFJK`, error
-vs float64):
+Measured on Trn2 (fp32, warm; the J of `scf_df_rhf.py`'s `DFJK` on the
+core-guess density, error vs float64 relative to max |J|):
 
-| n_ao / naux | two GEMVs per aux block (before) | `df_coulomb`, one block |
-|---|---|---|
-| 250 / 1206 | 3.81 ms, 2.1e-7 | 3.39 ms, 2.4e-7 |
-| 490 / 2366 | 12.6 ms, 1.9e-7 | 12.7 ms, 2.7e-7 |
-| 970 / 4686 | 86.7 ms (9 blocks), 1.9e-7 | 76.2 ms, 2.8e-7 |
+| n_ao / naux | LNC | two GEMVs per aux block (before) | `df_coulomb`, one block | speedup |
+|---|---|---|---|---|
+| 250 / 1206 | 2 | 3.81 ms, 2.1e-7 | 2.90 ms, 2.4e-7 | 1.31x |
+| 490 / 2366 | 2 | 12.6 ms, 1.9e-7 | 8.83 ms, 2.7e-7 | 1.43x |
+| 970 / 4686 | 2 | 86.7 ms (9 blocks), 1.9e-7 | 46.0 ms, 2.8e-7 | 1.89x |
+| 970 / 4686 | 1 | 126 ms (9 blocks), 2.4e-7 | 81.7 ms, 2.6e-7 | 1.55x |
 
-It is about as fast as the GEMVs. What it adds is the single block: at
-n_ao = 970 the aten GEMV on one 8.8 GB block compiled to a 26.7 GB graph and
-did not fit in HBM. With 512-column partial sums it took 45 ms at 970, but
-the SCF then stopped with orbitals 2-5e-6 Eh high in float64, against
-1e-7 for the GEMVs and for the 128-column chunks.
+It also allows a single block: at n_ao = 970 the aten GEMV on one 8.8 GB
+block compiled to a 26.7 GB graph and did not fit in HBM. With the DMA as
+narrow as the 128-column reduce, the kernel was descriptor-bound (76 ms at
+970).

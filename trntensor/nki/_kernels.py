@@ -956,10 +956,10 @@ if HAS_NKI:
 #
 # d[P] = Σ_r B[r, P] p[r] and J[r] = Σ_P B[r, P] d[P] over the packed rows
 # r = μ(μ+1)/2 + ν. Both stream B once in contiguous 128-row tiles (rows on
-# partitions, aux on the free axis) and do the arithmetic as one fused
-# multiply-add or multiply-reduce per tile on the Vector Engine, so they run
-# at DMA rate. Full row tiles are split evenly across the programs; the
-# dispatcher handles the few leftover rows with aten.
+# partitions, aux on the free axis) and do the arithmetic as fused Vector
+# Engine instructions: a multiply-add per tile for d, a multiply-reduce per
+# DF_J_RED columns for J (short fp32 chains). Full row tiles are split evenly
+# across the programs; the dispatcher handles the few leftover rows with aten.
 
 DF_J_COLS = 4096  # aux columns per SBUF tile (16 KiB per partition)
 DF_J_RED = 128  # aux columns per J partial sum (fewer terms per fp32 chain)

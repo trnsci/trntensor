@@ -1599,7 +1599,8 @@ def _nki_df_exchange(B: torch.Tensor, C_occ: torch.Tensor) -> torch.Tensor:
 
 
 # Under "auto" the J kernels need npair·naux of at least this many elements
-# of B (each kernel streams B once).
+# of B (each kernel streams B once). Trn2, LNC=2 (#60): 3.8e7 elements
+# (n_ao 250) 2.90 ms vs 3.81 ms for two aten GEMVs; 2.2e9 (970) 46 vs 87 ms.
 _DF_COULOMB_MIN_ELEMS = 1.0e7
 
 
