@@ -94,14 +94,19 @@ def mp2_energy(
         from .nki import dispatch as _d
 
         try:
+            # The kernels compute in fp32; return the dtype the aten path
+            # gives (fp64 / bf16 callers got fp32 through 0.22.0).
+            out_dtype = torch.promote_types(
+                torch.promote_types(B.dtype, eps_occ.dtype), eps_vir.dtype
+            )
             if route == "rows":
-                return _d._nki_mp2_energy_rows(B, eps_occ, eps_vir)
+                return _d._nki_mp2_energy_rows(B, eps_occ, eps_vir).to(out_dtype)
             if _d._on_native_path():
                 _d._warn_native_kernel_deprecated(
                     "original mp2_energy",
                     "the Trn2 row kernel replaces it (TRNTENSOR_MP2_ENERGY=rows)",
                 )
-            return _d._nki_mp2_energy(B, eps_occ, eps_vir)
+            return _d._nki_mp2_energy(B, eps_occ, eps_vir).to(out_dtype)
         except Exception:
             import os
 
@@ -341,17 +346,19 @@ def ao_to_mo_transform(
                 f"ao_to_mo_transform NKI path requires nocc ≤ 128 "
                 f"(got nocc={nocc}); M-tiling not yet implemented."
             )
+        # The kernels compute in fp32; return the dtype the aten path gives.
+        out_dtype = torch.promote_types(torch.promote_types(eri.dtype, C_occ.dtype), C_vir.dtype)
         try:
             if route == "trn2":
                 if packed:
-                    return _d._nki_ao_to_mo_trn2_packed(eri, C_occ, C_vir)
-                return _d._nki_ao_to_mo_trn2(eri, C_occ, C_vir)
+                    return _d._nki_ao_to_mo_trn2_packed(eri, C_occ, C_vir).to(out_dtype)
+                return _d._nki_ao_to_mo_trn2(eri, C_occ, C_vir).to(out_dtype)
             if _d._on_native_path():
                 _d._warn_native_kernel_deprecated(
                     "original ao_to_mo_transform",
                     "the Trn2 kernel replaces it (TRNTENSOR_AO_TO_MO=trn2)",
                 )
-            return _d._nki_ao_to_mo_transform(eri, C_occ, C_vir)
+            return _d._nki_ao_to_mo_transform(eri, C_occ, C_vir).to(out_dtype)
         except Exception:
             import os
 
@@ -444,7 +451,8 @@ def df_exchange(
         C_occ = C_occ.to(B.device)
     if B.dim() == 2 and _dispatch._df_exchange_route(B, nocc, nbasis) == "trn2":
         try:
-            K = _dispatch._nki_df_exchange(B, C_occ.to(B.dtype))
+            # fp32 kernel; the aten path returns B's dtype.
+            K = _dispatch._nki_df_exchange(B, C_occ.to(B.dtype)).to(B.dtype)
             return K * alpha if alpha != 1.0 else K
         except Exception:
             import os

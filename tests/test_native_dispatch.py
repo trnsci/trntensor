@@ -542,6 +542,33 @@ class TestPublicApiOnNativePath:
         torch.testing.assert_close(J, ref, atol=1e-3, rtol=1e-4)
         assert [c[0] for c in native_host] == ["df_coulomb_d", "df_coulomb_j"]
 
+    def test_df_coulomb_float64_runs_the_kernels_in_fp32(self, native_host, monkeypatch):
+        """A float64 B reached the fp32 kernels as is (inf on Trn2); it is now
+        computed in fp32 and J comes back float64, as on the aten path."""
+
+        def d_op(B, pw):
+            assert B.dtype == pw.dtype == torch.float32
+            rows = (B.shape[0] // 256) * 256
+            d = B[:rows].T @ pw[:rows, 0]
+            return torch.stack([0.5 * d, 0.5 * d])[:, None, :]
+
+        def j_op(B, d_b):
+            assert B.dtype == d_b.dtype == torch.float32
+            rows = (B.shape[0] // 256) * 256
+            return (B[:rows] @ d_b[0]).reshape(-1, 128).T
+
+        _install_ops(monkeypatch, native_host, df_coulomb_d=d_op, df_coulomb_j=j_op)
+        g = torch.Generator().manual_seed(3)
+        eri = torch.randn(40, 40, 9, generator=g, dtype=torch.float64)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        D = torch.randn(40, 40, generator=g, dtype=torch.float64)
+        D = D + D.T
+        J = trntensor.df_coulomb(trntensor.pack_tril(eri), D)
+        ref = torch.einsum("mnP,P->mn", eri, torch.einsum("lsP,ls->P", eri, D))
+        assert J.dtype == torch.float64
+        torch.testing.assert_close(J, ref, atol=1e-3, rtol=1e-4)
+        assert [c[0] for c in native_host] == ["df_coulomb_d", "df_coulomb_j"]
+
     def test_df_coulomb_route(self, monkeypatch):
         monkeypatch.setattr(dispatch, "HAS_NKI", True)
         monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
@@ -578,6 +605,9 @@ class TestPublicApiOnNativePath:
         assert dispatch._df_exchange_route(dev, 41, 256) == "trn2"
         assert dispatch._df_exchange_route(torch.empty(npair, 1206), 41, 256) == "aten"
         assert dispatch._df_exchange_route(dev, 513, 256) == "aten"
+        # Empty aux or occupied dim: aten (df_half_tiling raised ZeroDivisionError).
+        assert dispatch._df_exchange_route(torch.empty(npair, 0, device="meta"), 41, 256) == "aten"
+        assert dispatch._df_exchange_route(dev, 0, 256) == "aten"
         monkeypatch.setenv("TRNTENSOR_DF_EXCHANGE", "aten")
         assert dispatch._df_exchange_route(dev, 41, 256) == "aten"
         monkeypatch.setenv("TRNTENSOR_DF_EXCHANGE", "bogus")
@@ -673,6 +703,31 @@ class TestPublicApiOnNativePath:
         e = trntensor.mp2_energy(B, eps_occ, eps_vir)
         torch.testing.assert_close(e, _cpu_mp2_energy(B, eps_occ, eps_vir), atol=1e-5, rtol=1e-4)
         assert [c[0] for c in native_host] == ["mp2_energy_row"] * nocc
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
+    def test_mp2_energy_row_op_keeps_caller_dtype(self, native_host, monkeypatch, dtype):
+        """The row kernel computes in fp32; the energy comes back in the
+        caller's dtype, as on the aten path (fp32 through 0.22.0)."""
+        from trntensor.quantum import _cpu_mp2_energy
+
+        def row(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row):
+            out = torch.zeros(128, Bw.shape[0])
+            for d in range(Bw.shape[0]):
+                T = bt_i.T @ Bw[d]
+                denom = eps_occ_i[0, 0] + eps_occ_w[0, d] - eps_vir_col - eps_vir_row
+                out[0, d] = (T * (2 * T - T.T) / denom).sum()
+            return out
+
+        _install_ops(monkeypatch, native_host, mp2_energy_row=row)
+        g = torch.Generator().manual_seed(2)
+        B = (torch.randn(4, 6, 8, generator=g) * 0.1).to(dtype)
+        eps_occ = (-torch.rand(4, generator=g) - 0.5).to(dtype)
+        eps_vir = (torch.rand(6, generator=g) + 0.1).to(dtype)
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        assert e.dtype == dtype
+        ref = _cpu_mp2_energy(B.double(), eps_occ.double(), eps_vir.double())
+        tol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+        torch.testing.assert_close(e.double(), ref, atol=tol, rtol=tol)
 
     def test_mp2_energy_legacy_routes_to_op(self, native_host, monkeypatch):
         from trntensor.quantum import _cpu_mp2_energy

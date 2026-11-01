@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 ### Fixed
 
+- **NKI chemistry kernels on Trainium: `df_coulomb(float64)` gave inf, and
+  kernel routes changed the result dtype** (silent, #87). `_nki_df_coulomb`
+  passed a float64 `B` to the fp32 kernels as is. With ≥ 256 packed rows on
+  `set_backend("nki")` (or a large device-resident `B` under `"auto"`), J came
+  back inf. It now computes in fp32 and returns B's dtype (0.21.0–0.22.0).
+  `mp2_energy` (row and legacy kernels), `ao_to_mo_transform` (trn2, packed
+  and legacy kernels) and `df_exchange` returned float32 for float64 or
+  bfloat16 callers. They now return the aten route's dtype (every release
+  with those kernels, through 0.22.0). `df_exchange` with `naux == 0` (or
+  `nocc == 0`) raised `ZeroDivisionError` in the route's tiling and now takes
+  aten. Found by the conformance suite on Trn2 (trnsci/trnsci#35).
 - **`einsum(precision="dd")` on float32 / float64 operands was less accurate
   than `"fast"`** (silent; 0.17.0 through 0.22.0, the CPU emulation; Trainium
   raises `NotImplementedError`). The CPU route split every operand into two
