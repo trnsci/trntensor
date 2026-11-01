@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`precision="kahan"` / `"dd"` / `target_forward_error` dropped the imaginary
+  part of complex operands and rounded large integers** (silent, every
+  backend). Affects `"kahan"` in 0.4.0 through 0.22.0, and `"dd"` and
+  `target_forward_error` in 0.17.0 through 0.22.0. Complex operands now
+  accumulate in complex128, and integer operands contract natively, which is
+  exact (#69).
+
 ## [0.22.0] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

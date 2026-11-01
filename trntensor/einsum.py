@@ -19,6 +19,7 @@ which is where cuTENSOR beats cuBLAS for tensor workloads.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -386,8 +387,24 @@ def _execute_sharded(
 _FP64_DEVICE_TYPES = ("cpu", "cuda")
 
 
+def _wide_dtype(dtype: torch.dtype) -> torch.dtype | None:
+    """Accumulation dtype for ``precision="kahan"``: complex128 for complex
+    operands, float64 for real floating point, None (contract natively, which
+    is exact) for integer and bool operands."""
+    if dtype.is_complex:
+        return torch.complex128
+    if dtype.is_floating_point:
+        return torch.float64
+    return None
+
+
 def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
     """Contract in true fp64 and round once to the operand dtype.
+
+    Complex operands accumulate in complex128 (casting them to float64 would
+    drop the imaginary part). Integer operands contract natively: integer
+    accumulation is already exact, while a float64 detour rounds values
+    above 2**53.
 
     Operands on a device without native fp64 are contracted on the host and
     the result is moved back, so the only rounding beyond the fp64
@@ -395,10 +412,16 @@ def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
     """
     orig_dtype = operands[0].dtype if operands else torch.float32
     orig_device = operands[0].device if operands else torch.device("cpu")
+    promoted = functools.reduce(torch.promote_types, (op.dtype for op in operands), orig_dtype)
+    if promoted.is_complex and not orig_dtype.is_complex:
+        orig_dtype = promoted  # never round a complex result to a real dtype
+    wide = _wide_dtype(promoted)
+    if wide is None:
+        return torch.einsum(subscripts, *operands)
     if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
-        result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
+        result = torch.einsum(subscripts, *(op.to(wide) for op in operands))
         return result.to(orig_dtype)
-    host = (op.to(device="cpu", dtype=torch.float64) for op in operands)
+    host = (op.to(device="cpu", dtype=wide) for op in operands)
     result = torch.einsum(subscripts, *host).to(orig_dtype)
     return result.to(orig_device)
 
@@ -418,13 +441,16 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
             )
         # CPU: Ozaki-2 for matmul; recurse for path (binary steps get Ozaki);
         # kahan fallback for bmm and torch strategies.
-        if plan.strategy == "matmul":
+        # The Ozaki split is defined for real floating point; complex and
+        # integer operands take the exact kahan path instead.
+        real_float = all(op.dtype.is_floating_point for op in operands)
+        if plan.strategy == "matmul" and real_float:
             A, B = operands
             a = A.T if plan.transA else A
             b = B.T if plan.transB else B
             result = _ozaki_matmul_cpu(a.float(), b.float(), k=2)
             return result.to(A.dtype)
-        if plan.strategy == "path":
+        if plan.strategy == "path" and real_float:
             return _execute_path(subscripts, operands, plan)
         return _einsum_fp64(subscripts, operands)
     if plan.strategy in ("torch", "path"):

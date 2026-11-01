@@ -839,3 +839,46 @@ class TestOutputOrder:
         ins = subscripts.split("->")[0].split(",")
         ops = [torch.randn(*[sizes[c] for c in t]) for t in ins]
         assert trntensor.plan_contraction(subscripts, *ops).strategy == strategy
+
+
+class TestPrecisionModesNonRealDtypes:
+    """precision="kahan"/"dd" and target_forward_error must not drop the
+    imaginary part of complex operands or round integer operands (audit 3)."""
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    @pytest.mark.parametrize(
+        "subscripts,shapes",
+        [
+            ("ij,jk->ik", [(5, 4), (4, 3)]),
+            ("bij,bjk->bik", [(2, 5, 4), (2, 4, 3)]),
+            ("ij,jk,kl->il", [(3, 4), (4, 5), (5, 2)]),
+            ("ii->", [(4, 4)]),
+        ],
+    )
+    @pytest.mark.parametrize("mode", ["kahan", "dd", "target"])
+    def test_complex_keeps_imaginary_part(self, dtype, subscripts, shapes, mode):
+        g = torch.Generator().manual_seed(0)
+        ops = [torch.randn(s, generator=g, dtype=dtype) for s in shapes]
+        kw = {"target_forward_error": 1e-12} if mode == "target" else {"precision": mode}
+        got = trntensor.einsum(subscripts, *ops, **kw)
+        ref = torch.einsum(subscripts, *(o.to(torch.complex128) for o in ops)).to(dtype)
+        assert got.dtype == dtype
+        tol = 1e-5 if dtype == torch.complex64 else 1e-12
+        torch.testing.assert_close(got, ref, rtol=tol, atol=tol)
+
+    def test_complex_second_operand_kahan(self):
+        A = torch.randn(3, 4, dtype=torch.float64)
+        B = torch.randn(4, 2, dtype=torch.complex128)
+        got = trntensor.einsum("ij,jk->ik", A, B, precision="kahan")
+        torch.testing.assert_close(got, A.to(torch.complex128) @ B)
+
+    @pytest.mark.parametrize("mode", ["kahan", "dd"])
+    def test_integer_exact(self, mode):
+        A = torch.tensor([[2**53 + 1, 2], [2**40 + 3, 1]], dtype=torch.int64)
+        B = torch.tensor([[1, 0], [1, 1]], dtype=torch.int64)
+        got = trntensor.einsum("ij,jk->ik", A, B, precision=mode)
+        assert got.dtype == torch.int64
+        assert torch.equal(got, A @ B)
+        A32 = torch.tensor([[2**24 + 1, 0]], dtype=torch.int32)
+        B32 = torch.tensor([[1], [0]], dtype=torch.int32)
+        assert torch.equal(trntensor.einsum("ij,jk->ik", A32, B32, precision=mode), A32 @ B32)
