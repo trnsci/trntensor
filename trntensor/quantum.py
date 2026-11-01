@@ -94,14 +94,20 @@ def mp2_energy(
         from .nki import dispatch as _d
 
         try:
+            # The kernels compute in fp32; return the dtype the aten path
+            # gives (fp64 / bf16 callers got fp32 through 0.22.0).
+            out_dtype = torch.promote_types(
+                torch.promote_types(B.dtype, eps_occ.dtype), eps_vir.dtype
+            )
+            kB, keo, kev = (_kernel_operand(t) for t in (B, eps_occ, eps_vir))
             if route == "rows":
-                return _d._nki_mp2_energy_rows(B, eps_occ, eps_vir)
+                return _d._nki_mp2_energy_rows(kB, keo, kev).to(out_dtype)
             if _d._on_native_path():
                 _d._warn_native_kernel_deprecated(
                     "original mp2_energy",
                     "the Trn2 row kernel replaces it (TRNTENSOR_MP2_ENERGY=rows)",
                 )
-            return _d._nki_mp2_energy(B, eps_occ, eps_vir)
+            return _d._nki_mp2_energy(kB, keo, kev).to(out_dtype)
         except Exception:
             import os
 
@@ -124,6 +130,17 @@ def _on_device(fn, *tensors: torch.Tensor):
         if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
             raise
         return None
+
+
+def _kernel_operand(t: torch.Tensor) -> torch.Tensor:
+    """A float64 operand as float32 for the fp32 NKI kernels.
+
+    Trainium has no fp64 datapath. Through 0.22.0 float64 tensors reached the
+    chemistry kernels as is and came back inf (`ao_to_mo_transform`,
+    `df_exchange`, `df_coulomb`; #87). Strides are kept (`preserve_format`),
+    so layout detection still sees the caller's layout.
+    """
+    return t.float() if t.dtype == torch.float64 else t
 
 
 # Elements of the per-chunk T block (chunk·nocc·nvir²) the aten MP2 path
@@ -341,17 +358,20 @@ def ao_to_mo_transform(
                 f"ao_to_mo_transform NKI path requires nocc ≤ 128 "
                 f"(got nocc={nocc}); M-tiling not yet implemented."
             )
+        # The kernels compute in fp32; return the dtype the aten path gives.
+        out_dtype = torch.promote_types(torch.promote_types(eri.dtype, C_occ.dtype), C_vir.dtype)
+        k_eri, k_co, k_cv = (_kernel_operand(t) for t in (eri, C_occ, C_vir))
         try:
             if route == "trn2":
                 if packed:
-                    return _d._nki_ao_to_mo_trn2_packed(eri, C_occ, C_vir)
-                return _d._nki_ao_to_mo_trn2(eri, C_occ, C_vir)
+                    return _d._nki_ao_to_mo_trn2_packed(k_eri, k_co, k_cv).to(out_dtype)
+                return _d._nki_ao_to_mo_trn2(k_eri, k_co, k_cv).to(out_dtype)
             if _d._on_native_path():
                 _d._warn_native_kernel_deprecated(
                     "original ao_to_mo_transform",
                     "the Trn2 kernel replaces it (TRNTENSOR_AO_TO_MO=trn2)",
                 )
-            return _d._nki_ao_to_mo_transform(eri, C_occ, C_vir)
+            return _d._nki_ao_to_mo_transform(k_eri, k_co, k_cv).to(out_dtype)
         except Exception:
             import os
 
@@ -444,7 +464,9 @@ def df_exchange(
         C_occ = C_occ.to(B.device)
     if B.dim() == 2 and _dispatch._df_exchange_route(B, nocc, nbasis) == "trn2":
         try:
-            K = _dispatch._nki_df_exchange(B, C_occ.to(B.dtype))
+            # fp32 kernel; the aten path returns B's dtype.
+            kB = _kernel_operand(B)
+            K = _dispatch._nki_df_exchange(kB, C_occ.to(kB.dtype)).to(B.dtype)
             return K * alpha if alpha != 1.0 else K
         except Exception:
             import os
