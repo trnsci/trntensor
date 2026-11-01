@@ -6,7 +6,10 @@ public-facing dispatch is in `trntensor.nki.dispatch`.
 
 ## `set_backend(backend: str)`
 
-- `"auto"` — use NKI if `nki` is importable, else PyTorch
+- `"auto"` — the default. When `nki` is importable, each call is routed by
+  measured thresholds (see [Environment variables](#environment-variables)
+  and the tables below); on the native path matmul/bmm run on aten, and the
+  fused chemistry kernels run where they beat it. Otherwise PyTorch
 - `"pytorch"` — always use `torch.matmul` / `torch.einsum`
 - `"nki"` — require NKI; raises `RuntimeError` on non-Neuron hosts
 
@@ -29,7 +32,10 @@ detected on the first kernel launch (never at import):
   (`torch_neuronx.device_count() > 0`). Each kernel is a PyTorch custom op
   on `device="neuron"`, also callable directly and inside
   `torch.compile(backend="neuron")`: `torch.ops.trntensor.matmul`,
-  `batched_matmul`, `mp2_energy`, `ao_to_mo_transform`. The ops are
+  `batched_matmul`, `mp2_energy`, `ao_to_mo_transform`, `mp2_energy_row`,
+  `ao_to_mo_trn2`, `ao_to_mo_trn2_packed`, `df_half_packed`,
+  `df_exchange_syrk`, `df_coulomb_d`, `df_coulomb_j` (`matmul` / `batched_matmul` are
+  deprecated there, see below). The ops are
   registered only once this path is selected, and this path never imports
   `torch_xla`.
 - **XLA (Trn1)** — chosen when `torch_xla` is installed and the native
@@ -279,11 +285,9 @@ The original AO→MO and MP2 kernels remain the XLA-path (Trn1) kernels. See
   `J = B d`, each streaming packed `B` once in 128-row tiles on the Vector
   Engine.
 
-The DF-MP2 pair pattern `einsum("ap,bp->ab")` is served by
-`matmul_kernel` through the planner's `transB=True` route — no
-dedicated kernel needed. Fused energy-denominator kernel is tracked
-in [#13][i13].
-
-[i13]: https://github.com/trnsci/trntensor/issues/13
+The DF-MP2 pair pattern `einsum("ap,bp->ab")` is planned as `matmul` with
+`transB=True`: aten on the native path, `matmul_kernel` on the XLA path
+above the FLOP threshold. The fused contraction + energy-denominator
+kernel (#13) is `trntensor.mp2_energy`.
 
 [m2]: https://github.com/trnsci/trntensor/milestone/2

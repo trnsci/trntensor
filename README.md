@@ -16,10 +16,10 @@ Einstein summation with contraction planning, CP and Tucker decompositions. Expr
 
 trntensor follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
-- **[Phase 1 — correctness](https://github.com/trnsci/trntensor/issues/27)** (active): matmul + batched-matmul NKI kernels in place; awaiting hardware validation + additional `@pytest.mark.neuron` coverage.
-- **[Phase 2 — precision](https://github.com/trnsci/trntensor/issues/28)**: precision-aware contraction path selection (depends on [trnblas#22](https://github.com/trnsci/trnblas/issues/22) double-double GEMM).
-- **[Phase 3 — perf](https://github.com/trnsci/trntensor/issues/29)**: opt_einsum-style path planner, plan cache reuse.
-- **[Phase 4 — multi-chip](https://github.com/trnsci/trntensor/issues/30)**: sharded tensor contractions.
+- **[Phase 1 — correctness](https://github.com/trnsci/trntensor/issues/27)** (closed): NKI kernels validated on hardware. On the native TorchNeuron path (Trn2/Trn3) the fused `mp2_energy`, `ao_to_mo_transform`, `df_exchange` and `df_coulomb` kernels beat the aten routes they replace; the NKI matmul/bmm kernels never did and are deprecated there in favour of aten (0.19.0).
+- **[Phase 2 — precision](https://github.com/trnsci/trntensor/issues/28)** (closed): precision-aware mode selection (`precision=`, `target_forward_error=`). `precision="dd"` on Trainium still waits on [trnblas#22](https://github.com/trnsci/trnblas/issues/22) double-double GEMM.
+- **[Phase 3 — perf](https://github.com/trnsci/trntensor/issues/29)** (closed): greedy multi-operand path planner, plan cache.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trntensor/issues/30)** (active): sharded tensor contractions (`ShardedTensor`, reduce-parallel all-reduce).
 - **[Phase 5 — generation](https://github.com/trnsci/trntensor/issues/31)**: trn2 fused multi-contraction paths.
 
 Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
@@ -87,10 +87,16 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 | Planning | `estimate_flops` | FLOPs for a contraction |
 | Decomposition | `cp_decompose` | CP/PARAFAC via ALS |
 | Decomposition | `tucker_decompose` | Tucker via HOSVD |
+| Decomposition | `tt_decompose` | Tensor Train via TT-SVD |
+| Chemistry | `mp2_energy` | Fused DF-MP2 correlation energy |
+| Chemistry | `ao_to_mo_transform` | Fused AO→MO transform (full or packed integrals) |
+| Chemistry | `df_exchange` / `df_coulomb` | Fused DF exchange (K) / Coulomb (J) from packed integrals |
+| Chemistry | `pack_tril` / `unpack_tril` | Packed (μ≥ν) three-centre integral layout |
+| Sharding | `ShardedTensor`, `scatter`, `gather` | Output- and reduce-parallel sharded contractions |
 
 ## Status
 
-- [x] Einsum with matmul/bmm/torch dispatch
+- [x] Einsum with matmul/bmm/torch dispatch (output index order honoured since 0.22.0; earlier releases returned the wrong layout for transposed/permuted outputs, #64)
 - [x] Contraction planner
 - [x] CP decomposition (ALS)
 - [x] Tucker decomposition (HOSVD)
@@ -108,17 +114,17 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 - [x] Non-negative CP + warm-start CP
 - [x] PEP 561 `py.typed` marker
 - [x] Mixed precision / `dtype` override for bf16/fp16
-- [x] `precision=` kwarg (`"fast"` / `"kahan"` fp64 promotion / `"dd"` stub)
+- [x] `precision=` kwarg (`"fast"` / `"kahan"` fp64 promotion / `"sr"` / `"dd"`: CPU emulation only, raises on Trainium until trnblas#22)
 
 ## Related Projects
 
 | Project | What |
 |---------|------|
-| [trnfft](https://github.com/scttfrdmn/trnfft) | FFT + complex ops |
-| [trnblas](https://github.com/scttfrdmn/trnblas) | BLAS operations |
-| [trnsolver](https://github.com/scttfrdmn/trnsolver) | Linear solvers |
-| [trnrand](https://github.com/scttfrdmn/trnrand) | Random number generation |
-| [trnsparse](https://github.com/scttfrdmn/trnsparse) | Sparse operations |
+| [trnfft](https://github.com/trnsci/trnfft) | FFT + complex ops |
+| [trnblas](https://github.com/trnsci/trnblas) | BLAS operations |
+| [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers |
+| [trnrand](https://github.com/trnsci/trnrand) | Random number generation |
+| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse operations |
 
 ## License
 
