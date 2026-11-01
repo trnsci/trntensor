@@ -690,7 +690,10 @@ if HAS_NKI:
 # loops unroll, so the dispatcher runs the pair over groups of aux chunks
 # (``df_group_chunks``) to bound compile time and the ``Xt`` scratch.
 
-DF_K_SBUF_BUDGET = 160 * 1024  # bytes per partition for launch 1's buffers
+# Bytes per partition for launch 1's buffers (of 192 KiB). 176 KiB admits
+# TP = 256, NUB = 8, NVC = 16 at n_ao = 970 (175 KiB), the fastest tiling
+# measured there (#60).
+DF_K_SBUF_BUDGET = 176 * 1024
 DF_K_LAUNCH_INSTR = 48_000  # estimated instructions per half-transform launch
 
 
@@ -701,25 +704,48 @@ def df_half_sbuf_bytes(nb: int, nocc: int, tp: int, nub: int, nvc: int) -> int:
     return 4 * (nkb * nocc + 2 * nkb * nvc + 2 * nkb * nub * tp + 2 * ns * nocc * nvc)
 
 
-def df_half_tiling(naux: int, nb: int, nocc: int) -> tuple[int, int, int] | None:
+def df_half_tiling(naux: int, nb: int, nocc: int, npair: int = 0) -> tuple[int, int, int] | None:
     """``(TP, NUB, NVC)`` for ``df_half_packed_kernel``, or None if nothing fits.
 
-    ``TP`` divides ``naux`` (the packed rows are viewed as ``(npair·NPC, TP)``
-    without a padding copy) and is in ``[32, 512]`` (or ``naux`` itself when
-    smaller); an ``naux`` with no such divisor gets None. ``NUB`` (ν per gather, a power of
-    two ≤ 8) sets the batch of one indirect DMA, ``128·NUB`` rows; ``NVC``
-    (a power of two ≤ 128 dividing ``nb``) is the ν run kept in SBUF and
-    stored per DMA. Choice, in order: fewest ≤128-row aux tiles
-    ``NPC·ceil(TP/128)`` (Tensor Engine work), then the largest gather batch
-    (on Trn2 at n_ao = 490, NUB 2 → 4 → 8 took the K build from 19 to 15 to
-    12 ms), then the widest ``NVC``, then the widest ``TP``, all within
-    ``DF_K_SBUF_BUDGET``.
+    ``TP`` is the aux chunk width, in ``[32, 512]`` (or ``naux`` itself when
+    smaller): a divisor of ``naux``, or a 128 multiple below ``naux`` with a
+    short last chunk of ``naux mod TP``. The packed rows are viewed as
+    ``(npair·naux / W, W)``, ``W = gcd(naux, TP)``, without a padding copy;
+    with ``npair`` given, a ``TP`` whose gather indices ``npair·naux / W``
+    would not fit 31 bits is skipped. ``NUB`` (ν per gather, a power of two
+    ≤ 8) sets the batch of one indirect DMA, ``128·NUB`` rows; ``NVC`` (a
+    power of two ≤ 128 dividing ``nb``) is the ν run kept in SBUF and stored
+    per DMA. All within ``DF_K_SBUF_BUDGET``.
+
+    Choice, in order:
+
+    - fewest 128-row aux tiles in the SYRK launches (:func:`df_syrk_tiles`):
+      each partial tile costs a full one there. At naux = 4686 the divisor
+      213 in groups of 2 gives 44 tiles, 256 with a 78 tail 37;
+    - no short chunk: launch 1's time follows aux rows more than tiles at
+      n_ao = 970, and 128-multiple chunks were slower at 490 (#60);
+    - fewest tiles in launch 1, ``NPC·ceil(TP/128)``;
+    - the largest gather batch ``NUB`` (on Trn2 at n_ao = 490, NUB 2 → 4 →
+      8 took the K build from 19 to 15 to 12 ms); with a short chunk, then
+      the most elements per gather ``NUB·TP`` (128-wide chunks lost to
+      213-wide ones at 970);
+    - the widest ``NVC``, then the widest ``TP``.
+
+    ``TRNTENSOR_DF_K_TP`` forces ``TP``.
     """
+    import math
+    import os
+
+    lo = min(naux, 32)
+    cands = [tp for tp in range(min(naux, 512), lo - 1, -1) if naux % tp == 0]
+    cands += [tp for tp in (512, 384, 256, 128) if tp < naux and naux % tp and tp >= lo]
+    forced = int(os.environ.get("TRNTENSOR_DF_K_TP", "0") or 0)
+    if forced:
+        cands = [tp for tp in cands if tp == forced]
     best = None
-    for tp in range(min(naux, 512), min(naux, 32) - 1, -1):
-        if naux % tp:
+    for tp in cands:
+        if npair and npair * naux // math.gcd(naux, tp) >= 2**31:
             continue
-        tiles = (naux // tp) * -(-tp // TILE_K)
         for nub in (8, 4, 2, 1):
             if nub * tp > 4096:
                 continue
@@ -730,7 +756,10 @@ def df_half_tiling(naux: int, nb: int, nocc: int) -> tuple[int, int, int] | None
                 nvc //= 2
             if nvc < nub:
                 continue
-            key = (tiles, -nub, -nvc, -tp)
+            tail = naux % tp
+            syrk = df_syrk_tiles(naux, tp, df_group_chunks(-(-naux // tp), nb, tp, nub, nvc))
+            half = (naux // tp) * -(-tp // TILE_K) + -(-tail // TILE_K)
+            key = (syrk, tail > 0, half, -nub, -nub * tp if tail else 0, -nvc, -tp)
             if best is None or key < best[0]:
                 best = (key, (tp, nub, nvc))
             break
@@ -751,6 +780,28 @@ def df_group_chunks(npc: int, nb: int, tp: int, nub: int, nvc: int) -> int:
     return max(1, min(npc, DF_K_LAUNCH_INSTR // max(1, per_chunk)))
 
 
+def df_groups(naux: int, tp: int, grp: int) -> list[tuple[int, int]]:
+    """Launch groups ``[(c0, c1), ...]`` of aux chunks ``tp`` wide (the last
+    one ``naux mod tp`` when that is non-zero), ``grp`` per group. A short
+    last chunk that would be a group of its own joins the previous group
+    (one launch pair fewer)."""
+    npc = -(-naux // tp)
+    groups = [(c0, min(npc, c0 + grp)) for c0 in range(0, npc, grp)]
+    if len(groups) > 1 and naux % tp and groups[-1][1] - groups[-1][0] == 1:
+        groups[-2:] = [(groups[-2][0], npc)]
+    return groups
+
+
+def df_syrk_tiles(naux: int, tp: int, grp: int) -> int:
+    """128-row aux tiles over the SYRK launches of :func:`df_groups`."""
+    tail = naux % tp
+    tiles = 0
+    for c0, c1 in df_groups(naux, tp, grp):
+        rows = (c1 - c0) * tp - (tp - tail if tail and c1 * tp > naux else 0)
+        tiles += -(-rows // TILE_K)
+    return tiles
+
+
 def df_exchange_blocks(nb: int, banks: int) -> list[list[tuple[int, int, int]]]:
     """Passes of ``(m, ν0, w)`` K blocks for ``df_exchange_syrk_kernel``.
 
@@ -768,38 +819,57 @@ def df_exchange_blocks(nb: int, banks: int) -> list[list[tuple[int, int, int]]]:
 if HAS_NKI:
 
     @nki.jit
-    def df_half_packed_kernel(eri_v, img, C_occ, nub: int = 8):
+    def df_half_packed_kernel(eri_v, img, C_occ, nub: int = 8, tp: int = 0, tail: int = 0):
         """``Xt[P, i, ν] = Σ_λ C_occ[λ, i] B[λν, P]`` from packed integrals (#60).
 
-        ``eri_v``: packed ``(npair, naux)`` viewed as ``(npair·NPC, TP)``.
-        ``img``: ``(G, NVG, 128, NKB·NVC)`` uint32 gather indices for G
-        consecutive aux chunks (a slice of ``dispatch._df_gather_images``):
-        for chunk ``c`` and ν group ``g``, the ``(128, NUB)`` block at
-        columns ``k·NVC + b·NUB`` gathers ``B[k·128 + p, g·NVC + b·NUB + u,
-        chunk]`` into ``(p, u)``. ``C_occ``: ``(NB, NOCC)``, NB a multiple
-        of 128 (zero rows past nbasis), NOCC ≤ 512. ``nub``: ν per gather,
-        the block width the indices were built for.
+        ``eri_v``: packed ``(npair, naux)`` viewed as ``(npair·naux / W, W)``
+        for a ``W`` dividing both ``naux`` and the chunk width ``tp``
+        (``tp = 0``: ``W``). Aux chunk ``c`` of pair ``r`` starts at element
+        ``r·naux + c·tp``, i.e. row ``(r·naux + c·tp) / W``; one gather reads
+        ``tp`` contiguous elements from there. ``img``: ``(G, NVG, 128,
+        NKB·NVC)`` uint32 gather indices (those rows) for G consecutive aux
+        chunks (a slice of ``dispatch._df_gather_images``): for chunk ``c``
+        and ν group ``g``, the ``(128, NUB)`` block at columns ``k·NVC +
+        b·NUB`` gathers ``B[k·128 + p, g·NVC + b·NUB + u, chunk]`` into
+        ``(p, u)``. ``C_occ``: ``(NB, NOCC)``, NB a multiple of 128 (zero
+        rows past nbasis), NOCC ≤ 512. ``nub``: ν per gather, the block width
+        the indices were built for. ``tail``: when non-zero, the last chunk
+        of this launch is the short last chunk of naux, ``tail`` wide.
 
-        Returns ``Xt`` ``(G·TP, NVG, NOCC, NVC)``: ``Xt[P, g, i, v] = X[i, g·NVC
-        + v, P]`` for the aux rows of these chunks. Each stored SBUF block is
-        one contiguous ``NOCC·NVC`` run per row; with ν innermost the run
-        would be only ``NVC`` elements, and at n_ao = 970 (NVC = 16) those
-        64-byte DMA writes made this launch 5x slower. Columns ν past
-        nbasis hold finite junk that only reaches K's padding.
+        128-multiple chunk widths with one short last chunk give the SYRK
+        launch full 128-row aux tiles in every group but the last one (see
+        :func:`df_half_tiling`).
+
+        Returns ``Xt`` ``(NR, NVG, NOCC, NVC)``, ``NR = (G - 1)·tp + tail``
+        with a tail (else ``G·tp``): ``Xt[P, g, i, v] = X[i, g·NVC + v, P]``
+        for the aux rows of these chunks. Each stored SBUF block is one
+        contiguous ``NOCC·NVC`` run per row; with ν innermost the run would
+        be only ``NVC`` elements, and at n_ao = 970 (NVC = 16) those 64-byte
+        DMA writes made this launch 5x slower. Columns ν past nbasis hold
+        finite junk that only reaches K's padding.
         """
         NB, NOCC = C_occ.shape
         G, NVG = img.shape[0], img.shape[1]
-        TP = eri_v.shape[1]
+        W = eri_v.shape[1]
+        TP = tp if tp else W
         TILE = 128
         NKB = NB // TILE
         NVC = NB // NVG
         NUB = nub
-        NS = (TP + TILE - 1) // TILE
-        n_prog, pid, axis = _programs(G, NVG)
-        G_per = G // n_prog if axis == 0 else G
+        GF = G - 1 if tail else G  # full-width chunks
+        NR = GF * TP + tail
+        NSM = (max(TP if GF else 0, tail) + TILE - 1) // TILE
+        # A launch with a short chunk splits ν groups (equal work per
+        # program); otherwise chunks first.
+        if tail:
+            n_prog, pid, axis = _programs(NVG)
+            axis = 1 if axis == 0 else axis
+        else:
+            n_prog, pid, axis = _programs(G, NVG)
+        G_per = GF // n_prog if axis == 0 else GF
         NVG_per = NVG // n_prog if axis == 1 else NVG
 
-        xt = nl.ndarray((G * TP, NVG, NOCC, NVC), dtype=nl.float32, buffer=nl.shared_hbm)
+        xt = nl.ndarray((NR, NVG, NOCC, NVC), dtype=nl.float32, buffer=nl.shared_hbm)
 
         co_sb = nl.ndarray((TILE, NKB * NOCC), dtype=C_occ.dtype, buffer=nl.sbuf)
         for k in nl.affine_range(NKB):
@@ -807,42 +877,48 @@ if HAS_NKI:
                 C_occ[k * TILE : (k + 1) * TILE, 0:NOCC]
             )
 
+        def chunk(c, w, g):
+            ns = (w + TILE - 1) // TILE
+            idx_sb = nl.ndarray((TILE, NKB * NVC), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=idx_sb, src=img[c, g])
+            x_sb = nl.ndarray((TILE, NSM, NOCC, NVC), dtype=nl.float32, buffer=nl.sbuf)
+            for vb in nl.affine_range(NVC // NUB):
+                e_blk = nl.ndarray((TILE, NKB, NUB, w), dtype=eri_v.dtype, buffer=nl.sbuf)
+                for k in nl.affine_range(NKB):
+                    nisa.dma_copy(
+                        dst=e_blk[0:TILE, k, 0:NUB, 0:w],
+                        src=eri_v.ap(
+                            pattern=[[w, TILE * NUB], [1, w]],
+                            vector_offset=idx_sb[
+                                0:TILE, k * NVC + vb * NUB : k * NVC + vb * NUB + NUB
+                            ],
+                            indirect_dim=0,
+                        ),
+                    )
+                for u in nl.affine_range(NUB):
+                    for s in range(ns):
+                        ms = min(TILE, w - s * TILE)
+                        px = nl.zeros((ms, NOCC), dtype=nl.float32, buffer=nl.psum)
+                        for k in nl.affine_range(NKB):
+                            nisa.nc_matmul(
+                                dst=px,
+                                stationary=e_blk[0:TILE, k, u, s * TILE : s * TILE + ms],
+                                moving=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
+                                accumulate=True,
+                            )
+                        nisa.tensor_copy(src=px, dst=x_sb[0:ms, s, 0:NOCC, vb * NUB + u])
+            for s in range(ns):
+                ms = min(TILE, w - s * TILE)
+                r0 = c * TP + s * TILE
+                nl.store(xt[r0 : r0 + ms, g, 0:NOCC, 0:NVC], value=x_sb[0:ms, s, 0:NOCC, 0:NVC])
+
         for pc in nl.affine_range(G_per):
             c = pid * G_per + pc if axis == 0 else pc
             for gi in nl.affine_range(NVG_per):
-                g = pid * NVG_per + gi if axis == 1 else gi
-                idx_sb = nl.ndarray((TILE, NKB * NVC), dtype=nl.uint32, buffer=nl.sbuf)
-                nisa.dma_copy(dst=idx_sb, src=img[c, g])
-                x_sb = nl.ndarray((TILE, NS, NOCC, NVC), dtype=nl.float32, buffer=nl.sbuf)
-                for vb in nl.affine_range(NVC // NUB):
-                    e_blk = nl.ndarray((TILE, NKB, NUB, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
-                    for k in nl.affine_range(NKB):
-                        nisa.dma_copy(
-                            dst=e_blk[0:TILE, k, 0:NUB, 0:TP],
-                            src=eri_v.ap(
-                                pattern=[[TP, TILE * NUB], [1, TP]],
-                                vector_offset=idx_sb[
-                                    0:TILE, k * NVC + vb * NUB : k * NVC + vb * NUB + NUB
-                                ],
-                                indirect_dim=0,
-                            ),
-                        )
-                    for u in nl.affine_range(NUB):
-                        for s in range(NS):
-                            ms = min(TILE, TP - s * TILE)
-                            px = nl.zeros((ms, NOCC), dtype=nl.float32, buffer=nl.psum)
-                            for k in nl.affine_range(NKB):
-                                nisa.nc_matmul(
-                                    dst=px,
-                                    stationary=e_blk[0:TILE, k, u, s * TILE : s * TILE + ms],
-                                    moving=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
-                                    accumulate=True,
-                                )
-                            nisa.tensor_copy(src=px, dst=x_sb[0:ms, s, 0:NOCC, vb * NUB + u])
-                for s in range(NS):
-                    ms = min(TILE, TP - s * TILE)
-                    r0 = c * TP + s * TILE
-                    nl.store(xt[r0 : r0 + ms, g, 0:NOCC, 0:NVC], value=x_sb[0:ms, s, 0:NOCC, 0:NVC])
+                chunk(c, TP, pid * NVG_per + gi if axis == 1 else gi)
+        if tail:
+            for gi in nl.affine_range(NVG_per):
+                chunk(GF, tail, pid * NVG_per + gi if axis == 1 else gi)
         return xt
 
     @nki.jit

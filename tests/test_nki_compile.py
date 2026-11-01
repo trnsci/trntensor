@@ -107,6 +107,22 @@ KERNEL_INPUTS = {
             "nb256_nocc20_naux390_split_chunks",
             lambda: ((_r(32896 * 2, 195), _u32(2, 2, 128, 256), _r(256, 20)), {"nub": 4}),
         ),
+        # (npair·naux / W, W) rows, 128-multiple chunks and a short last one;
+        # naux 1206 = 512 + 512 + 182 (npair cut to 1000: shapes only)
+        (
+            "nb256_nocc42_naux1206_tail",
+            lambda: (
+                (_r(1000 * 603, 2), _u32(3, 4, 128, 128), _r(256, 42)),
+                {"nub": 8, "tp": 512, "tail": 182},
+            ),
+        ),
+        (
+            "nb256_nocc20_tail_only",
+            lambda: (
+                (_r(1000 * 603, 2), _u32(1, 2, 128, 256), _r(256, 20)),
+                {"nub": 4, "tp": 512, "tail": 182},
+            ),
+        ),
     ],
     "df_exchange_syrk_kernel": [
         # (Xt (rows, NVG, nocc, NVC), running partial Ks (2, NB, NB)); partial last tile

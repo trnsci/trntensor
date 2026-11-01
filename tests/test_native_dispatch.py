@@ -9,6 +9,7 @@ CPU-only: ``torch_neuronx`` and ``torch_xla`` are replaced with stand-ins via
 """
 
 import importlib.util
+import math
 import subprocess
 import sys
 import types
@@ -446,34 +447,47 @@ class TestPublicApiOnNativePath:
         assert native_host == []
 
     @pytest.mark.parametrize(
-        "nbasis,naux,nocc,group", [(40, 6, 5, 0), (130, 30, 7, 0), (40, 600, 6, 1)]
+        "nbasis,naux,nocc,group,tp",
+        [
+            (40, 6, 5, 0, 0),
+            (130, 30, 7, 0, 0),
+            (40, 600, 6, 1, 0),
+            (40, 600, 6, 1, 256),  # 256 + 256 + 88
+            (40, 600, 6, 0, 512),  # 512 + 88 in one launch
+            (40, 1100, 6, 2, 256),  # groups (0, 2), (2, 5): the 76 tail joins
+        ],
     )
     def test_df_exchange_routes_to_the_two_ops(
-        self, native_host, monkeypatch, nbasis, naux, nocc, group
+        self, native_host, monkeypatch, nbasis, naux, nocc, group, tp
     ):
         """#60: replaying the half kernel's batched gather from the index
         images on CPU rebuilds Xt, and the SYRK stand-in's two partials add
-        up to K."""
+        up to K, with chunks dividing naux or 128-multiple chunks and a
+        short last one."""
+        if tp:
+            monkeypatch.setenv("TRNTENSOR_DF_K_TP", str(tp))
 
-        def half_op(eri_v, img, C_occ, nub=8):
+        def half_op(eri_v, img, C_occ, nub=8, tp=0, tail=0):
             npc, nvg = img.shape[0], img.shape[1]
-            tp, nbp = eri_v.shape[1], C_occ.shape[0]
+            w0, nbp = eri_v.shape[1], C_occ.shape[0]
+            tp = tp or w0
+            widths = [tp] * (npc - 1) + [tail or tp]
             nvc, nkb = nbp // nvg, nbp // 128
             assert img.dtype == torch.uint32 and img.shape == (npc, nvg, 128, nkb * nvc)
             idx = img.view(torch.int32).long()
-            full = torch.empty(nbp, nbp, npc * tp)
-            for c in range(npc):
+            flat = eri_v.reshape(-1)
+            full = torch.empty(nbp, nbp, sum(widths))
+            for c, w in enumerate(widths):
                 for g in range(nvg):
                     for k in range(nkb):
                         for b in range(nvc // nub):
                             blk = idx[c, g, :, k * nvc + b * nub : k * nvc + (b + 1) * nub]
-                            rows = eri_v[blk.T.flatten()].reshape(128, nub, tp)
+                            starts = blk.T.flatten() * w0
+                            rows = flat[starts[:, None] + torch.arange(w)].reshape(128, nub, w)
                             v0 = g * nvc + b * nub
-                            full[k * 128 : (k + 1) * 128, v0 : v0 + nub, c * tp : (c + 1) * tp] = (
-                                rows
-                            )
+                            full[k * 128 : (k + 1) * 128, v0 : v0 + nub, c * tp : c * tp + w] = rows
             x = torch.einsum("li,lnP->Pin", C_occ, full)  # (P, i, ν)
-            return x.reshape(npc * tp, -1, nvg, nvc).permute(0, 2, 1, 3).contiguous()
+            return x.reshape(sum(widths), -1, nvg, nvc).permute(0, 2, 1, 3).contiguous()
 
         def syrk_op(xt, kin, banks=6):
             nr, nvg, nop, nvc = xt.shape
@@ -494,10 +508,13 @@ class TestPublicApiOnNativePath:
         ref = 2.0 * torch.einsum("imP,inP->mn", X, X)
         # fp32 sums of up to 600·nocc terms: compare against max |K|.
         assert float((out - ref).abs().max()) <= 1e-5 * float(ref.abs().max())
-        tp, nub, _nvc = _kernels.df_half_tiling(naux, -(-nbasis // 128) * 128, nocc + nocc % 2)
-        launches = naux // tp if group else 1
+        tp_, nub, _nvc = _kernels.df_half_tiling(naux, -(-nbasis // 128) * 128, nocc + nocc % 2)
+        assert tp_ == tp or not tp
+        tp = tp_
+        launches = len(_kernels.df_groups(naux, tp, group)) if group else 1
         assert [c[0] for c in native_host] == ["df_half_packed", "df_exchange_syrk"] * launches
-        assert native_host[0][1] == {"nub": nub} and naux % tp == 0
+        assert native_host[0][1]["nub"] == nub and native_host[0][1]["tp"] == tp
+        assert native_host[-2][1]["tail"] == naux % tp
 
     @pytest.mark.parametrize("nbasis", [30, 40])
     def test_df_coulomb_routes_to_the_two_ops(self, native_host, monkeypatch, nbasis):
@@ -570,12 +587,42 @@ class TestPublicApiOnNativePath:
     @pytest.mark.parametrize(
         "naux,nb,nocc", [(1206, 256, 41), (2366, 512, 81), (4686, 1024, 161), (768, 256, 32)]
     )
-    def test_df_half_tiling_divides_and_fits(self, naux, nb, nocc):
+    def test_df_half_tiling_fits_with_fewest_aux_tiles(self, naux, nb, nocc):
         tp, nub, nvc = _kernels.df_half_tiling(naux, nb, nocc)
-        assert naux % tp == 0 and tp <= 512 and nb % nvc == 0 and nvc % nub == 0
+        assert tp <= 512 and nb % nvc == 0 and nvc % nub == 0
+        assert naux % tp == 0 or tp % 128 == 0
         assert _kernels.df_half_sbuf_bytes(nb, nocc, tp, nub, nvc) <= _kernels.DF_K_SBUF_BUDGET
-        g = _kernels.df_group_chunks(naux // tp, nb, tp, nub, nvc)
-        assert 1 <= g <= naux // tp
+        npc = -(-naux // tp)
+        g = _kernels.df_group_chunks(npc, nb, tp, nub, nvc)
+        assert 1 <= g <= npc
+        # These shapes reach the fewest possible SYRK aux tiles.
+        assert _kernels.df_syrk_tiles(naux, tp, g) == -(-naux // 128)
+
+    def test_df_half_tiling_index_range_and_override(self, monkeypatch):
+        # 4686 = 2·3·11·71: 256 chunks with a 78 tail give the minimum 37
+        # SYRK aux tiles; the divisor 213 (2 chunks per group) needs 44.
+        assert _kernels.df_half_tiling(4686, 1024, 162) == (256, 8, 16)
+        assert _kernels.df_syrk_tiles(4686, 213, 2) == 44
+        assert _kernels.df_syrk_tiles(4686, 256, 2) == 37
+        # 2366 = 6·338 + 338: the divisor already reaches 19, so no tail.
+        assert _kernels.df_half_tiling(2366, 512, 82) == (338, 8, 32)
+        # Gather indices npair·naux / gcd(naux, tp) must fit 31 bits.
+        tp = _kernels.df_half_tiling(4686, 1024, 162, npair=10**6)[0]
+        assert 10**6 * 4686 // math.gcd(4686, tp) < 2**31
+        monkeypatch.setenv("TRNTENSOR_DF_K_TP", "213")
+        assert _kernels.df_half_tiling(4686, 1024, 162)[0] == 213
+
+    def test_df_groups_cover_the_chunks_and_absorb_a_lone_tail(self):
+        # 4686 = 18·256 + 78: groups of 2, the short chunk joins the last.
+        groups = _kernels.df_groups(4686, 256, 2)
+        assert groups[0] == (0, 2) and groups[-1] == (16, 19) and len(groups) == 9
+        assert _kernels.df_groups(2366, 338, 6) == [(0, 6), (6, 7)]  # full last chunk
+        assert _kernels.df_groups(1100, 512, 2) == [(0, 3)]
+        assert _kernels.df_groups(600, 512, 1) == [(0, 2)]
+        for naux, tp, grp in ((4686, 256, 2), (1206, 201, 6), (700, 128, 3)):
+            groups = _kernels.df_groups(naux, tp, grp)
+            assert groups[0][0] == 0 and groups[-1][1] == -(-naux // tp)
+            assert all(a[1] == b[0] for a, b in zip(groups[:-1], groups[1:], strict=True))
 
     @pytest.mark.parametrize("nb,banks", [(128, 6), (512, 6), (1024, 6), (1024, 2), (2048, 8)])
     def test_df_exchange_blocks_cover_the_upper_triangle(self, nb, banks):
@@ -1386,6 +1433,11 @@ class TestLazyRegistration:
             m(32896 * 6, 201), m(2, 4, 128, 128, dtype=torch.int32), m(256, 42)
         )
         assert xt.shape == (402, 4, 42, 64)
+        # 1206 = 512 + 512 + 182: rows (npair·1206 / 2, 2), a short last chunk.
+        xs = fake("df_half_packed")(
+            m(32896 * 603, 2), m(3, 4, 128, 128, dtype=torch.int32), m(256, 42), 8, 512, 182
+        )
+        assert xs.shape == (1206, 4, 42, 64)
         assert fake("df_exchange_syrk")(xt, m(2, 256, 256)).shape == (2, 256, 256)
         assert fake("df_coulomb_d")(m(31375, 1206), m(31375, 1)).shape == (2, 1, 1206)
         assert fake("df_coulomb_j")(m(31375, 1206), m(128, 1206)).shape == (128, 244)

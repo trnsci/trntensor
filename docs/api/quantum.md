@@ -264,10 +264,17 @@ K = trntensor.df_exchange(B_d, C_occ_d, alpha=2.0)
   - Both launches split across the programs of the logical core: the first
     by aux chunks (or ν groups), the second by occupied orbitals (padded to
     an even count). At LNC=2 both physical cores work.
-  - The aux chunk width is a divisor of naux, so `B` is never copied or
-    padded. Traced NKI loops unroll, so the dispatcher runs the pair over
-    groups of chunks to bound the compile time (about a minute per shape at
-    n_ao = 970) and the `Xt` scratch.
+  - `B` is never copied or padded. The aux chunk width is a divisor of
+    naux, or a multiple of 128 with a short last chunk of `naux mod width`
+    (#60). Traced NKI loops unroll, so the dispatcher runs the pair
+    over groups of chunks to bound the compile time (about a minute per
+    shape at n_ao = 970) and the `Xt` scratch.
+  - The tiling minimises the 128-row aux tiles of the SYRK launches: a
+    partial tile there costs a full one, and each group of chunks can end
+    in one. At n_ao = 970 (naux = 4686 = 2·3·11·71) the divisor 213 in
+    pairs gave 44 tiles for 4686 rows; chunks of 256 in pairs, with the
+    78-wide last chunk in the last group, give the minimum, 37. Where a
+    divisor already reaches the minimum (n_ao = 250 and 490) it is kept.
   - `"auto"` uses the kernels for device-resident `B` with `nocc ≤ 512`
     once `nocc·nbasis²·naux` reaches 1e7 multiply-adds.
     `TRNTENSOR_DF_EXCHANGE=auto|trn2|aten` overrides the choice.
@@ -300,17 +307,31 @@ max |K| against float64.
   call. `df_exchange` never builds the square.
 - `df_exchange` scales 1.59x / 1.81x / 1.95x from LNC=1 to LNC=2 at
   n_ao = 250 / 490 / 970.
-- At n_ao = 970 each launch pair takes 2 aux chunks of 213; there are 11
-  pairs. Padding naux to 4736 (chunks of 128, so no partial tiles) measured
-  126 ms, not faster: the narrower gathered rows cost more than the partial
-  tiles. Eight PSUM banks per SYRK pass instead of six made no difference.
+- At n_ao = 970 the table's 118 ms used 11 launch pairs of 2 aux chunks of
+  213. Chunks of 256 (NUB = 8, NVC = 16) take 9 pairs, the last one holding
+  the 78-wide chunk. K then takes 93.8 ms at LNC=2 and 187 ms at LNC=1
+  (from 118 and 230 ms), with error 6.2e-7 and 1.1e-6 (from 8.1e-7 and
+  1.5e-6).
+  - The gain is in the SYRK: 3.1 ms per 512-row group against 3.7 ms per
+    426-row group. The half transform takes about as long per aux row
+    either way.
+  - Summed per-launch times of other tilings: groups of 3 chunks of 213
+    (5 tiles per 639 rows) 117 ms; 256 with NVC = 8 (the earlier 160 KiB
+    SBUF budget) 103 ms; 256 with NUB = 4 115 ms.
+- At n_ao = 490 the 128-multiple widths 256 and 384 were slower in the half
+  transform than 338: 8.9 and 9.1 ms against 6.1 ms per 6–8-chunk launch.
+  Widths whose last 128-row tile is partial (320–352) ran as fast as 338.
+  So the divisor tiling stays where it already gives the fewest SYRK tiles.
+- Padding naux to 4736 (chunks of 128, so no partial tiles) measured
+  126 ms. Eight PSUM banks per SYRK pass instead of six made no difference.
 - Without the `Xt[P, g, i, v]` store layout (ν innermost, 64-byte DMA
   writes) the same call took 488 ms.
 
 ### Current limitations
 
 - `nocc ≤ 512` (one PSUM bank of the stage-1 output).
-- `naux` needs a divisor in [32, 512] (else the aten route runs).
+- The gather indices are 32-bit: `npair·naux / gcd(naux, width)` must stay
+  below 2^31, which limits the chunk widths for very large `B`.
 - The kernels run the Tensor Engine in fp32, which is what bounds them now.
   At n_ao = 970 the half transform runs at about 17 TFLOP/s and the SYRK at
   about 26 TFLOP/s per LNC=2 core (each counts the padded tiles).

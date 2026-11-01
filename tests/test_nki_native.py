@@ -228,16 +228,26 @@ class TestNativeTrn2Kernels:
         torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-4)
 
     @pytest.mark.parametrize(
-        "nbasis,nocc,naux,group",
-        [(128, 8, 128, 0), (200, 21, 558, 0), (256, 41, 1206, 0), (300, 33, 600, 1)],
+        "nbasis,nocc,naux,group,tp",
+        [
+            (128, 8, 128, 0, 0),
+            (200, 21, 558, 0, 0),
+            (256, 41, 1206, 0, 0),
+            (300, 33, 600, 1, 0),
+            (256, 41, 1206, 0, 512),  # 512 + 512 + 182, one launch
+            (300, 33, 600, 1, 256),  # 256 + (256 + 88): the tail joins
+            (200, 21, 1100, 2, 256),  # (256 + 256) + (256 + 256 + 76)
+        ],
     )
-    def test_df_exchange_kernels_match_reference(self, monkeypatch, nbasis, nocc, naux, group):
+    def test_df_exchange_kernels_match_reference(self, monkeypatch, nbasis, nocc, naux, group, tp):
         """#60: gather + half transform + PSUM SYRK against the fp64 K,
-        including odd nocc (padded), non-128 nbasis, partial aux tiles and
-        several launch groups."""
+        including odd nocc (padded), non-128 nbasis, partial aux tiles,
+        several launch groups and 128-multiple chunks with a short last one."""
         import trntensor
         from trntensor.nki import dispatch
 
+        if tp:
+            monkeypatch.setenv("TRNTENSOR_DF_K_TP", str(tp))
         if group:
             monkeypatch.setattr(dispatch, "df_group_chunks", lambda *a: group)
         g = torch.Generator().manual_seed(nbasis + naux)

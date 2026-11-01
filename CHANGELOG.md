@@ -19,6 +19,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `matmul` is now planned only for outputs `[A free, B free]` and `bmm` only
   for exactly `bij,bjk->bik`; the rest run through `torch.einsum` (#64).
 
+### Changed
+
+- **`df_exchange` tiles naux to minimise the SYRK's partial aux tiles (#66, #60).**
+  K at n_ao = 970 takes 93.8 ms instead of 118 ms at LNC=2, and 187 ms
+  instead of 230 ms at LNC=1. The error against float64 is 6.2e-7 (was
+  8.1e-7) relative to max |K|.
+  - Aux chunks can now be 128 multiples with a short last chunk of
+    `naux mod width`. Before, the width had to divide naux.
+    `df_half_packed_kernel` takes `tp` and `tail` and gathers from the packed
+    rows viewed as `(npair·naux / W, W)`, `W = gcd(naux, tp)`. `B` is still
+    not copied.
+  - `df_half_tiling` first minimises the 128-row tiles over the SYRK
+    launches (`df_syrk_tiles`), because each partial tile there costs a full
+    one. Next it prefers a divisor of naux, then the old order.
+    - At naux = 4686 that means chunks of 256 with a 78 tail, 37 tiles
+      instead of 44.
+    - n_ao = 250 and 490 keep their previous tilings, which already reach
+      the minimum.
+  - `df_groups` folds a lone short last chunk into the previous launch group.
+  - The launch-1 SBUF budget is now 176 KiB (was 160 KiB), so that
+    TP = 256, NUB = 8, NVC = 16 fits at n_ao = 970. This tiling is 7 ms
+    faster than NVC = 8.
+  - naux with no divisor in [32, 512] now runs the kernels, not aten.
+  - `TRNTENSOR_DF_K_TP` forces the chunk width.
+
 ## [0.21.0] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
