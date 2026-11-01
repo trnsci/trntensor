@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`einsum` returned the wrong layout for transposed or permuted outputs**
+  (silent). Affects **every release through 0.21.0**, on every backend
+  (PyTorch included). The planner chose the `matmul` / `bmm` strategy without
+  checking index order, so `einsum("ij,jk->ki", A, B)` returned `A @ B`
+  (shape `(i, k)`, and for square operands the transpose with no error), the
+  permuted batched outputs (`bij,bjk->bki` etc.) returned `(b, i, k)`, and
+  non-canonical batched operands (`bji,...`, `...,bkj`, `ibj,...`) raised.
+  `matmul` is now planned only for outputs `[A free, B free]` and `bmm` only
+  for exactly `bij,bjk->bik`; the rest run through `torch.einsum` (#64).
+
 ## [0.21.0] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

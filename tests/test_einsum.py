@@ -786,3 +786,56 @@ class TestPrecisionPromises:
         assert calls == [[("cpu", torch.float64), ("cpu", torch.float64)]]
         assert C.dtype == torch.float32 and C.device.type == "cpu"
         torch.testing.assert_close(C, (A.double() @ B.double()).float())
+
+
+def _two_operand_subscripts():
+    import itertools
+
+    subs = set()
+    for out in ("ik", "ki"):
+        for a in ("ij", "ji"):
+            for b in ("jk", "kj"):
+                subs.add(f"{a},{b}->{out}")
+    for out in itertools.permutations("bik"):
+        for a in ("bij", "bji", "ibj"):
+            for b in ("bjk", "bkj", "jbk"):
+                subs.add(f"{a},{b}->{''.join(out)}")
+    subs |= {"ij,jk->i", "ij,jk->k", "ij,jk->", "bij,bjk->bi", "ij,j->i", "i,j->ji"}
+    return sorted(subs)
+
+
+class TestOutputOrder:
+    """The matmul/bmm plans return op(A) @ op(B); a transposed or permuted output,
+    or non-canonical batched operands, must not take them (#64)."""
+
+    @pytest.mark.parametrize("subscripts", _two_operand_subscripts())
+    @pytest.mark.parametrize("square", [False, True])
+    def test_matches_torch_einsum(self, subscripts, square):
+        sizes = dict(zip("bijk", (2, 5, 5, 5) if square else (2, 6, 5, 7), strict=True))
+        g = torch.Generator().manual_seed(0)
+        ins = subscripts.split("->")[0].split(",")
+        ops = [torch.randn(*[sizes[c] for c in t], generator=g, dtype=torch.float64) for t in ins]
+        want = torch.einsum(subscripts, *ops)
+        torch.testing.assert_close(trntensor.einsum(subscripts, *ops), want)
+        out = torch.randn(want.shape, generator=g, dtype=torch.float64)
+        got = trntensor.einsum(subscripts, *ops, alpha=0.7, beta=0.5, out=out.clone())
+        torch.testing.assert_close(got, 0.7 * want + 0.5 * out)
+
+    @pytest.mark.parametrize(
+        "subscripts,strategy",
+        [
+            ("ij,jk->ik", "matmul"),
+            ("ji,kj->ik", "matmul"),
+            ("ij,jk->ki", "torch"),
+            ("ij,jk->i", "torch"),
+            ("bij,bjk->bik", "bmm"),
+            ("bij,bjk->bki", "torch"),
+            ("bji,bjk->bik", "torch"),
+            ("ibj,bjk->bik", "torch"),
+        ],
+    )
+    def test_strategy(self, subscripts, strategy):
+        sizes = dict(zip("bijk", (2, 6, 5, 7), strict=True))
+        ins = subscripts.split("->")[0].split(",")
+        ops = [torch.randn(*[sizes[c] for c in t]) for t in ins]
+        assert trntensor.plan_contraction(subscripts, *ops).strategy == strategy
