@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inf in the buffer (e.g. `torch.empty`) made the result NaN (silent, every
   backend). Affects 0.3.0 through 0.22.0. `beta == 0` now ignores `out`, as
   in BLAS, cuTENSOR and trnblas (#71).
+### Fixed
+
+- **`tucker_decompose` returned a wrong core for complex tensors** (silent,
+  every backend): it projected with `Uᵀ` instead of `Uᴴ`, so even a
+  full-rank reconstruction was off by ~140 %. Affects every release through
+  0.22.0. `tt_decompose` now also accepts complex tensors instead of raising
+  (#73). Real tensors are unchanged.
 
 ## [0.22.0] — 2026-11-01
 
