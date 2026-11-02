@@ -48,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `target_forward_error` in 0.17.0 through 0.22.0. Complex operands now
   accumulate in complex128, and integer operands contract natively, which is
   exact (#69).
+- **`multi_einsum` changed result dtypes for mixed-dtype batches** (silent,
+  every backend). Same-shape contractions were stacked without checking
+  dtype, so float32 results came back float64. Affects 0.17.0 through 0.22.0.
+  Batching now requires matching operand dtypes and devices (#75).
 
 ## [0.22.0] — 2026-11-01
 
