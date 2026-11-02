@@ -171,8 +171,6 @@ def xfail_decide(issue, why):
     return pytest.mark.xfail(strict=True, reason=f"trnsci/trntensor#{issue}: {why}")
 
 
-XF_COMPLEX_PREC = xfail_open(69, 70, "kahan/dd/target_forward_error drop the imaginary part")
-XF_INT_PREC = xfail_open(69, 70, "kahan/dd round large integers")
 XF_OUT = xfail_decide(77, "needs decision: einsum out= is never written")
 XF_CP_DTYPE = xfail_decide(78, "cp_decompose/cp_reconstruct hard-code float32 CPU buffers")
 XF_SHARD = xfail_decide(78, "output-parallel sharded einsum does not co-partition operands")
@@ -322,12 +320,7 @@ def _mode_cases():
         is_int = not (dt.is_floating_point or dt.is_complex)
         if is_int and mode != "fast" and mode != "kahan":
             continue
-        marks = []
-        if dt.is_complex and mode in ("kahan", "dd", "target"):
-            marks = [XF_COMPLEX_PREC]
-        elif dt == torch.int32 and mode == "kahan" and sub == "ii->":
-            marks = [XF_INT_PREC]  # returns int32 where torch.einsum returns int64
-        cases.append(pytest.param(sub, shapes, dt, mode, marks=marks, id=f"{sub}-{dt}-{mode}"))
+        cases.append(pytest.param(sub, shapes, dt, mode, id=f"{sub}-{dt}-{mode}"))
     return cases
 
 
@@ -355,8 +348,7 @@ def test_integer_precision_modes_exact(dtype, precision):
     b = torch.tensor([[1], [1]], dtype=dtype)
     got = tt.einsum("ij,jk->ik", d(a), d(b), precision=precision)
     ref = torch.einsum("ij,jk->ik", a, b)
-    if not same_bits(got, ref):
-        pytest.xfail(XF_INT_PREC.kwargs["reason"])
+    assert same_bits(got, ref)
 
 
 @pytest.mark.parametrize("cast", ["bf16", "bfloat16", "fp16", "f32", "float32", torch.float64])
