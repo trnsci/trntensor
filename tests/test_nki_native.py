@@ -397,6 +397,8 @@ class TestNativeTrn2Kernels:
         fn = ops["ao_to_mo_trn2_packed"]
         ops["ao_to_mo_trn2_packed"] = lambda *a, **k: calls.append(1) or fn(*a, **k)
         monkeypatch.setattr(dispatch, "_native_ops", ops)
+        # The spies count custom-op calls: keep launches off the eager handle.
+        monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
         prev = trntensor.get_backend()
         trntensor.set_backend("auto")
         try:
@@ -435,6 +437,8 @@ class TestNativeTrn2Kernels:
             fn = ops[name]
             ops[name] = lambda *a, _fn=fn, _n=name, **k: calls.append(_n) or _fn(*a, **k)
         monkeypatch.setattr(dispatch, "_native_ops", ops)
+        # The spies count custom-op calls: keep launches off the eager handle.
+        monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
         prev = trntensor.get_backend()
         trntensor.set_backend("auto")
         try:
