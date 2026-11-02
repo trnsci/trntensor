@@ -34,7 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half-transformed tensor, the two steps now run as `mm` and `bmm` with
   contiguous orbital transposes. At 768/64/2304 the error against float64 is
   2.2e-7 (was 1.06), and a warm call takes 16.1 ms (the wrong route took
-  25 ms).
+  25 ms). Not fixed here: at LNC=1, the device `index_select` that builds a
+  square `eri` over 4 GiB is itself wrong (it unpacks packed input for the aten
+  route), so that case still returns wrong values or NaN (#97).
 
 - **`einsum(precision="kahan")` rounded int32 values above 2**24 on the
   neuron device** (silent, #90). The device computes integer matmul in fp32.
