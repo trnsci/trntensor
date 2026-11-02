@@ -1633,6 +1633,8 @@ def _df_exchange_route(B: torch.Tensor, nocc: int, nbasis: int) -> str:
     if choice != "auto":
         return choice
     naux = B.shape[1]
+    if naux == 0 or nocc == 0:  # nothing to tile (df_half_tiling divides by naux)
+        return "aten"
     if nocc > 512 or df_half_tiling(naux, _round_up(nbasis, TILE_K), nocc, B.shape[0]) is None:
         return "aten"
     if _nki_forced():
@@ -1734,6 +1736,12 @@ def _nki_df_coulomb(B: torch.Tensor, pw: torch.Tensor) -> torch.Tensor:
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
     npair, naux = B.shape
+    out_dtype = B.dtype
+    # The kernels take fp32 (or bf16). A float64 B went to them as is and
+    # came back inf/garbage through 0.22.0; compute in fp32 and return B's
+    # dtype, as the aten path does.
+    if B.dtype not in (torch.float32, torch.bfloat16):
+        B = B.float()
     B = B.contiguous()
     pw = pw.reshape(npair, 1).to(B.dtype).contiguous()
     rows = (npair // (2 * TILE_K)) * 2 * TILE_K
@@ -1746,7 +1754,7 @@ def _nki_df_coulomb(B: torch.Tensor, pw: torch.Tensor) -> torch.Tensor:
     j = jt.T.reshape(-1)
     if rows < npair:
         j = torch.cat([j, B[rows:] @ d])
-    return j
+    return j.to(out_dtype)
 
 
 def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
