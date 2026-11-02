@@ -329,3 +329,70 @@ class TestComplexTuckerTT:
         torch.testing.assert_close(
             trntensor.tt_reconstruct(trntensor.tt_decompose(x, 64)), x, rtol=tol, atol=tol
         )
+
+
+_MATMULS = {
+    torch.matmul,
+    torch.Tensor.matmul,
+    torch.Tensor.__matmul__,
+    torch.Tensor.__rmatmul__,
+    torch.mm,
+    torch.bmm,
+    torch.einsum,
+    torch.linalg.solve,
+    torch.linalg.pinv,
+}
+
+
+class _NoConjViews(torch.overrides.TorchFunctionMode):
+    """Records every matmul / solve that receives a lazy conj view."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func in _MATMULS:
+            for a in (*args, *kwargs.values()):
+                if isinstance(a, torch.Tensor) and a.is_conj():
+                    self.seen.append(getattr(func, "__name__", str(func)))
+        return func(*args, **kwargs)
+
+
+class TestNoLazyConjToMatmul:
+    """On the neuron device matmul ignores the conj bit of a lazy view
+    (aws-neuron-sdk#1455): ``A.mH @ B`` computes ``A.mT @ B``. No such view may
+    reach a matmul or solve in the decompositions (#89)."""
+
+    def test_mode_records_a_conj_view(self):
+        a = torch.randn(3, 3, dtype=torch.complex64)
+        with _NoConjViews() as m:
+            _ = a.mH @ a
+        assert m.seen
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    def test_tucker(self, dtype):
+        x = torch.randn(4, 5, 3, generator=torch.Generator().manual_seed(3), dtype=dtype)
+        with _NoConjViews() as m:
+            core, U = trntensor.tucker_decompose(x, (2, 3, 2))
+        assert m.seen == []
+        assert not core.is_conj()
+        ref = torch.einsum("abc,ai,bj,ck->ijk", x, U[0].conj(), U[1].conj(), U[2].conj())
+        tol = 1e-4 if dtype == torch.complex64 else 1e-10
+        torch.testing.assert_close(core, ref, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    def test_cp(self, dtype):
+        x = torch.randn(4, 5, 3, generator=torch.Generator().manual_seed(4), dtype=dtype)
+        torch.manual_seed(0)
+        with _NoConjViews() as m:
+            trntensor.cp_decompose(x, rank=2, max_iter=3)
+        assert m.seen == []
+
+    def test_real_mH_is_no_copy(self):
+        from trntensor.decompose import _conj, _mH
+
+        r = torch.randn(4, 3)
+        assert _mH(r).data_ptr() == r.data_ptr()
+        assert _conj(r).data_ptr() == r.data_ptr()

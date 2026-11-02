@@ -16,6 +16,23 @@ from __future__ import annotations
 import torch
 
 
+def _mH(x: torch.Tensor) -> torch.Tensor:
+    """Conjugate transpose with the conjugation applied (as trnsolver's ``factor._mH``).
+
+    ``x.mH`` and ``x.conj()`` of a complex tensor are lazy views: they set the
+    conj bit and leave the data unconjugated. On a Neuron device matmul ignores
+    that bit (aws-neuron/aws-neuron-sdk#1455), so ``A.mH @ B`` computes
+    ``A.mT @ B``, silently. ``resolve_conj()`` materializes the conjugate; for
+    real input it is a no-op (no copy).
+    """
+    return x.mH.resolve_conj()
+
+
+def _conj(x: torch.Tensor) -> torch.Tensor:
+    """``x.conj()`` materialized (see :func:`_mH`); real input is returned as is."""
+    return x.conj().resolve_conj()
+
+
 def cp_decompose(
     tensor: torch.Tensor,
     rank: int,
@@ -89,7 +106,7 @@ def cp_decompose(
             # Normal equations of the least-squares problem T_mode ≈ A V^T:
             # A conj(V^H V) = T_mode conj(V), i.e. (V^H V) A^T = (T_mode conj(V))^T.
             # For real input V.mH is V.T and conj() is a no-op.
-            VtV = V.mH @ V
+            VtV = _mH(V) @ V
 
             if nonneg:
                 # Multiplicative update: ensures non-negativity
@@ -98,11 +115,11 @@ def cp_decompose(
                 factors[mode] = (factors[mode] * numer / denom).clamp(min=1e-10)
             else:
                 # ALS: solve normal equations
-                rhs = T_mode @ V.conj()
+                rhs = T_mode @ _conj(V)
                 try:
                     factors[mode] = torch.linalg.solve(VtV, rhs.T).T
                 except RuntimeError:
-                    factors[mode] = rhs @ torch.linalg.pinv(VtV.conj())
+                    factors[mode] = rhs @ torch.linalg.pinv(_conj(VtV))
                 # Extract norms as weights
                 norms = torch.linalg.norm(factors[mode], dim=0)
                 weights = norms
@@ -163,10 +180,11 @@ def tucker_decompose(
 
     # Core tensor: G = T ×_1 U_1^H ×_2 U_2^H ×_3 U_3^H ... (the conjugate
     # transpose: U^T is not the inverse of a complex unitary U; for real
-    # tensors .mH is .T)
+    # tensors .mH is .T). Resolved, not a lazy conj view: device matmul
+    # ignores the conj bit (#89, aws-neuron-sdk#1455).
     core = tensor.clone()
     for mode in range(ndim):
-        core = _mode_product(core, factors[mode].mH, mode)
+        core = _mode_product(core, _mH(factors[mode]), mode)
 
     return core, factors
 
