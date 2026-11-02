@@ -14,6 +14,13 @@ fall back to aten (which would hide the violation).
 
 Results are also checked for the pytorch backend's dtype and shape (the stubs
 return zeros, so values are not compared).
+
+float64 follows the suite fp64 policy (#92, trnsci/trnsci#35): under
+``"auto"`` it runs torch at float64 accuracy and reaches no kernel; under
+explicit ``set_backend("nki")`` the kernel runs on fp32 operands with one
+``UserWarning`` per op per process; under ``TRNTENSOR_REQUIRE_NKI=1`` it raises
+``NotImplementedError``. The result dtype is always the pytorch backend's,
+including mixed-dtype promotion.
 """
 
 import sys
@@ -81,6 +88,7 @@ class _Recorder:
     def __init__(self):
         self.calls: list[str] = []
         self.violations: list[str] = []
+        self.float_dtypes: set[torch.dtype] = set()  # floating operand dtypes seen
 
 
 def _fake_torch_neuronx(rec: _Recorder):
@@ -95,6 +103,7 @@ def _fake_torch_neuronx(rec: _Recorder):
                 ts = [a for a in args if isinstance(a, torch.Tensor)]
                 takes = KERNEL_TAKES.get(short)
                 dts = [t.dtype for t in ts]
+                rec.float_dtypes.update(d for d in dts if d.is_floating_point)
                 if takes is None:
                     rec.violations.append(f"{short}: no allowed-dtype entry in the test")
                 elif len(dts) != len(takes) or any(
@@ -152,6 +161,7 @@ def guarded(monkeypatch):
     for var in ("TRNTENSOR_FORCE_BACKEND", "TRNTENSOR_REQUIRE_NKI", "TRNSCI_NKI_DISPATCH"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+    monkeypatch.setattr(dispatch, "_fp64_warned", set())
     monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "host")  # CPU is the "device"
     trntensor.clear_plan_cache()
     with warnings.catch_warnings():
@@ -362,14 +372,15 @@ def test_require_nki_refuses_chemistry_dtypes(guarded, monkeypatch, dtype, name)
     assert guarded.violations == []
 
 
-@pytest.mark.parametrize("dtype", [torch.float64, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "name",
     ["mp2-rows", "mp2-legacy", "ao2mo-trn2", "ao2mo-trn2-packed", "df_exchange", "df_coulomb"],
 )
 def test_require_nki_chemistry_floats_run_the_kernel(guarded, monkeypatch, dtype, name):
-    """float64 / float16 chemistry operands run the kernel in fp32 (#88) and come
-    back in the caller's dtype; REQUIRE_NKI does not refuse them."""
+    """float16 (and, on the fp32-only df_* kernels, bfloat16) chemistry operands
+    run the kernel in fp32 (a lossless upcast) and come back in the caller's
+    dtype; REQUIRE_NKI does not refuse them. float64 is refused (#92), below."""
     _require_nki(monkeypatch)
     _set_backend(monkeypatch, "nki")
     _, env, fn = next(c for c in CALLS if c[0] == name)
@@ -379,6 +390,175 @@ def test_require_nki_chemistry_floats_run_the_kernel(guarded, monkeypatch, dtype
     assert out.dtype == dtype
     assert guarded.calls, "the kernel route did not run"
     assert guarded.violations == []
+
+
+# ── The float64 policy (#92): auto → torch, nki → fp32 kernel + warning,
+#    REQUIRE_NKI → NotImplementedError ──────────────────────────────────────
+
+# Calls that reach a kernel with fp32 operands (kahan / dd never do, and the
+# decompositions use torch matmuls directly).
+_NO_KERNEL = ("einsum-kahan", "einsum-dd", "cp_decompose", "tucker_decompose", "tt_decompose")
+KERNEL_CALLS = [c for c in CALLS if c[0] not in _NO_KERNEL]
+_KERNEL_IDS = [c[0] for c in KERNEL_CALLS]
+_F64 = torch.float64
+
+
+def _with_env(monkeypatch, env):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+
+def _fp64_warnings(record) -> list[str]:
+    """Op names of the fp64 reduced-precision UserWarnings in ``record``."""
+    ops = []
+    for w in record:
+        msg = str(w.message)
+        if issubclass(w.category, UserWarning) and "has fp32 accuracy" in msg:
+            ops.append(msg.split("trntensor ", 1)[1].split(":", 1)[0])
+    return ops
+
+
+@pytest.mark.parametrize("name,env,fn", KERNEL_CALLS, ids=_KERNEL_IDS)
+def test_fp64_auto_runs_torch_at_fp64(guarded, monkeypatch, name, env, fn):
+    """``"auto"``: float64 reaches no kernel, does not warn, and gives the
+    pytorch backend's float64 result (the stubs would return zeros)."""
+    _with_env(monkeypatch, env)
+    ref, ref_err = _reference(monkeypatch, fn, _F64)
+    assert ref_err is None, ref_err
+    _set_backend(monkeypatch, "auto")
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        out, err = _run(fn, _F64)
+    assert err is None, err
+    assert guarded.calls == [], guarded.calls
+    assert _fp64_warnings(record) == []
+    for got, want in zip(_leaves(out), _leaves(ref), strict=True):
+        assert got.dtype == want.dtype == _F64
+        torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("name,env,fn", KERNEL_CALLS, ids=_KERNEL_IDS)
+def test_fp64_explicit_nki_runs_the_fp32_kernel_and_warns_once(guarded, monkeypatch, name, env, fn):
+    """Explicit ``"nki"``: the kernel runs on fp32 operands, the result is
+    float64, and each op warns exactly once across repeated calls."""
+    _with_env(monkeypatch, env)
+    _set_backend(monkeypatch, "nki")
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        for seed in range(3):
+            out, err = _run(fn, _F64, seed=seed)
+            assert err is None, err
+            assert all(t.dtype == _F64 for t in _leaves(out) if t.dtype.is_floating_point)
+    assert guarded.calls, "the kernel route did not run"
+    assert guarded.violations == []
+    assert guarded.float_dtypes == {F32}, guarded.float_dtypes
+    ops = _fp64_warnings(record)
+    assert ops, "no reduced-precision warning"
+    assert sorted(ops) == sorted(set(ops)), f"warned more than once per op: {ops}"
+
+
+def test_fp64_warning_names_the_op_and_the_way_out(guarded, monkeypatch):
+    _set_backend(monkeypatch, "nki")
+    a = torch.randn(6, 5, dtype=_F64)
+    b = torch.randn(5, 4, dtype=_F64)
+    with pytest.warns(UserWarning, match=r'trntensor matmul: .*set_backend\("auto"\)'):
+        trntensor.einsum("ij,jk->ik", a, b)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # a second call must not warn again
+        trntensor.einsum("ij,jk->ik", a, b)
+
+
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+@pytest.mark.parametrize("name,env,fn", KERNEL_CALLS, ids=_KERNEL_IDS)
+def test_fp64_require_nki_raises(guarded, monkeypatch, name, env, fn, backend):
+    """``TRNTENSOR_REQUIRE_NKI=1``: float64 on a kernel route raises, before
+    any cast or kernel launch, under explicit ``"nki"`` and ``"auto"``."""
+    _with_env(monkeypatch, env)
+    _require_nki(monkeypatch)
+    _set_backend(monkeypatch, backend)
+    with pytest.raises(NotImplementedError, match="float64|TRNTENSOR_REQUIRE_NKI"):
+        fn(_F64, torch.Generator().manual_seed(0))
+    assert guarded.calls == []
+
+
+# Mixed-dtype operands of the chemistry calls: (first operand dtype, the rest).
+def _mp2_mixed(a, b):
+    def run(_dt, g):
+        B = _mk((3, 5, 7), a, g)
+        eo = (-(torch.rand(3, generator=g)) - 1).to(b)
+        ev = (torch.rand(5, generator=g) + 1).to(b)
+        return trntensor.mp2_energy(B, eo, ev)
+
+    return run
+
+
+def _ao2mo_mixed(a, b, packed=False):
+    def run(_dt, g):
+        eri = _sym(_mk((6, 6, 5), a, g))
+        co, cv = _mk((6, 2), b, g), _mk((6, 3), b, g)
+        return trntensor.ao_to_mo_transform(trntensor.pack_tril(eri) if packed else eri, co, cv)
+
+    return run
+
+
+def _dfk_mixed(a, b):
+    def run(_dt, g):
+        eri = _sym(_mk((5, 5, 4), a, g))
+        return trntensor.df_exchange(trntensor.pack_tril(eri), _mk((5, 2), b, g))
+
+    return run
+
+
+def _dfj_mixed(a, b):
+    def run(_dt, g):
+        eri = _sym(_mk((23, 23, 3), a, g))
+        D = _mk((23, 23), b, g)
+        return trntensor.df_coulomb(trntensor.pack_tril(eri), D + D.T)
+
+    return run
+
+
+def _matmul_mixed(a, b):
+    def run(_dt, g):
+        return trntensor.einsum("ij,jk->ik", _mk((6, 5), a, g), _mk((5, 4), b, g))
+
+    return run
+
+
+_MIXED_PAIRS = [(F32, _F64), (_F64, F32), (BF16, F32), (F16, _F64), (BF16, F16), (F16, F32)]
+_MIXED_CALLS = [
+    ("mp2-rows", {"TRNTENSOR_MP2_ENERGY": "rows"}, _mp2_mixed),
+    ("ao2mo-trn2", {"TRNTENSOR_AO_TO_MO": "trn2"}, _ao2mo_mixed),
+    ("ao2mo-trn2-packed", {"TRNTENSOR_AO_TO_MO": "trn2"}, lambda a, b: _ao2mo_mixed(a, b, True)),
+    ("df_exchange", {"TRNTENSOR_DF_EXCHANGE": "trn2"}, _dfk_mixed),
+    ("df_coulomb", {"TRNTENSOR_DF_COULOMB": "trn2"}, _dfj_mixed),
+    ("einsum-matmul", {}, _matmul_mixed),
+]
+
+
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+@pytest.mark.parametrize("pair", _MIXED_PAIRS, ids=lambda p: f"{p[0]}-{p[1]}")
+@pytest.mark.parametrize("name,env,make", _MIXED_CALLS, ids=[c[0] for c in _MIXED_CALLS])
+def test_mixed_dtype_result_matches_pytorch_backend(
+    guarded, monkeypatch, name, env, make, pair, backend
+):
+    """The result dtype is the pytorch backend's (its promotion of the operand
+    dtypes), and no kernel sees a dtype it does not take."""
+    _with_env(monkeypatch, env)
+    fn = make(*pair)
+    ref, ref_err = _reference(monkeypatch, fn, None)
+    _set_backend(monkeypatch, backend)
+    out, err = _run(fn, None)
+    assert guarded.violations == [], guarded.violations
+    if ref_err is not None:
+        # The pytorch backend rejects the mix (aten einsum needs one dtype);
+        # the kernel routes cast per operand, so there is no dtype to compare.
+        return
+    assert err is None, err
+    want = [t.dtype for t in _leaves(ref)]
+    assert [t.dtype for t in _leaves(out)] == want
+    if backend == "auto" and _F64 in want:
+        assert guarded.calls == []  # a float64 result under "auto": torch
 
 
 # ── Reduce-parallel all-reduce (nki.collectives) ─────────────────────────────

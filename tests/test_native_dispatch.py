@@ -154,6 +154,14 @@ def native_host(monkeypatch):
     yield calls
 
 
+def _explicit_nki_no_require(monkeypatch):
+    """``native_host`` without TRNTENSOR_REQUIRE_NKI: float64 under explicit
+    NKI runs the fp32 kernel (with a one-time warning) instead of raising."""
+    monkeypatch.delenv("TRNTENSOR_REQUIRE_NKI", raising=False)
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+    monkeypatch.setattr(dispatch, "_fp64_warned", set())
+
+
 def _install_ops(monkeypatch, calls, **impls):
     def wrap(name, fn):
         def op(*args, **kwargs):
@@ -545,8 +553,10 @@ class TestPublicApiOnNativePath:
         assert [c[0] for c in native_host] == ["df_coulomb_d", "df_coulomb_j"]
 
     def test_df_coulomb_float64_runs_the_kernels_in_fp32(self, native_host, monkeypatch):
-        """A float64 B reached the fp32 kernels as is (inf on Trn2); it is now
-        computed in fp32 and J comes back float64, as on the aten path."""
+        """A float64 B reached the fp32 kernels as is (inf on Trn2); under
+        explicit NKI it is now computed in fp32 and J comes back float64, as
+        on the aten path. (Under TRNTENSOR_REQUIRE_NKI=1 it raises, #92.)"""
+        _explicit_nki_no_require(monkeypatch)
 
         def d_op(B, pw):
             assert B.dtype == pw.dtype == torch.float32
@@ -565,7 +575,8 @@ class TestPublicApiOnNativePath:
         eri = 0.5 * (eri + eri.transpose(0, 1))
         D = torch.randn(40, 40, generator=g, dtype=torch.float64)
         D = D + D.T
-        J = trntensor.df_coulomb(trntensor.pack_tril(eri), D)
+        with pytest.warns(UserWarning, match="fp32 accuracy"):
+            J = trntensor.df_coulomb(trntensor.pack_tril(eri), D)
         ref = torch.einsum("mnP,P->mn", eri, torch.einsum("lsP,ls->P", eri, D))
         assert J.dtype == torch.float64
         torch.testing.assert_close(J, ref, atol=1e-3, rtol=1e-4)
@@ -720,6 +731,8 @@ class TestPublicApiOnNativePath:
                 out[0, d] = (T * (2 * T - T.T) / denom).sum()
             return out
 
+        if dtype == torch.float64:
+            _explicit_nki_no_require(monkeypatch)  # REQUIRE_NKI refuses float64 (#92)
         _install_ops(monkeypatch, native_host, mp2_energy_row=row)
         g = torch.Generator().manual_seed(2)
         B = (torch.randn(4, 6, 8, generator=g) * 0.1).to(dtype)
@@ -727,6 +740,7 @@ class TestPublicApiOnNativePath:
         eps_vir = (torch.rand(6, generator=g) + 0.1).to(dtype)
         e = trntensor.mp2_energy(B, eps_occ, eps_vir)
         assert e.dtype == dtype
+        assert [c[0] for c in native_host] == ["mp2_energy_row"] * 4
         ref = _cpu_mp2_energy(B.double(), eps_occ.double(), eps_vir.double())
         tol = 2e-2 if dtype == torch.bfloat16 else 1e-5
         torch.testing.assert_close(e.double(), ref, atol=tol, rtol=tol)
@@ -1542,14 +1556,26 @@ class TestLazyRegistration:
 
 
 class TestKernelRoutesTakeFp32:
-    """float64 operands reach the fp32 chemistry kernels as float32 and the
-    result comes back float64 (#87: inf on Trn2 through 0.22.0)."""
+    """Under explicit ``set_backend("nki")``, float64 operands reach the fp32
+    chemistry kernels as float32 and the result comes back float64 (#87: inf
+    on Trn2 through 0.22.0). Under ``TRNTENSOR_REQUIRE_NKI=1`` they raise
+    instead (the fp64 policy, #92); ``tests/test_kernel_dtype_guard.py``
+    covers that and ``"auto"``."""
 
-    @staticmethod
-    def _fp32_only(fn):
+    @pytest.fixture(autouse=True)
+    def _explicit_nki(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.delenv("TRNTENSOR_REQUIRE_NKI", raising=False)
+        monkeypatch.delenv("TRNTENSOR_FORCE_BACKEND", raising=False)
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+        monkeypatch.setattr(dispatch, "_fp64_warned", set())
+        self.calls = 0
+
+    def _fp32_only(self, fn):
         def wrapped(*ts):
             for t in ts:
                 assert t.dtype == torch.float32, t.dtype
+            self.calls += 1
             return fn(*ts)
 
         return wrapped
@@ -1558,7 +1584,6 @@ class TestKernelRoutesTakeFp32:
     def test_ao_to_mo_transform(self, monkeypatch, packed):
         import trntensor.quantum as q
 
-        monkeypatch.setenv("TRNTENSOR_REQUIRE_NKI", "1")  # no silent aten fallback
         monkeypatch.setattr(q, "_ao_to_mo_route", lambda *a: "trn2")
 
         def ref(eri, co, cv):
@@ -1574,14 +1599,15 @@ class TestKernelRoutesTakeFp32:
         co = torch.randn(6, 2, generator=g, dtype=torch.float64)
         cv = torch.randn(6, 3, generator=g, dtype=torch.float64)
         inp = trntensor.pack_tril(eri) if packed else eri
-        out = trntensor.ao_to_mo_transform(inp, co, cv)
+        with pytest.warns(UserWarning, match="fp32 accuracy"):
+            out = trntensor.ao_to_mo_transform(inp, co, cv)
+        assert self.calls == 1  # the kernel ran (no silent aten fallback)
         assert out.dtype == torch.float64
         torch.testing.assert_close(
             out, torch.einsum("mi,na,mnP->iaP", co, cv, eri), atol=1e-4, rtol=1e-5
         )
 
     def test_df_exchange(self, monkeypatch):
-        monkeypatch.setenv("TRNTENSOR_REQUIRE_NKI", "1")  # no silent aten fallback
         monkeypatch.setattr(dispatch, "_df_exchange_route", lambda *a: "trn2")
 
         def k(B, co):
@@ -1594,7 +1620,9 @@ class TestKernelRoutesTakeFp32:
         eri = torch.randn(5, 5, 4, generator=g, dtype=torch.float64)
         eri = eri + eri.transpose(0, 1)
         co = torch.randn(5, 2, generator=g, dtype=torch.float64)
-        K = trntensor.df_exchange(trntensor.pack_tril(eri), co, alpha=2.0)
+        with pytest.warns(UserWarning, match="fp32 accuracy"):
+            K = trntensor.df_exchange(trntensor.pack_tril(eri), co, alpha=2.0)
+        assert self.calls == 1
         ref = 2.0 * torch.einsum("lmp,li,knp,ki->mn", eri, co, eri, co)
         assert K.dtype == torch.float64
         torch.testing.assert_close(K, ref, atol=1e-4, rtol=1e-5)

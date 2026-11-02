@@ -7,27 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **float64 follows the trnsci float64 policy (#92, trnsci/trnsci#35).**
+  Trainium computes float64 at fp32 precision, so a float64 operand on a
+  kernel route cannot get float64 accuracy there. This applies to the matmul /
+  batched-matmul kernels (`einsum`, `multi_einsum`) and to the chemistry
+  kernels (`mp2_energy`, `ao_to_mo_transform`, `df_exchange`, `df_coulomb`):
+  - **`"auto"`:** float64 under `auto` now computes in torch at float64
+    accuracy (previously cast to fp32 on the NKI path). For the chemistry
+    kernels the cast came in with #88 and was in 0.23.0. Through 0.22.0
+    float64 reached them unchanged and returned inf. torch runs on the
+    operands' own device; float64 host operands stay on the host.
+  - **Explicit `set_backend("nki")` (or `TRNTENSOR_FORCE_BACKEND=nki`):**
+    float64 is cast to fp32, the kernel runs, and the result comes back as
+    float64. A one-time `UserWarning` per op says the precision is fp32.
+    Through 0.23.0 the chemistry kernels cast without a warning; the matmul
+    kernels got float64 operands unchanged.
+  - **`TRNTENSOR_REQUIRE_NKI=1`:** float64 on a kernel route raises
+    `NotImplementedError` (trnblas#69's convention), under explicit `"nki"`
+    and `"auto"` alike. **Callers who ran float64 chemistry inputs under
+    `TRNTENSOR_REQUIRE_NKI=1` (0.23.0: the kernel ran in fp32) now get an
+    error.** Pass float32 operands to run the kernels, or unset the variable.
+  - **Result dtype:** always the pytorch backend's dtype for the same inputs,
+    including bf16 / fp16 and mixed-dtype promotion (`torch.promote_types`
+    of the operands).
+
+  Affected versions: the old behaviour is 0.23.0 for the chemistry kernels
+  (the silent fp32 cast) and 0.23.0 and earlier for the matmul kernels
+  (float64 unchanged). The new behaviour lands in the next release (0.24.0).
+  Docs: "Precision and dtypes" in `docs/api/nki.md`.
+  `tests/test_conformance.py` now holds float64 to the float64 tolerance
+  for host inputs under `--backend auto`, as under `pytorch`.
+
 ### Fixed
 
 - **One dtype guard at the NKI kernel boundary: float64, integer, bool and
   complex operands no longer reach a kernel that does not take them**
   (silent, trnsci/trnsci#35; the class of #87). `nki.dispatch` now has a
-  per-kernel operand-dtype table (`KERNEL_OPERAND_DTYPES`), and every launch
-  (native op, XLA call, simulator, the `mp2_energy` row loop, the
-  reduce-parallel all-reduce) checks it and raises `TypeError` otherwise; a
-  native op without an entry cannot be loaded. The host wrappers decide first:
+  per-kernel operand-dtype table (`KERNEL_OPERAND_DTYPES`). Every launch
+  checks it and raises `TypeError` if a dtype is not listed: the native op,
+  the XLA call, the simulator, the `mp2_energy` row loop and the
+  reduce-parallel all-reduce. A native op without an entry cannot be loaded.
+  The host wrappers decide first:
   - `einsum` / `multi_einsum` (matmul and batched-matmul kernels; fp32, bf16,
-    fp16, one shared dtype): float64, integer, bool, complex and mixed dtypes
-    run torch, as the pytorch backend does. Through 0.22.0 they reached the
-    kernels under `set_backend("nki")`, or `"auto"` above the size thresholds.
+    fp16, one shared dtype): integer, bool, complex and mixed dtypes run
+    torch, as the pytorch backend does; float64 follows the policy above.
+    Through 0.23.0 they reached the kernels under `set_backend("nki")`, or
+    under `"auto"` above the size thresholds.
   - `mp2_energy`, `ao_to_mo_transform` (fp32 / bf16 kernels) and
-    `df_exchange`, `df_coulomb` (fp32 kernels): float64 (#88), float16 and,
-    for `df_*`, bfloat16 operands are computed in fp32 and returned in the
-    aten route's dtype; integer, bool and complex take aten. bf16 `df_coulomb`
-    on the kernel route raised in the host tail whenever `npair` was not a
-    multiple of 256, and fell back to aten.
+    `df_exchange`, `df_coulomb` (fp32 kernels): float16 operands, and
+    bfloat16 operands of `df_*`, are computed in fp32 (a lossless upcast).
+    The result is returned in the aten route's dtype. float64 follows the
+    policy above. Integer, bool and complex operands take aten. On the kernel
+    route, bf16 `df_coulomb` raised in the host tail whenever `npair` was not
+    a multiple of 256, then fell back to aten. Re-allowing bf16 on the `df_*`
+    kernels waits on a Trn2 bf16 run (#92).
   - reduce-parallel all-reduce: partials other than fp32 / bf16 / fp16 are
     summed by `torch.distributed` instead of the NKI collective kernel.
+    float64 partials are summed there at full precision.
   - Under `TRNTENSOR_REQUIRE_NKI=1`, a dtype that would run torch instead of
     the kernel raises `NotImplementedError` (trnblas's convention).
   The `df_half_packed` op's fake (meta) output is now float32, like the

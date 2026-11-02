@@ -653,16 +653,18 @@ def _get_dispatch_path() -> str:
 # ── Kernel operand dtypes: one guard at the kernel boundary ──────────────────
 #
 # Trainium has no fp64 datapath and the trntensor kernels are written for
-# fp32 (bf16 / fp16 where listed). Through 0.22.0 float64 (and integer, bool,
-# complex) tensors could reach them unchanged and come back inf, garbage or
+# fp32 (bf16 / fp16 where listed). Through 0.23.0 float64 (and integer, bool,
+# complex) tensors could reach them unchanged (float64 chemistry: through
+# 0.22.0, then cast by #88) and come back inf, garbage or
 # in the wrong dtype (#87, the same class as trnblas#68, trnfft#109/#131,
 # trnsolver#83, trnsparse#78/#79). Two layers close it:
 #
 # - The host wrappers decide per dtype before any launch: the matmul family
 #   runs torch for a dtype the kernel does not take
-#   (:func:`_matmul_kernel_dtypes_ok`); the chemistry routes compute float64 /
-#   float16 in fp32 and cast the result back, and take aten for integer,
-#   bool and complex operands (:func:`_chem_kernel_operands`). Under
+#   (:func:`_matmul_kernel_dtypes_ok`); the chemistry routes compute float16
+#   (and bf16 on the df_* kernels) in fp32 and cast the result back, and take
+#   aten for integer, bool and complex operands (:func:`_chem_kernel_operands`).
+#   float64 follows the suite fp64 policy (:func:`_fp64_to_kernel`). Under
 #   ``TRNTENSOR_REQUIRE_NKI=1`` a dtype that would take torch instead of the
 #   kernel raises ``NotImplementedError`` (:func:`_no_kernel_for_dtype`).
 # - Every launch (native op, XLA call, simulator) checks its operands against
@@ -739,6 +741,58 @@ def _no_kernel_for_dtype(what: str, allowed, *tensors: torch.Tensor) -> None:
         )
 
 
+# ── float64 at a kernel entry: the suite policy (#92, trnsci/trnsci#35) ─────
+#
+# Trainium computes float64 at fp32 precision, so a float64 operand on the
+# kernel route cannot get float64 accuracy there:
+# - ``"auto"``: torch on the operands' device (the pytorch backend's
+#   computation), at float64 accuracy on the host;
+# - explicit ``set_backend("nki")`` / ``TRNTENSOR_FORCE_BACKEND=nki``: cast to
+#   fp32, run the kernel, warn once per op (UserWarning), and return the dtype
+#   the pytorch backend returns;
+# - ``TRNTENSOR_REQUIRE_NKI=1``: ``NotImplementedError`` (takes precedence).
+_fp64_warned: set[str] = set()
+
+FP64_REDUCED_PRECISION_MESSAGE = (
+    "trntensor {what}: float64 operands are computed by the NKI kernel in fp32 "
+    '(Trainium has no fp64 datapath) because set_backend("nki") was requested; '
+    "the result is returned as {out} but has fp32 accuracy. Use "
+    'set_backend("auto") to compute float64 in torch at float64 accuracy. '
+    "This warning is shown once per op per process."
+)
+
+
+def _has_fp64(*tensors: torch.Tensor) -> bool:
+    return any(t.dtype == torch.float64 for t in tensors)
+
+
+def _fp64_to_kernel(what: str, *tensors: torch.Tensor) -> bool:
+    """Decide a float64 operand set at a kernel entry (the fp64 policy above).
+
+    Returns True when the caller should cast to fp32 and run the kernel
+    (explicit NKI; warns once per ``what``), False when it should run torch
+    (``"auto"``). Raises ``NotImplementedError`` under
+    ``TRNTENSOR_REQUIRE_NKI=1``, before any cast.
+    """
+    if _require_nki_now():
+        raise NotImplementedError(
+            f"trntensor {what}: float64 operands would run the NKI kernel at fp32 "
+            "precision (Trainium has no fp64 datapath), and TRNTENSOR_REQUIRE_NKI=1 "
+            "does not allow that downcast. Pass float32 operands to run the kernel, "
+            "or unset TRNTENSOR_REQUIRE_NKI to compute float64 in torch."
+        )
+    if not _nki_forced():
+        return False
+    if what not in _fp64_warned:
+        _fp64_warned.add(what)
+        warnings.warn(
+            FP64_REDUCED_PRECISION_MESSAGE.format(what=what, out="float64"),
+            UserWarning,
+            stacklevel=3,
+        )
+    return True
+
+
 def _matmul_kernel_dtypes_ok(*tensors: torch.Tensor) -> bool:
     """True when the matmul / batched-matmul kernels take these operands
     (one shared fp32 / bf16 / fp16 dtype). Otherwise the wrapper runs torch:
@@ -753,17 +807,22 @@ def _chem_kernel_operands(
 ) -> tuple | None:
     """Operands for the chemistry kernels, or None to take aten.
 
-    Real floating dtypes outside ``allowed`` (float64, float16; bf16 for the
-    fp32-only df_* kernels) are computed in fp32, and the caller casts the
-    result back to the aten route's dtype (#87/#88 for float64; the others
-    are a lossless upcast). Strides are kept (``preserve_format``) so layout detection still
-    sees the caller's layout. Integer, bool and complex operands take aten
-    (the pytorch backend's computation); under ``TRNTENSOR_REQUIRE_NKI=1``
-    they raise ``NotImplementedError``.
+    float64 follows the fp64 policy (:func:`_fp64_to_kernel`): aten under
+    ``"auto"``, fp32 kernel with a one-time warning under explicit NKI,
+    ``NotImplementedError`` under ``TRNTENSOR_REQUIRE_NKI=1``. Other real
+    floating dtypes outside ``allowed`` (float16; bf16 for the fp32-only df_*
+    kernels) are computed in fp32 (a lossless upcast). The caller casts the
+    result back to the aten route's dtype. Strides are kept
+    (``preserve_format``) so layout detection still sees the caller's layout.
+    Integer, bool and complex operands take aten (the pytorch backend's
+    computation); under ``TRNTENSOR_REQUIRE_NKI=1`` they raise
+    ``NotImplementedError``.
     """
     if not all(t.dtype.is_floating_point for t in tensors):
         _no_kernel_for_dtype(what, allowed, *tensors)
         return None
+    if _has_fp64(*tensors) and not _fp64_to_kernel(what, *tensors):
+        return None  # "auto": aten at float64 accuracy
     return tuple(t if t.dtype in allowed else t.to(torch.float32) for t in tensors)
 
 
@@ -1114,8 +1173,11 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
         return _stochastic_round_cpu(result, A.dtype) if use_sr else result
 
     if not _matmul_kernel_dtypes_ok(A, B):
-        # float64 / integer / bool / complex / mixed: torch, as the pytorch
-        # backend (float64 reached the fp32 kernel through 0.22.0).
+        if A.dtype == B.dtype == torch.float64 and _fp64_to_kernel("matmul", A, B):
+            # Explicit NKI: the fp32 kernel, result in float64 (the fp64 policy).
+            return nki_matmul(A.float(), B.float(), use_sr=use_sr).to(torch.float64)
+        # float64 under "auto" / integer / bool / complex / mixed: torch, as
+        # the pytorch backend (float64 reached the fp32 kernel through 0.23.0).
         _no_kernel_for_dtype("matmul", _MATMUL_DTYPES, A, B)
         result = torch.matmul(A, B)
         return _stochastic_round_cpu(result, A.dtype) if use_sr else result
@@ -1974,6 +2036,8 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
         return torch.bmm(A, B)
 
     if not _matmul_kernel_dtypes_ok(A, B):
+        if A.dtype == B.dtype == torch.float64 and _fp64_to_kernel("batched_matmul", A, B):
+            return nki_batched_matmul(A.float(), B.float(), use_sr=use_sr).to(torch.float64)
         _no_kernel_for_dtype("batched_matmul", _MATMUL_DTYPES, A, B)
         return torch.bmm(A, B)
 

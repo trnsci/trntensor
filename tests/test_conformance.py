@@ -27,8 +27,13 @@ Device (Trn2), the same cases against the same references::
     pytest tests/test_conformance.py --backend auto --conformance-device neuron
     pytest tests/test_conformance.py --backend nki      # host inputs
 
-Off the pytorch backend or the host, float tolerances widen to the fp32-ish
-device level and the fp64 gradchecks are skipped.
+Off the pytorch backend or the host, float32 tolerances widen to the
+fp32-ish device level. float64 follows the suite fp64 policy (#92): under
+``--backend auto`` it computes in torch at float64 accuracy, so host inputs
+keep the float64 tolerances (and the fp64 gradchecks run); only under
+``--backend nki`` (fp32 kernel, one-time warning) or on the device (no fp64
+datapath) does float64 widen to the fp32-ish level. trntensor has no complex
+kernels, so complex128 on host inputs keeps its tolerance on every backend.
 """
 
 from __future__ import annotations
@@ -69,6 +74,13 @@ def _strict():
     return BACKEND == "pytorch" and DEV.type == "cpu"
 
 
+def _fp64_exact():
+    """float64 computes at float64 accuracy: host inputs under the pytorch
+    backend or ``"auto"`` (which routes float64 to torch, #92). Explicit
+    ``"nki"`` casts float64 to the fp32 kernels; the device has no fp64."""
+    return DEV.type == "cpu" and BACKEND in ("pytorch", "auto")
+
+
 def d(t):
     """Move an input to the conformance device (no-op on CPU)."""
     if isinstance(t, torch.Tensor) and DEV.type != "cpu":
@@ -87,8 +99,10 @@ def tol_for(dtype):
         return 1e-2
     if dtype in (torch.float32, torch.complex64):
         return 2e-5 if _strict() else 2e-3
-    if dtype in (torch.float64, torch.complex128):
-        return 1e-11 if _strict() else 2e-6
+    if dtype == torch.complex128:  # no complex kernels: torch on every backend
+        return 1e-11 if DEV.type == "cpu" else 2e-6
+    if dtype == torch.float64:
+        return 1e-11 if _fp64_exact() else 2e-6
     return 0.0  # integers: exact
 
 
@@ -412,7 +426,7 @@ def _exact_matmul(A, B):
 )
 def test_forward_error_bound_holds(dtype, mode, K):
     _skip_dd_on_trainium(mode)
-    if not _strict() and mode == "fast":
+    if mode == "fast" and not (_strict() or (dtype == torch.float64 and _fp64_exact())):
         pytest.skip("device fast mode accumulates in PSUM fp32; bound is for host order")
     gen = torch.Generator().manual_seed(K)
     A = torch.randn(9, K, generator=gen).to(dtype)
@@ -656,8 +670,8 @@ def test_results_do_not_alias_across_calls():
 
 
 def _gradcheck(fn, inputs, gg=True):
-    if not _strict():
-        pytest.skip("fp64 gradcheck runs on the host pytorch backend only")
+    if not _fp64_exact():
+        pytest.skip("fp64 gradcheck runs on host inputs under the pytorch / auto backends only")
     ins = [x.detach().clone().requires_grad_(True) for x in inputs]
     kw = {"eps": 1e-6, "atol": 1e-5, "rtol": 1e-4}
     assert torch.autograd.gradcheck(fn, ins, **kw)
@@ -697,7 +711,7 @@ def test_grad_matches_torch_einsum(sub, shapes):
     (out * d(w)).sum().backward()
     (-1.5 * torch.einsum(sub, *b) * w).sum().backward()
     for x, y in zip(a, b, strict=True):
-        assert_ref(x.grad, y.grad, tol=1e-9 if _strict() else 2e-6)
+        assert_ref(x.grad, y.grad, tol=1e-9 if _fp64_exact() else 2e-6)
 
 
 def test_gradcheck_alpha_beta_out():
