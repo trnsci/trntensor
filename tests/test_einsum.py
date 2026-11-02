@@ -1,5 +1,7 @@
 """Test einsum and contraction planning."""
 
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -925,6 +927,37 @@ def _host_dd(mode, monkeypatch):
         import trntensor.nki.dispatch as _nd
 
         monkeypatch.setattr(_nd, "HAS_NKI", False)
+
+
+class TestKahanIntegerOffFp64Devices:
+    """On a device without exact native integer matmul (the neuron device
+    computes it in fp32) kahan contracts integers on the host (#90)."""
+
+    def test_integer_operands_route_to_host(self, monkeypatch):
+        E = sys.modules["trntensor.einsum"]
+
+        calls = []
+        real = E._host_int_einsum
+
+        def spy(subscripts, operands):
+            calls.append(subscripts)
+            return real(subscripts, operands)
+
+        monkeypatch.setattr(E, "_FP64_DEVICE_TYPES", ("cuda",))  # CPU stands in for neuron
+        monkeypatch.setattr(E, "_host_int_einsum", spy)
+        a = torch.tensor([[2**24 + 1, 2]], dtype=torch.int32)
+        b = torch.tensor([[1], [1]], dtype=torch.int32)
+        got = trntensor.einsum("ij,jk->ik", a, b, precision="kahan")
+        assert calls == ["ij,jk->ik"]
+        assert got.dtype == torch.int32 and got.item() == 2**24 + 3
+
+    def test_integer_operands_on_cpu_stay_native(self, monkeypatch):
+        E = sys.modules["trntensor.einsum"]
+
+        monkeypatch.setattr(E, "_host_int_einsum", lambda *a: pytest.fail("host detour on CPU"))
+        a = torch.tensor([[2**53 + 1, 2]], dtype=torch.int64)
+        b = torch.tensor([[1], [1]], dtype=torch.int64)
+        assert trntensor.einsum("ij,jk->ik", a, b, precision="kahan").item() == 2**53 + 3
 
 
 class TestPrecisionModesNonRealDtypes:
