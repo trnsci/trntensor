@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cp_decompose` works in the input dtype, including float64 and complex
+  (#103).** Affected 0.1.1–0.23.0: the random init and the Khatri-Rao buffer
+  were float32 on the host, so float64 or complex input raised `expected m1
+  and m2 to have the same dtype` on every backend (and a float64 warm start
+  was truncated to float32 inside the Khatri-Rao product). The init, the
+  Khatri-Rao buffer and the weights now follow `tensor.dtype` and
+  `tensor.device`, warm-start factors are cast to them, and complex input
+  uses the conjugated normal equations `(V^H V) A^T = (T_(k) conj(V))^T`.
+  Weights are real (`tensor.real.dtype`). `nonneg=True` with complex input
+  raises `ValueError`. Real float32 results are bit-identical.
+
 - **`einsum(..., out=)` now writes the result into `out` and returns it
   (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
   and never written, so the documented in-place accumulation example
