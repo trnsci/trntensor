@@ -18,9 +18,11 @@ the first launch by ``_get_dispatch_path``.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import math
 import os
+import threading
 import warnings
 
 import numpy as np
@@ -44,6 +46,10 @@ if HAS_NKI:
 # Re-raise kernel exceptions instead of falling back when set. Used by the
 # validation suite to surface silent kernel breakage during iteration.
 _REQUIRE_NKI = os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+# Keep float64 / complex128 that is already on the ``neuron`` device in device
+# aten (fp32 precision) under ``"auto"`` instead of computing it on the host.
+# See ``_fp64_host_guard``.
+_FP64_ON_DEVICE = os.environ.get("TRNTENSOR_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
 
 # Route dispatch through nki.simulate(kernel)(np_args) on CPU instead of
 # XLA → NEFF → hardware. Catches Python-trace-level errors (bad kwargs,
@@ -791,6 +797,184 @@ def _fp64_to_kernel(what: str, *tensors: torch.Tensor) -> bool:
             stacklevel=3,
         )
     return True
+
+
+# ── float64 already on the neuron device (#92, trnsci/trnsci#35) ────────────
+#
+# Under ``"auto"`` float64 runs torch on the operands' device. For operands on
+# the ``neuron`` device that is device aten, and device aten computes float64
+# at fp32 precision (measured on Trn2), so ``"auto"`` would not keep its
+# float64-accuracy promise for device-resident data. Every public entry point
+# that can compute on float64 / complex128 is wrapped in ``_fp64_host_guard``:
+# under ``"auto"``, when an operand is float64 or complex128 on the ``neuron``
+# device, the neuron-resident operands are copied to the host, the call runs
+# there (host float64 already stays in host torch), and the results go back to
+# the operands' device in their float64 / complex128 dtype. One UserWarning per
+# op per process. ``TRNTENSOR_FP64_ON_DEVICE=1`` keeps device aten (fp32
+# precision) for callers who prefer speed. ``TRNTENSOR_REQUIRE_NKI=1`` is not
+# affected: float64 on a kernel route still raises. Explicit ``"nki"`` and
+# ``"pytorch"`` backends are not affected.
+_FP64_HOST_DTYPES = (torch.float64, torch.complex128)
+_fp64_host_warned: set[str] = set()
+_fp64_host_state = threading.local()  # .active: inside a guarded host call
+
+FP64_HOST_MESSAGE = (
+    "trntensor {what}: float64 on the neuron device is computed on the host for "
+    "float64 accuracy (device arithmetic is fp32); pass float32 to stay on device, "
+    "or set TRNTENSOR_FP64_ON_DEVICE=1 to keep device aten at fp32 precision. "
+    "This warning is shown once per op per process."
+)
+
+
+def _fp64_on_device_now() -> bool:
+    return _FP64_ON_DEVICE or os.environ.get("TRNTENSOR_FP64_ON_DEVICE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _auto_backend() -> bool:
+    """True under ``"auto"`` (no ``TRNTENSOR_FORCE_BACKEND=nki|pytorch``)."""
+    forced = os.environ.get("TRNTENSOR_FORCE_BACKEND", "").lower()
+    return forced not in ("nki", "pytorch") and _backend == "auto"
+
+
+def _on_neuron_device(t: torch.Tensor) -> bool:
+    """True when ``t`` lives on the TorchNeuron ``neuron`` device."""
+    return t.device.type == "neuron"
+
+
+def _fp64_to_host(t: torch.Tensor) -> torch.Tensor:
+    return t.to("cpu")
+
+
+def _fp64_to_device(t: torch.Tensor, device) -> torch.Tensor:
+    return t.to(device)
+
+
+def _map_tensors(x, fn):
+    """``x`` with ``fn`` applied to every tensor in it: tensors, tuples (incl.
+    namedtuples), lists, dicts and :class:`~trntensor.parallel.ShardedTensor`."""
+    if isinstance(x, torch.Tensor):
+        return fn(x)
+    if isinstance(x, tuple):
+        items = [_map_tensors(v, fn) for v in x]
+        return type(x)(*items) if hasattr(x, "_fields") else tuple(items)
+    if isinstance(x, list):
+        return [_map_tensors(v, fn) for v in x]
+    if isinstance(x, dict):
+        return {k: _map_tensors(v, fn) for k, v in x.items()}
+    from ..parallel import ShardedTensor
+
+    if isinstance(x, ShardedTensor):
+        return ShardedTensor([_map_tensors(c, fn) for c in x.chunks], x.partition_dim)
+    return x
+
+
+def _tensor_version(t: torch.Tensor) -> int | None:
+    try:
+        return t._version
+    except RuntimeError:  # inference tensors do not track versions
+        return None
+
+
+def _tensors_in(x) -> list[torch.Tensor]:
+    """Every tensor in ``x`` (the structures :func:`_map_tensors` walks)."""
+    found: list[torch.Tensor] = []
+
+    def visit(t):
+        found.append(t)
+        return t
+
+    _map_tensors(x, visit)
+    return found
+
+
+def _fp64_device_operands(args, kwargs) -> list[torch.Tensor]:
+    """The float64 / complex128 tensors on the ``neuron`` device in a call."""
+    return [
+        t
+        for t in _tensors_in((args, kwargs))
+        if t.dtype in _FP64_HOST_DTYPES and _on_neuron_device(t)
+    ]
+
+
+def _fp64_host_wanted(args, kwargs) -> list[torch.Tensor]:
+    if getattr(_fp64_host_state, "active", False):
+        return []
+    if not _auto_backend() or _require_nki_now() or _fp64_on_device_now():
+        return []
+    dt = kwargs.get("dtype")
+    if dt is not None and dt not in _FP64_HOST_DTYPES and dt not in ("float64", "complex128"):
+        return []  # an explicit compute dtype (einsum's dtype=) decides instead
+    return _fp64_device_operands(args, kwargs)
+
+
+def _fp64_host_guard(what: str, results_on_host: bool = False):
+    """Decorate a public entry point with the device-resident float64 host path.
+
+    See the section comment above. ``results_on_host`` is for entry points
+    whose contract already returns host tensors (``multi_einsum``). Operands
+    the call mutates in place (``einsum(out=)``) are copied back into the
+    caller's device tensor, which is returned in place of its host copy.
+    """
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            found = _fp64_host_wanted(args, kwargs)
+            if not found:
+                return fn(*args, **kwargs)
+            device = found[0].device
+            if what not in _fp64_host_warned:
+                _fp64_host_warned.add(what)
+                warnings.warn(FP64_HOST_MESSAGE.format(what=what), UserWarning, stacklevel=2)
+            moved: dict[int, tuple[torch.Tensor, torch.Tensor, int]] = {}
+
+            def to_host(t):
+                if not _on_neuron_device(t):
+                    return t
+                if id(t) not in moved:
+                    h = _fp64_to_host(t)
+                    moved[id(t)] = (t, h, _tensor_version(h))
+                return moved[id(t)][1]
+
+            h_args, h_kwargs = _map_tensors((args, kwargs), to_host)
+            prev = getattr(_fp64_host_state, "active", False)
+            _fp64_host_state.active = True
+            try:
+                out = fn(*h_args, **h_kwargs)
+            finally:
+                _fp64_host_state.active = prev
+            returned = {id(t) for t in _tensors_in(out)}
+            originals = {}
+            for orig, host, version in moved.values():
+                # Written in place by the call (an inference tensor has no
+                # version counter: then only a returned operand counts).
+                now = _tensor_version(host)
+                if (now != version) if version is not None else id(host) in returned:
+                    orig.copy_(host)
+                    originals[id(host)] = orig
+            if results_on_host:
+                return out
+
+            def back(t):
+                if id(t) in originals:
+                    return originals[id(t)]
+                return _fp64_to_device(t, device)
+
+            return _map_tensors(out, back)
+
+        return wrapper
+
+    return deco
+
+
+def _fp64_stays_on_host(*tensors: torch.Tensor) -> bool:
+    """True when host float64 / complex128 must not be uploaded to the device:
+    every backend but explicit NKI computes it in host torch."""
+    return not _nki_forced() and any(t.dtype in _FP64_HOST_DTYPES for t in tensors)
 
 
 def _matmul_kernel_dtypes_ok(*tensors: torch.Tensor) -> bool:

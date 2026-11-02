@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import torch
 
+from .nki.dispatch import _fp64_host_guard
 
+
+@_fp64_host_guard("cp_decompose")
 def cp_decompose(
     tensor: torch.Tensor,
     rank: int,
@@ -103,6 +106,7 @@ def cp_decompose(
     return factors, weights
 
 
+@_fp64_host_guard("cp_reconstruct")
 def cp_reconstruct(factors: list[torch.Tensor], weights: torch.Tensor) -> torch.Tensor:
     """Reconstruct tensor from CP factors: T = Σ_r w_r * a_r ⊗ b_r ⊗ ..."""
     rank = weights.shape[0]
@@ -122,6 +126,7 @@ def cp_reconstruct(factors: list[torch.Tensor], weights: torch.Tensor) -> torch.
     return result
 
 
+@_fp64_host_guard("tucker_decompose")
 def tucker_decompose(
     tensor: torch.Tensor,
     ranks: tuple[int, ...],
@@ -157,6 +162,7 @@ def tucker_decompose(
     return core, factors
 
 
+@_fp64_host_guard("tucker_reconstruct")
 def tucker_reconstruct(core: torch.Tensor, factors: list[torch.Tensor]) -> torch.Tensor:
     """Reconstruct tensor from Tucker decomposition."""
     result = core.clone()
@@ -165,6 +171,7 @@ def tucker_reconstruct(core: torch.Tensor, factors: list[torch.Tensor]) -> torch
     return result
 
 
+@_fp64_host_guard("tt_decompose")
 def tt_decompose(
     tensor: torch.Tensor,
     max_rank: int,
@@ -215,6 +222,7 @@ def tt_decompose(
     return cores
 
 
+@_fp64_host_guard("tt_reconstruct")
 def tt_reconstruct(cores: list[torch.Tensor]) -> torch.Tensor:
     """Reconstruct a tensor from its Tensor Train cores.
 

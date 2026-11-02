@@ -28,17 +28,22 @@ Device (Trn2), the same cases against the same references::
     pytest tests/test_conformance.py --backend nki      # host inputs
 
 Off the pytorch backend or the host, float32 tolerances widen to the
-fp32-ish device level. float64 follows the suite fp64 policy (#92): under
-``--backend auto`` it computes in torch at float64 accuracy, so host inputs
-keep the float64 tolerances (and the fp64 gradchecks run); only under
-``--backend nki`` (fp32 kernel, one-time warning) or on the device (no fp64
-datapath) does float64 widen to the fp32-ish level. trntensor has no complex
-kernels, so complex128 on host inputs keeps its tolerance on every backend.
+fp32-ish device level. float64 and complex128 follow the suite fp64 policy
+(#92): under ``--backend auto`` they compute in torch at float64 accuracy,
+and inputs already on the ``neuron`` device are computed on the host (the
+device computes float64 at fp32 precision), so both host and device inputs
+keep the float64 tolerances under ``auto``. The fp64 gradchecks run on host
+inputs under ``pytorch`` / ``auto``. Only under ``--backend nki`` (fp32 kernel,
+one-time warning), on the device under ``pytorch``, or with
+``TRNTENSOR_FP64_ON_DEVICE=1`` (device aten kept) does float64 widen to the
+fp32-ish level. trntensor has no complex kernels, so complex128 on host inputs
+keeps its tolerance on every backend.
 """
 
 from __future__ import annotations
 
 import itertools
+import os
 import random
 import warnings
 
@@ -74,10 +79,27 @@ def _strict():
     return BACKEND == "pytorch" and DEV.type == "cpu"
 
 
+def _fp64_on_device_kept():
+    return os.environ.get("TRNTENSOR_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
+
+
+def _fp64_auto_host():
+    """``"auto"`` computes float64 / complex128 at float64 accuracy wherever the
+    inputs live: host inputs in host torch, ``neuron``-resident inputs on the
+    host and back (#92), unless ``TRNTENSOR_FP64_ON_DEVICE=1`` keeps device
+    aten."""
+    return BACKEND == "auto" and (DEV.type == "cpu" or not _fp64_on_device_kept())
+
+
 def _fp64_exact():
     """float64 computes at float64 accuracy: host inputs under the pytorch
-    backend or ``"auto"`` (which routes float64 to torch, #92). Explicit
-    ``"nki"`` casts float64 to the fp32 kernels; the device has no fp64."""
+    backend, or ``"auto"`` (:func:`_fp64_auto_host`). Explicit ``"nki"`` casts
+    float64 to the fp32 kernels; device aten computes float64 in fp32."""
+    return (DEV.type == "cpu" and BACKEND == "pytorch") or _fp64_auto_host()
+
+
+def _fp64_gradcheck_ok():
+    """fp64 gradchecks: host inputs under the pytorch / auto backends."""
     return DEV.type == "cpu" and BACKEND in ("pytorch", "auto")
 
 
@@ -100,7 +122,7 @@ def tol_for(dtype):
     if dtype in (torch.float32, torch.complex64):
         return 2e-5 if _strict() else 2e-3
     if dtype == torch.complex128:  # no complex kernels: torch on every backend
-        return 1e-11 if DEV.type == "cpu" else 2e-6
+        return 1e-11 if DEV.type == "cpu" or _fp64_auto_host() else 2e-6
     if dtype == torch.float64:
         return 1e-11 if _fp64_exact() else 2e-6
     return 0.0  # integers: exact
@@ -669,7 +691,7 @@ def test_results_do_not_alias_across_calls():
 
 
 def _gradcheck(fn, inputs, gg=True):
-    if not _fp64_exact():
+    if not _fp64_gradcheck_ok():
         pytest.skip("fp64 gradcheck runs on host inputs under the pytorch / auto backends only")
     ins = [x.detach().clone().requires_grad_(True) for x in inputs]
     kw = {"eps": 1e-6, "atol": 1e-5, "rtol": 1e-4}

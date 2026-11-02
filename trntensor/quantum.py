@@ -16,9 +16,10 @@ from __future__ import annotations
 import torch
 
 from .nki import dispatch as _dispatch
-from .nki.dispatch import _ao_to_mo_route, _mp2_energy_route
+from .nki.dispatch import _ao_to_mo_route, _fp64_host_guard, _mp2_energy_route
 
 
+@_fp64_host_guard("mp2_energy")
 def mp2_energy(
     B: torch.Tensor,
     eps_occ: torch.Tensor,
@@ -214,6 +215,7 @@ def _as_packed_rows(eri: torch.Tensor, nbasis: int) -> torch.Tensor:
     )
 
 
+@_fp64_host_guard("ao_to_mo_transform")
 def ao_to_mo_transform(
     eri: torch.Tensor,
     C_occ: torch.Tensor,
@@ -429,6 +431,7 @@ def _ao_to_mo_contiguous_lhs(
 _DF_K_GATHER_BYTES = 1 << 30
 
 
+@_fp64_host_guard("df_exchange")
 def df_exchange(
     B: torch.Tensor,
     C_occ: torch.Tensor,
@@ -529,6 +532,7 @@ def _aten_df_exchange(B: torch.Tensor, C_occ: torch.Tensor, alpha: float) -> tor
     return torch.matmul(Xm, Xm.T) * alpha if alpha != 1.0 else torch.matmul(Xm, Xm.T)
 
 
+@_fp64_host_guard("df_coulomb")
 def df_coulomb(B: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
     """Density-fitted Coulomb matrix from packed three-centre integrals.
 

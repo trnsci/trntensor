@@ -20,7 +20,10 @@ float64 follows the suite fp64 policy (#92, trnsci/trnsci#35): under
 explicit ``set_backend("nki")`` the kernel runs on fp32 operands with one
 ``UserWarning`` per op per process; under ``TRNTENSOR_REQUIRE_NKI=1`` it raises
 ``NotImplementedError``. The result dtype is always the pytorch backend's,
-including mixed-dtype promotion.
+including mixed-dtype promotion. float64 / complex128 already on the
+``neuron`` device is computed on the host under ``"auto"`` and returned on the
+device (device aten computes float64 at fp32 precision), unless
+``TRNTENSOR_FP64_ON_DEVICE=1``; see the last section.
 """
 
 import sys
@@ -158,10 +161,17 @@ def guarded(monkeypatch):
     monkeypatch.setattr(dispatch, "_to_xla", no_xla)
     for kname in _RAW_KERNELS:
         monkeypatch.setattr(_kernels, kname, no_raw_kernel, raising=False)
-    for var in ("TRNTENSOR_FORCE_BACKEND", "TRNTENSOR_REQUIRE_NKI", "TRNSCI_NKI_DISPATCH"):
+    for var in (
+        "TRNTENSOR_FORCE_BACKEND",
+        "TRNTENSOR_REQUIRE_NKI",
+        "TRNTENSOR_FP64_ON_DEVICE",
+        "TRNSCI_NKI_DISPATCH",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", False)
     monkeypatch.setattr(dispatch, "_fp64_warned", set())
+    monkeypatch.setattr(dispatch, "_fp64_host_warned", set())
     monkeypatch.setenv("TRNTENSOR_HOST_ROUTE", "host")  # CPU is the "device"
     trntensor.clear_plan_cache()
     with warnings.catch_warnings():
@@ -281,8 +291,8 @@ def _leaves(x):
         return [x]
     if isinstance(x, (list, tuple)):
         return [t for v in x for t in _leaves(v)]
-    if hasattr(x, "shards"):  # ShardedTensor
-        return _leaves(list(x.shards))
+    if isinstance(x, parallel.ShardedTensor):
+        return _leaves(list(x.chunks))
     return []
 
 
@@ -620,3 +630,261 @@ def test_library_table_matches(guarded):
         **KERNEL_TAKES,
         "all_reduce": (COLLECTIVE_TAKES,),
     }
+
+
+# ── float64 already on the neuron device (#92): "auto" computes on the host ──
+#
+# In `guarded` CPU stands in for the neuron device. Here every tensor counts as
+# neuron-resident except the host copies the guard makes (`_fp64_to_host`,
+# tagged `_fake_host`); the return transfer (`_fp64_to_device`) records each
+# tensor and its target device.
+
+
+class _Transfers:
+    def __init__(self):
+        self.to_host: list[torch.dtype] = []
+        self.to_device: list[tuple[int, torch.device]] = []
+        self.aten_on_device = 0
+
+    def back_ids(self):
+        return {i for i, _ in self.to_device}
+
+
+@pytest.fixture
+def on_device(guarded, monkeypatch):
+    tr = _Transfers()
+
+    def to_host(t):
+        tr.to_host.append(t.dtype)
+        h = t.clone()  # differentiable, like the real .to("cpu")
+        h._fake_host = True
+        return h
+
+    def to_device(t, device):
+        tr.to_device.append((id(t), torch.device(device)))
+        return t
+
+    real_aten = dispatch._aten_on_device
+
+    def aten_spy(fn, *ts):
+        tr.aten_on_device += 1
+        return real_aten(fn, *ts)
+
+    monkeypatch.setattr(
+        dispatch, "_on_neuron_device", lambda t: not getattr(t, "_fake_host", False)
+    )
+    monkeypatch.setattr(dispatch, "_fp64_to_host", to_host)
+    monkeypatch.setattr(dispatch, "_fp64_to_device", to_device)
+    monkeypatch.setattr(dispatch, "_aten_on_device", aten_spy)
+    tr.rec = guarded
+    return tr
+
+
+def _host_warnings(record) -> list[str]:
+    """Op names of the device-resident float64 host-path UserWarnings."""
+    ops = []
+    for w in record:
+        msg = str(w.message)
+        if issubclass(w.category, UserWarning) and "computed on the host" in msg:
+            ops.append(msg.split("trntensor ", 1)[1].split(":", 1)[0])
+    return ops
+
+
+def _seeded(fn, dt, seed=0):
+    torch.manual_seed(seed)  # the decompositions draw their initial factors
+    return _run(fn, dt, seed)
+
+
+def _skip_if_pytorch_rejects(monkeypatch, fn, dt):
+    _, err = _reference(monkeypatch, lambda d, g: _seeded_inner(fn, d, g), dt)
+    if err is not None:
+        pytest.skip(f"the pytorch backend rejects these operands too: {err!r}")
+
+
+_HOST_CALLS = [c for c in CALLS if c[0] != "einsum-dd"]  # dd raises with NKI (trnblas#22)
+_HOST_IDS = [c[0] for c in _HOST_CALLS]
+_C128 = torch.complex128
+
+
+@pytest.mark.parametrize("dtype", [_F64, _C128], ids=str)
+@pytest.mark.parametrize("name,env,fn", _HOST_CALLS, ids=_HOST_IDS)
+def test_device_fp64_auto_computes_on_host(on_device, monkeypatch, name, env, fn, dtype):
+    """``"auto"``, float64 / complex128 on the neuron device: the operands go to
+    the host, no kernel or device aten runs, the results come back to the
+    operands' device in float64 / complex128 and match the fp64 CPU reference
+    (the pytorch backend on host inputs) to fp64 tolerance."""
+    _with_env(monkeypatch, env)
+    ref, ref_err = _reference(monkeypatch, lambda dt, g: _seeded_inner(fn, dt, g), dtype)
+    if ref_err is not None:
+        pytest.skip(f"the pytorch backend rejects these operands too: {ref_err!r}")
+    _set_backend(monkeypatch, "auto")
+    out, err = _seeded(fn, dtype)
+    assert err is None, err
+    assert on_device.to_host, "the operands were not copied to the host"
+    assert set(on_device.to_host) <= {_F64, _C128} | set(on_device.to_host)
+    assert on_device.rec.calls == [] and on_device.aten_on_device == 0
+    leaves = _leaves(out)
+    if name != "multi_einsum":  # multi_einsum returns host tensors by contract
+        back = on_device.back_ids()
+        assert all(id(t) in back for t in leaves), "a result did not go back to the device"
+        assert {d for _, d in on_device.to_device} == {torch.device("cpu")}  # the operands' device
+    for got, want in zip(leaves, _leaves(ref), strict=True):
+        assert got.dtype == want.dtype
+        if got.dtype in (_F64, _C128):
+            torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
+
+
+def _seeded_inner(fn, dt, g):
+    torch.manual_seed(0)
+    return fn(dt, g)
+
+
+@pytest.mark.parametrize("name,env,fn", _HOST_CALLS, ids=_HOST_IDS)
+def test_device_fp64_host_warning_fires_once_per_op(on_device, monkeypatch, name, env, fn):
+    _skip_if_pytorch_rejects(monkeypatch, fn, _F64)
+    _with_env(monkeypatch, env)
+    _set_backend(monkeypatch, "auto")
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        for seed in range(3):
+            _, err = _seeded(fn, _F64, seed)
+            assert err is None, err
+    ops = _host_warnings(record)
+    assert len(ops) == 1, ops
+    assert _fp64_warnings(record) == []  # not the explicit-nki fp32 warning
+
+
+def test_device_fp64_host_warning_text(on_device):
+    a, b = torch.randn(6, 5, dtype=_F64), torch.randn(5, 4, dtype=_F64)
+    with pytest.warns(UserWarning) as record:
+        trntensor.einsum("ij,jk->ik", a, b)
+    msg = str(record[0].message)
+    assert msg.startswith("trntensor einsum: float64 on the neuron device is computed on the host")
+    assert (
+        "float64 on the neuron device is computed on the host for float64 accuracy "
+        "(device arithmetic is fp32); pass float32 to stay on device" in msg
+    )
+    assert "TRNTENSOR_FP64_ON_DEVICE=1" in msg
+
+
+@pytest.mark.parametrize("how", ["env", "global"])
+@pytest.mark.parametrize("name,env,fn", _HOST_CALLS, ids=_HOST_IDS)
+def test_device_fp64_on_device_override_keeps_the_device_path(
+    on_device, monkeypatch, name, env, fn, how
+):
+    """``TRNTENSOR_FP64_ON_DEVICE=1``: no host copy, no host-path warning; the
+    call takes its device route (torch on the operands' device)."""
+    _skip_if_pytorch_rejects(monkeypatch, fn, _F64)
+    _with_env(monkeypatch, env)
+    if how == "env":
+        monkeypatch.setenv("TRNTENSOR_FP64_ON_DEVICE", "1")
+    else:
+        monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
+    _set_backend(monkeypatch, "auto")
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        out, err = _seeded(fn, _F64)
+    assert err is None, err
+    assert on_device.to_host == [] and on_device.to_device == []
+    assert _host_warnings(record) == []
+    assert all(t.dtype == _F64 for t in _leaves(out) if t.dtype.is_floating_point)
+
+
+@pytest.mark.parametrize("name,env,fn", KERNEL_CALLS, ids=_KERNEL_IDS)
+def test_device_fp64_require_nki_still_raises(on_device, monkeypatch, name, env, fn):
+    _with_env(monkeypatch, env)
+    _require_nki(monkeypatch)
+    _set_backend(monkeypatch, "auto")
+    with pytest.raises(NotImplementedError, match="float64|TRNTENSOR_REQUIRE_NKI"):
+        fn(_F64, torch.Generator().manual_seed(0))
+    assert on_device.to_host == []
+
+
+@pytest.mark.parametrize("backend", ["nki", "pytorch"])
+@pytest.mark.parametrize("name,env,fn", KERNEL_CALLS, ids=_KERNEL_IDS)
+def test_device_fp64_explicit_backends_unchanged(on_device, monkeypatch, name, env, fn, backend):
+    """Explicit ``"nki"`` (fp32 kernel + its warning) and ``"pytorch"`` (torch on
+    the operands' device) do not take the host path."""
+    _with_env(monkeypatch, env)
+    _set_backend(monkeypatch, backend)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        _, err = _seeded(fn, _F64)
+    assert err is None, err
+    assert on_device.to_host == [] and _host_warnings(record) == []
+    if backend == "nki":
+        assert on_device.rec.calls, "the kernel route did not run"
+
+
+@pytest.mark.parametrize("name,env,fn", _HOST_CALLS, ids=_HOST_IDS)
+def test_host_fp64_auto_unchanged(guarded, monkeypatch, name, env, fn):
+    """Host-resident float64 under ``"auto"``: host torch, no host-path warning,
+    no upload (the default predicate: CPU is not the ``neuron`` device)."""
+    _skip_if_pytorch_rejects(monkeypatch, fn, _F64)
+    _with_env(monkeypatch, env)
+    copies = []
+    monkeypatch.setattr(dispatch, "_fp64_to_host", lambda t: copies.append(t) or t)
+    _set_backend(monkeypatch, "auto")
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        _, err = _seeded(fn, _F64)
+    assert err is None, err
+    assert copies == [] and _host_warnings(record) == []
+
+
+def test_device_fp64_einsum_out_is_written_on_device(on_device):
+    """``einsum(out=)`` on device: the result is written into the caller's
+    device tensor, which is returned (not its host copy)."""
+    g = torch.Generator().manual_seed(0)
+    a = torch.randn(6, 5, generator=g, dtype=_F64)
+    b = torch.randn(5, 4, generator=g, dtype=_F64)
+    out = torch.randn(6, 4, generator=g, dtype=_F64)
+    want = 2.0 * (a @ b) + 0.5 * out
+    got = trntensor.einsum("ij,jk->ik", a, b, alpha=2.0, beta=0.5, out=out)
+    assert got is out
+    torch.testing.assert_close(out, want, rtol=1e-12, atol=1e-12)
+    assert on_device.to_device == []  # the caller's tensor was written, not moved
+
+
+def test_device_fp64_explicit_float32_dtype_stays_on_device(on_device):
+    """``einsum(dtype="f32")`` asks for fp32 compute: no host path."""
+    a, b = torch.randn(6, 5, dtype=_F64), torch.randn(5, 4, dtype=_F64)
+    out = trntensor.einsum("ij,jk->ik", a, b, dtype="f32")
+    assert out.dtype == F32 and on_device.to_host == []
+
+
+def test_device_fp64_mixed_operands_go_to_host(on_device):
+    """One float64 operand on the device is enough: the float32 operand goes
+    with it, and the result is the pytorch backend's float64."""
+    g = torch.Generator().manual_seed(0)
+    B = torch.randn(3, 5, 7, generator=g, dtype=F32)
+    eo = -torch.rand(3, generator=g, dtype=_F64) - 1
+    ev = torch.rand(5, generator=g, dtype=_F64) + 1
+    out = trntensor.mp2_energy(B, eo, ev)
+    assert sorted(map(str, on_device.to_host)) == sorted(map(str, [F32, _F64, _F64]))
+    want = trntensor.quantum._cpu_mp2_energy(B, eo, ev)
+    assert out.dtype == want.dtype == _F64
+    torch.testing.assert_close(out, want, rtol=1e-12, atol=1e-12)
+
+
+def test_device_fp64_autograd_flows_back_to_the_device_operands(on_device):
+    a = torch.randn(6, 5, dtype=_F64, requires_grad=True)
+    b = torch.randn(5, 4, dtype=_F64)
+    trntensor.einsum("ij,jk->ik", a, b).sum().backward()
+    torch.testing.assert_close(a.grad, torch.ones(6, 4, dtype=_F64) @ b.T)
+
+
+def test_multi_einsum_does_not_pin_host_fp64(guarded, monkeypatch):
+    """Host float64 shared operands are not pinned to the device under
+    ``"auto"`` (device aten would compute them at fp32 precision)."""
+    pinned = []
+    monkeypatch.setattr(dispatch, "_to_device", lambda t: pinned.append(t) or t)
+    _set_backend(monkeypatch, "auto")
+    a, b = torch.randn(6, 5, dtype=_F64), torch.randn(5, 4, dtype=_F64)
+    trntensor.multi_einsum(("ij,jk->ik", a, b), ("ij,jk->ik", a, b))
+    assert pinned == []
+    af, bf = a.float(), b.float()
+    trntensor.multi_einsum(("ij,jk->ik", af, bf), ("ij,jk->ik", af, bf), ("ij,jk->ik", a, b))
+    assert pinned == []  # one float64 contraction keeps the batch unpinned
+    trntensor.multi_einsum(("ij,jk->ik", af, bf), ("ij,jk->ik", af, bf))
+    assert len(pinned) == 2  # float32 still pins

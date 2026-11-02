@@ -33,6 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     including bf16 / fp16 and mixed-dtype promotion (`torch.promote_types`
     of the operands).
 
+  - **float64 already on the `neuron` device:** under `"auto"`, "torch on
+    the operands' device" would be device aten, which computes float64 at
+    fp32 precision (measured on Trn2). float64 / complex128 operands on the
+    `neuron` device are now copied to the host, computed in host torch at
+    float64 accuracy, and the result is returned on the original device in
+    float64 / complex128. This covers `einsum`, `multi_einsum` (which returns
+    host tensors, as before), the chemistry calls and the CP / Tucker / TT
+    decompositions and reconstructions. One `UserWarning` per op per process:
+    "float64 on the neuron device is computed on the host for float64
+    accuracy (device arithmetic is fp32); pass float32 to stay on device".
+    **New: `TRNTENSOR_FP64_ON_DEVICE=1`** keeps device aten (fp32 precision,
+    no warning) for callers who prefer speed. Host-resident float64 is
+    unchanged, and `multi_einsum` no longer pins host float64 / complex128
+    operands to the device under `"auto"`; through 0.23.0 shared operands
+    were pinned, so device aten computed them at fp32 precision.
+    `--backend auto --conformance-device neuron` now holds float64 and
+    complex128 to the float64 tolerance.
+
   Affected versions: the old behaviour is 0.23.0 for the chemistry kernels
   (the silent fp32 cast) and 0.23.0 and earlier for the matmul kernels
   (float64 unchanged). The new behaviour lands in the next release (0.24.0).
