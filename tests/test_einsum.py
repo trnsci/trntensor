@@ -1,5 +1,7 @@
 """Test einsum and contraction planning."""
 
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -915,6 +917,107 @@ class TestOutputOrder:
         ins = subscripts.split("->")[0].split(",")
         ops = [torch.randn(*[sizes[c] for c in t]) for t in ins]
         assert trntensor.plan_contraction(subscripts, *ops).strategy == strategy
+
+
+def _host_dd(mode, monkeypatch):
+    """Exercise dd's host (Ozaki/kahan) path on any machine. On a Neuron host
+    (HAS_NKI) precision="dd" raises by design until trnblas#22; that contract
+    is test_dd_nki_still_raises."""
+    if mode == "dd":
+        import trntensor.nki.dispatch as _nd
+
+        monkeypatch.setattr(_nd, "HAS_NKI", False)
+
+
+class TestKahanIntegerOffFp64Devices:
+    """On a device without exact native integer matmul (the neuron device
+    computes it in fp32) kahan contracts integers on the host (#90)."""
+
+    def test_integer_operands_route_to_host(self, monkeypatch):
+        E = sys.modules["trntensor.einsum"]
+
+        calls = []
+        real = E._host_int_einsum
+
+        def spy(subscripts, operands):
+            calls.append(subscripts)
+            return real(subscripts, operands)
+
+        monkeypatch.setattr(E, "_FP64_DEVICE_TYPES", ("cuda",))  # CPU stands in for neuron
+        monkeypatch.setattr(E, "_host_int_einsum", spy)
+        a = torch.tensor([[2**24 + 1, 2]], dtype=torch.int32)
+        b = torch.tensor([[1], [1]], dtype=torch.int32)
+        got = trntensor.einsum("ij,jk->ik", a, b, precision="kahan")
+        assert calls == ["ij,jk->ik"]
+        assert got.dtype == torch.int32 and got.item() == 2**24 + 3
+
+    def test_integer_operands_on_cpu_stay_native(self, monkeypatch):
+        E = sys.modules["trntensor.einsum"]
+
+        monkeypatch.setattr(E, "_host_int_einsum", lambda *a: pytest.fail("host detour on CPU"))
+        a = torch.tensor([[2**53 + 1, 2]], dtype=torch.int64)
+        b = torch.tensor([[1], [1]], dtype=torch.int64)
+        assert trntensor.einsum("ij,jk->ik", a, b, precision="kahan").item() == 2**53 + 3
+
+
+class TestPrecisionModesNonRealDtypes:
+    """precision="kahan"/"dd" and target_forward_error must not drop the
+    imaginary part of complex operands or round integer operands (audit 3)."""
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    @pytest.mark.parametrize(
+        "subscripts,shapes",
+        [
+            ("ij,jk->ik", [(5, 4), (4, 3)]),
+            ("bij,bjk->bik", [(2, 5, 4), (2, 4, 3)]),
+            ("ij,jk,kl->il", [(3, 4), (4, 5), (5, 2)]),
+            ("ii->", [(4, 4)]),
+        ],
+    )
+    @pytest.mark.parametrize("mode", ["kahan", "dd", "target"])
+    def test_complex_keeps_imaginary_part(self, dtype, subscripts, shapes, mode, monkeypatch):
+        _host_dd(mode, monkeypatch)
+        g = torch.Generator().manual_seed(0)
+        ops = [torch.randn(s, generator=g, dtype=dtype) for s in shapes]
+        kw = {"target_forward_error": 1e-12} if mode == "target" else {"precision": mode}
+        got = trntensor.einsum(subscripts, *ops, **kw)
+        ref = torch.einsum(subscripts, *(o.to(torch.complex128) for o in ops)).to(dtype)
+        assert got.dtype == dtype
+        tol = 1e-5 if dtype == torch.complex64 else 1e-12
+        torch.testing.assert_close(got, ref, rtol=tol, atol=tol)
+
+    def test_complex_second_operand_kahan(self):
+        A = torch.randn(3, 4, dtype=torch.float64)
+        B = torch.randn(4, 2, dtype=torch.complex128)
+        got = trntensor.einsum("ij,jk->ik", A, B, precision="kahan")
+        torch.testing.assert_close(got, A.to(torch.complex128) @ B)
+
+    @pytest.mark.parametrize("mode", ["kahan", "dd"])
+    def test_integer_exact(self, mode, monkeypatch):
+        _host_dd(mode, monkeypatch)
+        A = torch.tensor([[2**53 + 1, 2], [2**40 + 3, 1]], dtype=torch.int64)
+        B = torch.tensor([[1, 0], [1, 1]], dtype=torch.int64)
+        got = trntensor.einsum("ij,jk->ik", A, B, precision=mode)
+        assert got.dtype == torch.int64
+        assert torch.equal(got, A @ B)
+        A32 = torch.tensor([[2**24 + 1, 0]], dtype=torch.int32)
+        B32 = torch.tensor([[1], [0]], dtype=torch.int32)
+        assert torch.equal(trntensor.einsum("ij,jk->ik", A32, B32, precision=mode), A32 @ B32)
+
+
+class TestMultiEinsumMixedDtypes:
+    """A homogeneous-shape batch with mixed dtypes must return each result in
+    the dtype ``einsum`` would (audit 3)."""
+
+    def test_mixed_dtype_batch_keeps_each_dtype(self):
+        g = torch.Generator().manual_seed(0)
+        A32, B32 = torch.randn(4, 5, generator=g), torch.randn(5, 6, generator=g)
+        A64, B64 = A32.double() * 2, B32.double()
+        r = trntensor.multi_einsum(("ij,jk->ik", A32, B32), ("ij,jk->ik", A64, B64))
+        assert r[0].dtype == torch.float32
+        assert r[1].dtype == torch.float64
+        torch.testing.assert_close(r[0], A32 @ B32)
+        torch.testing.assert_close(r[1], A64 @ B64)
 
 
 class TestBetaZeroIgnoresOut:

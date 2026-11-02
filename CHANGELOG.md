@@ -56,8 +56,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
+
 ### Fixed
 
+- **`einsum(precision="kahan")` rounded int32 values above 2**24 on the
+  neuron device** (silent, #90). The device computes integer matmul in fp32.
+  Since #70 integer operands contracted natively on any device. They now
+  contract natively only on CPU/CUDA, and on the host for other devices.
+  Unreleased (`main` after #70 only). Found by the conformance suite on Trn2
+  (trnsci/trnsci#35).
+- **NKI chemistry kernels on Trainium: float64 operands gave inf, and kernel
+  routes changed the result dtype** (silent, #87). float64 tensors reached the
+  fp32 kernels as is. `df_coulomb` (≥ 256 packed rows), `ao_to_mo_transform`
+  and `df_exchange` came back inf under `set_backend("nki")`, or under
+  `"auto"` at the sizes where it picks the kernels. float64 operands are now
+  computed in fp32 and returned as float64, the documented fp64-on-Trainium
+  behaviour (`df_*` 0.21.0–0.22.0, `ao_to_mo_transform` every release with
+  its kernels). `mp2_energy` (row and legacy kernels), `ao_to_mo_transform`
+  and `df_exchange` also returned float32 for float64 or bfloat16 callers.
+  They now return the aten route's dtype. `df_exchange` with `naux == 0` (or
+  `nocc == 0`) raised `ZeroDivisionError` in the route's tiling and now takes
+  aten. Found by the conformance suite on Trn2 (trnsci/trnsci#35).
 - **`einsum(precision="dd")` on float32 / float64 operands was less accurate
   than `"fast"`** (silent; 0.17.0 through 0.22.0, the CPU emulation; Trainium
   raises `NotImplementedError`). The CPU route split every operand into two
@@ -72,13 +91,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inf in the buffer (e.g. `torch.empty`) made the result NaN (silent, every
   backend). Affects 0.3.0 through 0.22.0. `beta == 0` now ignores `out`, as
   in BLAS, cuTENSOR and trnblas (#71).
-### Fixed
-
 - **`tucker_decompose` returned a wrong core for complex tensors** (silent,
   every backend): it projected with `Uᵀ` instead of `Uᴴ`, so even a
   full-rank reconstruction was off by ~140 %. Affects every release through
   0.22.0. `tt_decompose` now also accepts complex tensors instead of raising
   (#73). Real tensors are unchanged.
+- **`precision="kahan"` / `"dd"` / `target_forward_error` dropped the imaginary
+  part of complex operands and rounded large integers** (silent, every
+  backend). Affects `"kahan"` in 0.4.0 through 0.22.0, and `"dd"` and
+  `target_forward_error` in 0.17.0 through 0.22.0. Complex operands now
+  accumulate in complex128, and integer operands contract natively, which is
+  exact (#69).
+- **`multi_einsum` changed result dtypes for mixed-dtype batches** (silent,
+  every backend). Same-shape contractions were stacked without checking
+  dtype, so float32 results came back float64. Affects 0.17.0 through 0.22.0.
+  Batching now requires matching operand dtypes and devices (#75).
 
 ## [0.22.0] — 2026-11-01
 

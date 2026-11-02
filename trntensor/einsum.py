@@ -19,6 +19,7 @@ which is where cuTENSOR beats cuBLAS for tensor workloads.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -393,8 +394,30 @@ def _execute_sharded(
 _FP64_DEVICE_TYPES = ("cpu", "cuda")
 
 
+def _wide_dtype(dtype: torch.dtype) -> torch.dtype | None:
+    """Accumulation dtype for ``precision="kahan"``: complex128 for complex
+    operands, float64 for real floating point, None (contract natively, which
+    is exact) for integer and bool operands."""
+    if dtype.is_complex:
+        return torch.complex128
+    if dtype.is_floating_point:
+        return torch.float64
+    return None
+
+
+def _host_int_einsum(subscripts: str, operands: tuple) -> torch.Tensor:
+    """Integer contraction on the host, natively (exact)."""
+    return torch.einsum(subscripts, *(op.cpu() for op in operands))
+
+
 def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
     """Contract in true fp64 and round once to the operand dtype.
+
+    Complex operands accumulate in complex128 (casting them to float64 would
+    drop the imaginary part). Integer operands contract natively: integer
+    accumulation is already exact, while a float64 detour rounds values
+    above 2**53. Off CPU/CUDA (the neuron device computes integer matmul in
+    fp32) they contract natively on the host.
 
     Operands on a device without native fp64 are contracted on the host and
     the result is moved back, so the only rounding beyond the fp64
@@ -402,10 +425,20 @@ def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
     """
     orig_dtype = operands[0].dtype if operands else torch.float32
     orig_device = operands[0].device if operands else torch.device("cpu")
+    promoted = functools.reduce(torch.promote_types, (op.dtype for op in operands), orig_dtype)
+    if promoted.is_complex and not orig_dtype.is_complex:
+        orig_dtype = promoted  # never round a complex result to a real dtype
+    wide = _wide_dtype(promoted)
+    if wide is None:
+        if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
+            return torch.einsum(subscripts, *operands)
+        # On the neuron device an integer contraction runs in fp32 and rounds
+        # values above 2**24 (#90): contract natively on the host instead.
+        return _host_int_einsum(subscripts, operands).to(orig_device)
     if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
-        result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
+        result = torch.einsum(subscripts, *(op.to(wide) for op in operands))
         return result.to(orig_dtype)
-    host = (op.to(device="cpu", dtype=torch.float64) for op in operands)
+    host = (op.to(device="cpu", dtype=wide) for op in operands)
     result = torch.einsum(subscripts, *host).to(orig_dtype)
     return result.to(orig_device)
 
@@ -443,15 +476,18 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
             if plan.strategy == "path":
                 return _execute_path(subscripts, operands, plan)
             return _einsum_fp64(subscripts, operands)
-        # bf16/fp16 (and other dtypes): Ozaki-2 for matmul; recurse for path
-        # (binary steps get Ozaki); kahan fallback for bmm and torch strategies.
-        if plan.strategy == "matmul":
+        # bf16/fp16 (and mixed real dtypes): Ozaki-2 for matmul; recurse for
+        # path (binary steps get Ozaki); kahan fallback for bmm and torch
+        # strategies. The Ozaki split is defined for real floating point;
+        # complex and integer operands take the exact kahan path instead (#69).
+        real_float = all(op.dtype.is_floating_point for op in operands)
+        if plan.strategy == "matmul" and real_float:
             A, B = operands
             a = A.T if plan.transA else A
             b = B.T if plan.transB else B
             result = _ozaki_matmul_cpu(a.float(), b.float(), k=2)
             return result.to(A.dtype)
-        if plan.strategy == "path":
+        if plan.strategy == "path" and real_float:
             return _execute_path(subscripts, operands, plan)
         return _einsum_fp64(subscripts, operands)
     if plan.strategy in ("torch", "path"):
@@ -626,6 +662,11 @@ def _try_batched_multi_einsum(
         return None
     shape_key = (contractions[0][1].shape, contractions[0][2].shape)
     if not all((c[1].shape, c[2].shape) == shape_key for c in contractions):
+        return None
+    # torch.stack would promote a mixed batch (float32 results came back
+    # float64) or fail on mixed devices: each result must match einsum's.
+    meta_key = tuple((op.dtype, op.device) for op in contractions[0][1:])
+    if not all(tuple((op.dtype, op.device) for op in c[1:]) == meta_key for c in contractions):
         return None
 
     from .nki.dispatch import nki_batched_matmul
