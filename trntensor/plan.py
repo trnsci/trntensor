@@ -34,6 +34,9 @@ class ContractionPlan:
     batch_indices: list[str] = field(default_factory=list)
     output_indices: list[str] = field(default_factory=list)
     estimated_flops: int = 0
+    # Multiply-adds of the planned execution: for "matmul" / "bmm" / "torch"
+    # the product of all index sizes (== estimate_flops); for "path" the sum
+    # over the binary steps of each pair's index-size product.
     contraction_path: list[tuple[int, int]] = field(default_factory=list)
     # Greedy-optimal order for 3+ operand einsums. Each (i, j) pair refers to
     # indices in the CURRENT operand list at that step (opt_einsum convention):
@@ -200,9 +203,12 @@ def plan_contraction(
             subscripts=subscripts,
             strategy="path",
             contraction_path=path,
+            estimated_flops=_path_macs(input_indices, output_str, size_map, path),
         )
     else:
         plan = ContractionPlan(subscripts=subscripts, strategy="torch")
+    if plan.strategy != "path":
+        plan.estimated_flops = estimate_flops(subscripts, *operands)
     plan.backend = _backend_for(plan.strategy, operands)
     plan.precision = precision
     _PLAN_CACHE[key] = plan
@@ -401,7 +407,7 @@ def estimate_flops(subscripts: str, *operands: torch.Tensor) -> int:
     index_sizes = {}
     for op_str, op in zip(input_str.split(","), operands, strict=False):
         for idx, size in zip(op_str, op.shape, strict=False):
-            index_sizes[idx] = size
+            index_sizes[idx] = int(size)
 
     flops = 1
     for idx in all_indices:

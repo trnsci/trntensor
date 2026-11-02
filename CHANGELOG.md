@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`plan_contraction` fills `ContractionPlan.estimated_flops` (#83).**
+  Affected 0.1.1–0.23.0: the documented multiply-add estimate was never set
+  and always read 0. `matmul`, `bmm` and `torch` plans now carry
+  `estimate_flops(subscripts, *operands)` (the product of all index sizes);
+  `path` plans carry the multiply-adds of the planned binary steps, which is
+  what runs and is less than the dense all-index product. Plans are cached by
+  shape, so the field is exact for the cached shapes.
+
 - **`einsum(..., out=)` now writes the result into `out` and returns it
   (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
   and never written, so the documented in-place accumulation example
