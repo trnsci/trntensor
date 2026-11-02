@@ -1596,3 +1596,43 @@ class TestKernelRoutesTakeFp32:
         ref = 2.0 * torch.einsum("lmp,li,knp,ki->mn", eri, co, eri, co)
         assert K.dtype == torch.float64
         torch.testing.assert_close(K, ref, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.parametrize("big", ["eri", "half"])
+def test_ao_to_mo_aten_large_operand_avoids_transposed_lhs(monkeypatch, big):
+    """Large device operands skip einsum's transposed-LHS matmul (#97, aws-neuron-sdk#1448)."""
+    from trntensor import quantum
+
+    nb, naux, nocc, nvir = 12, 20, 5, 7
+    g = torch.Generator().manual_seed(0)
+    eri = torch.randn(nb, nb, naux, generator=g)
+    C_occ, C_vir = torch.randn(nb, nocc, generator=g), torch.randn(nb, nvir, generator=g)
+    ref = torch.einsum(
+        "na,inP->iaP", C_vir.double(), torch.einsum("mi,mnP->inP", C_occ.double(), eri.double())
+    )
+    calls = []
+    real_einsum = torch.einsum
+    monkeypatch.setattr(torch, "einsum", lambda *a, **k: calls.append(a[0]) or real_einsum(*a, **k))
+    # Below the limit (or off the device): the einsum route, unchanged.
+    out = quantum._cpu_ao_to_mo_transform(eri, C_occ, C_vir)
+    assert calls == ["mi,mnP->inP", "na,inP->iaP"]
+    torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
+    # CPU standing in for the device; the limit at the eri or the half-transformed size.
+    monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
+    limit = eri.numel() * 4 if big == "eri" else nocc * nb * naux * 4
+    monkeypatch.setattr(dispatch, "_ATEN_TRANSPOSED_LHS_MAX_BYTES", limit)
+    calls.clear()
+    out = quantum._cpu_ao_to_mo_transform(eri, C_occ, C_vir)
+    assert calls == []
+    assert out.shape == (nocc, nvir, naux)
+    torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
+    # The public entry point takes the same route (full and packed eri).
+    eri_s = eri + eri.transpose(0, 1)
+    ref_s = torch.einsum(
+        "na,inP->iaP", C_vir.double(), torch.einsum("mi,mnP->inP", C_occ.double(), eri_s.double())
+    )
+    for arg in (eri_s, quantum.pack_tril(eri_s)):
+        calls.clear()
+        out = trntensor.ao_to_mo_transform(arg, C_occ, C_vir)
+        assert "mi,mnP->inP" not in calls
+        torch.testing.assert_close(out.double(), ref_s, rtol=1e-5, atol=1e-5)
