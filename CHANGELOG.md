@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     nbasis 1658, trnsolver#87).
   - `mp2_energy_blocked`: DF-MP2 over occupied blocks of a host `B_ia^P`,
     for `B` larger than one device.
+  - Memory-mapped chunks are read into RAM with one sequential read when
+    loaded. Left mapped, the row gathers of `df_exchange` fault pages in at
+    random, which was disk-bound on a disk-backed store.
   - CPU-validated against dense references; device overlap and scaling are
     still to be measured.
 
