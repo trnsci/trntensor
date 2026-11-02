@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** `kahan`/`dd` dropped the imaginary part of complex operands and rounded large integers (#69, #90); `beta=0` read `out=` (#71); complex `tucker_decompose` used Uᵀ (#73); `multi_einsum` returned fp32 results as fp64 (#75); `einsum(precision="dd")` missed its documented bound (#84); float64 chemistry kernels returned inf on device (#87); `ao_to_mo_transform` on device with operands over 4 GiB was silently wrong and is now guarded (#97). New: native AO→MO for any nocc, 1.8–3.5× faster than aten at nocc 160–384 (#94).
+
 ### Changed
 
 - **`ao_to_mo_transform`'s Trn2 kernels now run any `nocc` (#80).** They
