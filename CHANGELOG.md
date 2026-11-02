@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`einsum(precision="kahan")` rounded int32 values above 2**24 on the
+  neuron device** (silent, #90). The device computes integer matmul in fp32.
+  Since #70 integer operands contracted natively on any device. They now
+  contract natively only on CPU/CUDA, and on the host for other devices.
+  Unreleased (`main` after #70 only). Found by the conformance suite on Trn2
+  (trnsci/trnsci#35).
 - **`einsum(precision="dd")` on float32 / float64 operands was less accurate
   than `"fast"`** (silent; 0.17.0 through 0.22.0, the CPU emulation; Trainium
   raises `NotImplementedError`). The CPU route split every operand into two

@@ -405,13 +405,19 @@ def _wide_dtype(dtype: torch.dtype) -> torch.dtype | None:
     return None
 
 
+def _host_int_einsum(subscripts: str, operands: tuple) -> torch.Tensor:
+    """Integer contraction on the host, natively (exact)."""
+    return torch.einsum(subscripts, *(op.cpu() for op in operands))
+
+
 def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
     """Contract in true fp64 and round once to the operand dtype.
 
     Complex operands accumulate in complex128 (casting them to float64 would
     drop the imaginary part). Integer operands contract natively: integer
     accumulation is already exact, while a float64 detour rounds values
-    above 2**53.
+    above 2**53. Off CPU/CUDA (the neuron device computes integer matmul in
+    fp32) they contract natively on the host.
 
     Operands on a device without native fp64 are contracted on the host and
     the result is moved back, so the only rounding beyond the fp64
@@ -424,7 +430,11 @@ def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
         orig_dtype = promoted  # never round a complex result to a real dtype
     wide = _wide_dtype(promoted)
     if wide is None:
-        return torch.einsum(subscripts, *operands)
+        if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
+            return torch.einsum(subscripts, *operands)
+        # On the neuron device an integer contraction runs in fp32 and rounds
+        # values above 2**24 (#90): contract natively on the host instead.
+        return _host_int_einsum(subscripts, operands).to(orig_device)
     if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
         result = torch.einsum(subscripts, *(op.to(wide) for op in operands))
         return result.to(orig_dtype)
