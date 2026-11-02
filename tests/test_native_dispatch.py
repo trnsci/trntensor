@@ -980,9 +980,23 @@ class TestNativeKernelRetirement:
         assert dispatch._ao_to_mo_route(small, 16, 112) == "aten"
         assert dispatch._ao_to_mo_route(large, 32, 224) == "trn2"
         assert dispatch._ao_to_mo_route(torch.empty(256, 256, 512), 32, 224) == "aten"
-        assert dispatch._ao_to_mo_route(large, 129, 224) == "aten"
+        # nocc > 128 runs occupied blocks in the kernel (#80).
+        assert dispatch._ao_to_mo_route(large, 129, 127) == "trn2"
+        assert dispatch._ao_to_mo_route(torch.empty(512, 512, 1024, device="meta"), 384, 128) == (
+            "trn2"
+        )
         huge = torch.empty(4096, 4096, 512, device="meta")
         assert dispatch._ao_to_mo_route(huge, 32, 4000) == "aten"  # SBUF
+        # A full eri that would need a padded copy stays on aten (#80) ...
+        assert dispatch._ao_to_mo_route(torch.empty(300, 300, 700, device="meta"), 100, 200) == (
+            "aten"
+        )
+        assert dispatch._ao_to_mo_route(torch.empty(384, 384, 700, device="meta"), 129, 255) == (
+            "aten"
+        )
+        assert dispatch._ao_to_mo_route(torch.empty(384, 384, 768, device="meta"), 129, 255) == (
+            "trn2"
+        )
         monkeypatch.setattr(dispatch, "_backend", "nki")
         assert dispatch._ao_to_mo_route(small, 16, 112) == "trn2"
         monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
@@ -997,12 +1011,39 @@ class TestNativeKernelRetirement:
         assert dispatch._ao_to_mo_route(torch.empty(npair, 512), 32, 224, 256) == "aten"
         small = torch.empty(128 * 129 // 2, 256, device="meta")
         assert dispatch._ao_to_mo_route(small, 16, 112, 128) == "aten"
+        # ... a packed one only pads the gather indices, but padded nbasis
+        # rows waste work: 160/129/256 (8.5e8) stays on aten, 300/129/700 runs.
+        pk160 = torch.empty(160 * 161 // 2, 256, device="meta")
+        assert dispatch._ao_to_mo_route(pk160, 129, 31, 160) == "aten"
+        pk300 = torch.empty(300 * 301 // 2, 700, device="meta")
+        assert dispatch._ao_to_mo_route(pk300, 129, 171, 300) == "trn2"
         monkeypatch.setattr(dispatch, "_backend", "nki")
         assert dispatch._ao_to_mo_route(small, 16, 112, 128) == "trn2"
         # The gather-index chunk counts against SBUF.
         full_b = dispatch._ao_to_mo_trn2_sbuf_bytes(1024, 32, 1000, 512, 4)
         pk_b = dispatch._ao_to_mo_trn2_sbuf_bytes(1024, 32, 1000, 512, 4, packed=True)
         assert pk_b - full_b == 4 * 8 * 1024
+
+    @pytest.mark.parametrize("nocc", [1, 5, 128, 129, 160, 200, 256, 257, 384, 500])
+    def test_ao_to_mo_occ_blocks_cover_nocc(self, nocc):
+        from trntensor.nki._kernels import ao_to_mo_trn2_occ_blocks
+
+        blocks = ao_to_mo_trn2_occ_blocks(nocc)
+        assert len(blocks) == -(-nocc // 128)
+        assert all(0 < sz <= 128 for _, sz in blocks)
+        assert max(sz for _, sz in blocks) - min(sz for _, sz in blocks) <= 1
+        assert [o for o, _ in blocks] == [
+            sum(sz for _, sz in blocks[:b]) for b in range(len(blocks))
+        ]
+        assert sum(sz for _, sz in blocks) == nocc
+
+    @pytest.mark.parametrize("n,g", [(1, 4), (4, 4), (5, 4), (129, 4), (257, 2), (7, 1)])
+    def test_ao_to_mo_groups_cover_range(self, n, g):
+        from trntensor.nki._kernels import ao_to_mo_trn2_groups
+
+        runs = ao_to_mo_trn2_groups(n, g)
+        assert [i for o, sz in runs for i in range(o, o + sz)] == list(range(n))
+        assert all(sz == g for _, sz in runs[:-1]) and 0 < runs[-1][1] <= g
 
     @pytest.mark.parametrize("nbasis,nbp,naux,tp", [(256, 256, 768, 384), (200, 256, 512, 256)])
     def test_tril_gather_images_address_the_packed_rows(self, nbasis, nbp, naux, tp):

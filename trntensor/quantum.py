@@ -219,8 +219,9 @@ def ao_to_mo_transform(
     - Native TorchNeuron path (Trn2/Trn3): ``ao_to_mo_trn2_kernel``. Both
       stages are plain GEMMs with the contraction index on the partition
       axis (no DMA transposes), and the auxiliary index is split across both
-      physical cores at LNC=2. ``"auto"`` uses it for device-resident ``eri``
-      with ``nocc ≤ 128`` when its SBUF working set fits and the stage-1
+      physical cores at LNC=2; ``nocc > 128`` runs in occupied blocks of
+      ≤ 128 over one read of ``eri`` (#80). ``"auto"`` uses it for
+      device-resident ``eri`` when its SBUF working set fits and the stage-1
       work ``nocc·nbasis²·naux`` is at least 5e8 multiply-adds (about
       nbasis ≥ 256). There it measured 1.3-1.6x faster than the two aten
       einsums on Trn2 (#51). Otherwise the
@@ -334,8 +335,8 @@ def ao_to_mo_transform(
         from .nki import dispatch as _d
 
         # The original kernel: NOCC ≤ 128 is the stationary M dim of its
-        # step-2 nc_matmul; M-tiling not implemented. (The Trn2 kernel's
-        # route already requires nocc ≤ 128.)
+        # step-2 nc_matmul; M-tiling not implemented. (The Trn2 kernel
+        # tiles the occupied index itself, #80.)
         if route == "legacy" and nocc > 128:
             raise NotImplementedError(
                 f"ao_to_mo_transform NKI path requires nocc ≤ 128 "

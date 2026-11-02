@@ -176,12 +176,19 @@ Kernel alone, device-resident, warm (fp32; padded `nvir` included):
   no DMA transposes.
   - Stage 1: `X[i, ν, P] = Σ_μ C_occ[μ, i] eri[μ, ν, P]`.
   - Stage 2: `B[i, a, P] = Σ_ν C_vir[ν, a] X[i, ν, P]`.
-  - The auxiliary index is split across both physical cores at LNC=2.
-  - `"auto"` uses the kernel for device-resident `eri` with `nocc ≤ 128` when
-    its SBUF working set fits and the stage-1 work `nocc·nbasis²·naux` is at
-    least 5e8 multiply-adds (about nbasis ≥ 256). Smaller problems lose to
-    the launch floor and the padding copies; otherwise it runs the two aten
-    steps.
+  - The auxiliary index is split across both physical cores at LNC=2. With
+    an odd aux-chunk count and `nocc > 128`, the occupied index is split
+    instead.
+  - Any `nocc` (#80): stage 1 runs occupied blocks of ≤ 128 over each eri
+    block, so `eri` is read once per program.
+  - `"auto"` uses the kernel for device-resident `eri` when its SBUF
+    working set fits and the stage-1 work `nocc·nbasis²·naux` is at least
+    5e8 multiply-adds (about nbasis ≥ 256). Smaller problems lose to the
+    launch floor. Two exceptions (#80):
+    - A full `eri` whose nbasis or naux is not a 128 multiple runs aten. The
+      kernel would pad a copy of the whole square, which costs more than
+      aten. Pass the packed form to keep the kernel there.
+    - A packed `eri` with nbasis not a 128 multiple needs 2e9 multiply-adds.
     `TRNTENSOR_AO_TO_MO=auto|trn2|aten|legacy` overrides the choice.
 
   Measured on Trn2 (fp32, one LNC=2 core, device-resident, warm, #51):
@@ -199,6 +206,26 @@ Kernel alone, device-resident, warm (fp32; padded `nvir` included):
   nbasis 64 and 128 it measured 0.79 and 0.57 ms with the kernel forced,
   which is why `"auto"` keeps aten there.
 
+  Above `nocc = 128` (#80; Trn2, one logical core, fp32, warm medians in ms,
+  `nvir = nbasis − nocc`). "Per-128 launches" is the `nocc ≤ 128` kernel run
+  once per 128 orbitals, which re-reads `eri` each time:
+
+  | nbasis, naux | LNC | nocc | aten, full / packed | per-128 launches, full / packed | Trn2 kernel, full / packed |
+  |---|---|---|---|---|---|
+  | 512, 1536 | 2 | 160 | 17.2 / 25.1 | 14.1 / 13.5 | **9.4 / 9.2** |
+  | 512, 1536 | 2 | 256 | 24.8 / 34.8 | 15.3 / 14.6 | **10.4 / 9.9** |
+  | 512, 1536 | 2 | 384 | 29.5 / 37.0 | 21.5 / 19.7 | **12.6 / 12.7** |
+  | 512, 1536 | 1 | 160 | 24.8 / 43.1 | 26.7 / 27.6 | **18.7 / 18.7** |
+  | 512, 1536 | 1 | 256 | 33.1 / 52.1 | 28.2 / 29.6 | **20.3 / 20.4** |
+  | 512, 1536 | 1 | 384 | 41.0 / 60.2 | 38.7 / 40.3 | **24.3 / 24.7** |
+  | 768, 2304 | 2 | 160 | 37.5* / 65.0* | 41.7 / 47.6 | **30.2 / 30.6** |
+  | 768, 2304 | 2 | 256 | 84.9* / 112.9* | 44.3 / 51.8 | **33.7 / 33.6** |
+  | 768, 2304 | 2 | 384 | 112.9* / 140.6* | 59.2 / 70.7 | **45.3 / 45.4** |
+
+  \* At nbasis 768 / naux 2304 the aten result was wrong on the device
+  (max error ~1 against float64), while the kernel matched float64 to 2e-7;
+  aten was correct at nbasis 736. Its timings there are for reference only.
+
 - **Host inputs on native TorchNeuron (#56).** Under `"auto"`, with `eri`,
   `C_occ` and `C_vir` all on the host, the inputs are uploaded (`eri` in the
   layout given), the device route above runs, and the result is downloaded,
@@ -215,7 +242,9 @@ Kernel alone, device-resident, warm (fp32; padded `nvir` included):
 
 ### Current limitations
 
-- Both NKI kernels need `nocc ≤ 128`; larger `nocc` runs the aten steps (native) or raises `NotImplementedError` (XLA).
+- The original (XLA-path) kernel needs `nocc ≤ 128` and raises `NotImplementedError` above it. The Trn2 kernels take any `nocc`.
+- At `nocc` just above a multiple of 128 the Trn2 kernel pays for a whole extra block in stage 1 (the occupied block is the stationary operand, and a pass costs the same at any width). For example, nocc 160 at nbasis 768 costs 30 ms against 21 ms at 128.
+- The first call per shape compiles for minutes at large sizes (traced loops unroll): 4–11 min at nbasis 768 / naux 2304 for a full `eri`, 1–4.5 min packed. The NEFF cache keeps that to one compile per shape.
 - The `(nocc, nbasis, naux)` intermediate goes through kernel-scratch HBM between the two stages, as it does between the two aten einsums. Stage 1 leaves `i` on the partition axis, and stage 2 needs `ν` there.
 
 ## `trntensor.df_exchange(B, C_occ, alpha=1.0) -> Tensor`

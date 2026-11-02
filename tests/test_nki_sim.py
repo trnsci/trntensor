@@ -187,6 +187,33 @@ class TestAoToMoTransformSimulator:
             trntensor.set_backend("auto")
 
 
+class TestAoToMoTrn2Simulator:
+    """#80: the Trn2 AO→MO kernel at nocc > 128 (occupied blocks in stage 1,
+    ragged stage-2 groups) against a float64 reference."""
+
+    @pytest.mark.parametrize(
+        "nbasis,nocc,nvir,naux",
+        [(128, 129, 128, 256), (256, 200, 128, 512), (128, 258, 128, 384)],
+    )
+    def test_matches_float64(self, nbasis, nocc, nvir, naux):
+        import nki
+        import numpy as np
+
+        from trntensor.nki._kernels import ao_to_mo_trn2_kernel
+
+        r = np.random.default_rng(nocc)
+        eri = r.standard_normal((nbasis, nbasis, naux), dtype=np.float32)
+        co = r.standard_normal((nbasis, nocc), dtype=np.float32)
+        cv = r.standard_normal((nbasis, nvir), dtype=np.float32)
+        out = nki.simulate(ao_to_mo_trn2_kernel)(eri, co, cv)
+        ref = np.einsum(
+            "na,inP->iaP",
+            cv.astype(np.float64),
+            np.einsum("mi,mnP->inP", co.astype(np.float64), eri),
+        )
+        assert float(np.abs(out - ref).max() / np.abs(ref).max()) < 2e-6
+
+
 class TestMp2EnergySimulator:
     def test_demo_shape(self):
         import trntensor
