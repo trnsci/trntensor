@@ -841,6 +841,16 @@ class TestOutputOrder:
         assert trntensor.plan_contraction(subscripts, *ops).strategy == strategy
 
 
+def _host_dd(mode, monkeypatch):
+    """Exercise dd's host (Ozaki/kahan) path on any machine. On a Neuron host
+    (HAS_NKI) precision="dd" raises by design until trnblas#22; that contract
+    is test_dd_nki_still_raises."""
+    if mode == "dd":
+        import trntensor.nki.dispatch as _nd
+
+        monkeypatch.setattr(_nd, "HAS_NKI", False)
+
+
 class TestPrecisionModesNonRealDtypes:
     """precision="kahan"/"dd" and target_forward_error must not drop the
     imaginary part of complex operands or round integer operands (audit 3)."""
@@ -856,7 +866,8 @@ class TestPrecisionModesNonRealDtypes:
         ],
     )
     @pytest.mark.parametrize("mode", ["kahan", "dd", "target"])
-    def test_complex_keeps_imaginary_part(self, dtype, subscripts, shapes, mode):
+    def test_complex_keeps_imaginary_part(self, dtype, subscripts, shapes, mode, monkeypatch):
+        _host_dd(mode, monkeypatch)
         g = torch.Generator().manual_seed(0)
         ops = [torch.randn(s, generator=g, dtype=dtype) for s in shapes]
         kw = {"target_forward_error": 1e-12} if mode == "target" else {"precision": mode}
@@ -873,7 +884,8 @@ class TestPrecisionModesNonRealDtypes:
         torch.testing.assert_close(got, A.to(torch.complex128) @ B)
 
     @pytest.mark.parametrize("mode", ["kahan", "dd"])
-    def test_integer_exact(self, mode):
+    def test_integer_exact(self, mode, monkeypatch):
+        _host_dd(mode, monkeypatch)
         A = torch.tensor([[2**53 + 1, 2], [2**40 + 3, 1]], dtype=torch.int64)
         B = torch.tensor([[1, 0], [1, 1]], dtype=torch.int64)
         got = trntensor.einsum("ij,jk->ik", A, B, precision=mode)
