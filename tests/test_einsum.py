@@ -256,17 +256,67 @@ class TestAlphaBeta:
         A = torch.randn(4, 3)
         B = torch.randn(3, 5)
         C = torch.randn(4, 5)
-        result = trntensor.einsum("ij,jk->ik", A, B, beta=0.5, out=C)
         expected = A @ B + 0.5 * C
+        result = trntensor.einsum("ij,jk->ik", A, B, beta=0.5, out=C)
         np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-5)
 
     def test_alpha_beta_combined(self):
         A = torch.randn(4, 3)
         B = torch.randn(3, 5)
         C = torch.randn(4, 5)
-        result = trntensor.einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
         expected = 2.0 * (A @ B) + 0.5 * C
+        result = trntensor.einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
         np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-5)
+
+    def test_out_is_written_in_place(self):
+        """The documented accumulation example ``einsum(..., beta=1.0, out=acc)``
+        must update ``acc`` (#77: 0.3.0-0.23.0 returned a fresh tensor and
+        left ``acc`` unchanged)."""
+        A = torch.randn(4, 3)
+        B = torch.randn(3, 5)
+        acc = torch.zeros(4, 5)
+        for _ in range(3):
+            trntensor.einsum("ij,jk->ik", A, B, beta=1.0, out=acc)
+        torch.testing.assert_close(acc, 3 * (A @ B))
+        C = torch.randn(4, 5)
+        want = 2.0 * (A @ B) + 0.5 * C
+        got = trntensor.einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
+        assert got is C
+        torch.testing.assert_close(C, want)
+
+    def test_out_aliasing_operand(self):
+        A = torch.randn(5, 5)
+        want = 2.0 * A.T + A
+        got = trntensor.einsum("ij->ji", A, alpha=2.0, beta=1.0, out=A)
+        assert got is A
+        torch.testing.assert_close(A, want)
+        X = torch.randn(4, 4)
+        Xt = X.T.clone()
+        trntensor.einsum("ij->ji", X, out=X)
+        torch.testing.assert_close(X, Xt)
+        Y = torch.randn(4, 4)
+        Y0 = Y.clone()
+        trntensor.einsum("ij,jk->ik", Y, torch.eye(4), out=Y)
+        torch.testing.assert_close(Y, Y0)
+
+    def test_out_checks_match_torch(self):
+        A, B = torch.randn(4, 3), torch.randn(3, 5)
+        with pytest.raises(ValueError, match="shape"):
+            trntensor.einsum("ij,jk->ik", A, B, out=torch.zeros(1, 5))
+        with pytest.raises(RuntimeError, match="can't be cast"):
+            trntensor.einsum("ij,jk->ik", A, B, out=torch.zeros(4, 5, dtype=torch.int64))
+        with pytest.raises(RuntimeError, match="can't be cast"):
+            trntensor.einsum("ij,jk->ik", A.cfloat(), B.cfloat(), out=torch.zeros(4, 5))
+        Ag = A.clone().requires_grad_()
+        with pytest.raises(RuntimeError, match="automatic differentiation"):
+            trntensor.einsum("ij,jk->ik", Ag, B, out=torch.zeros(4, 5))
+        with torch.no_grad():
+            out = torch.zeros(4, 5)
+            trntensor.einsum("ij,jk->ik", Ag, B, out=out)
+        torch.testing.assert_close(out, A @ B)
+        out64 = torch.zeros(4, 5, dtype=torch.float64)
+        trntensor.einsum("ij,jk->ik", A, B, beta=1.0, out=out64)
+        torch.testing.assert_close(out64, (A @ B).double())
 
     def test_defaults_unchanged(self):
         """Default alpha=1, beta=0, out=None is identical to plain einsum."""
@@ -1042,4 +1092,4 @@ class TestBetaZeroIgnoresOut:
         out = torch.full(ref.shape, fill)
         got = trntensor.einsum(subscripts, *ops, alpha=alpha, beta=0.0, out=out)
         torch.testing.assert_close(got, ref)
-        assert torch.isnan(out).all() or torch.isinf(out).all()  # out not written
+        assert got is out  # old contents not read, result written (#77)

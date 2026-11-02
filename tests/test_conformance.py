@@ -185,7 +185,6 @@ def xfail_decide(issue, why):
     return pytest.mark.xfail(strict=True, reason=f"trnsci/trntensor#{issue}: {why}")
 
 
-XF_OUT = xfail_decide(77, "needs decision: einsum out= is never written")
 XF_CP_DTYPE = xfail_decide(78, "cp_decompose/cp_reconstruct hard-code float32 CPU buffers")
 XF_SHARD = xfail_decide(78, "output-parallel sharded einsum does not co-partition operands")
 XF_FLOPS = xfail_decide(83, "ContractionPlan.estimated_flops is never filled in")
@@ -611,10 +610,11 @@ def test_alpha_beta_out(sub, shapes, alpha, beta):
     gen = torch.Generator().manual_seed(7)
     ops = [torch.randn(s, generator=gen) for s in shapes]
     C = torch.randn(torch.einsum(sub, *ops).shape, generator=gen)
+    want = (alpha * ref_einsum(sub, *ops).double() + beta * C.double()).float()
     dops, dC = [d(o) for o in ops], d(C)
     snap = [o.clone() for o in ops]
-    got = tt.einsum(sub, *dops, alpha=alpha, beta=beta, out=dC)
-    assert_ref(got, (alpha * ref_einsum(sub, *ops).double() + beta * C.double()).float())
+    got = tt.einsum(sub, *dops, alpha=alpha, beta=beta, out=dC)  # writes dC (#77)
+    assert_ref(got, want)
     assert all(same_bits(a, b) for a, b in zip(dops, snap, strict=True)), "operand mutated"
 
 
@@ -639,7 +639,6 @@ def test_out_is_an_operand():
     assert_ref(got, 3 * A)
 
 
-@XF_OUT
 @pytest.mark.parametrize("beta", [0.0, 1.0])
 def test_out_is_written(beta):
     """torch.einsum(out=) and cuTENSOR write the output operand; the docs example relies on it."""
@@ -717,7 +716,10 @@ def test_grad_matches_torch_einsum(sub, shapes):
 def test_gradcheck_alpha_beta_out():
     gen = torch.Generator().manual_seed(14)
     A, B, C = (torch.randn(s, generator=gen, dtype=torch.float64) for s in ((4, 3), (3, 5), (4, 5)))
-    _gradcheck(lambda a, b, c: tt.einsum("ij,jk->ik", a, b, alpha=2.0, beta=0.5, out=c), [A, B, C])
+    _gradcheck(lambda a, b: tt.einsum("ij,jk->ik", a, b, alpha=2.0), [A, B])
+    # out= writes in place, so like torch.einsum(out=) it refuses autograd (#77).
+    with pytest.raises(RuntimeError, match="automatic differentiation"):
+        tt.einsum("ij,jk->ik", A.requires_grad_(), B, alpha=2.0, beta=0.5, out=C)
 
 
 def test_gradcheck_reconstructions_and_chemistry():
