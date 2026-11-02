@@ -118,12 +118,19 @@ def cp_decompose(
 
 
 def cp_reconstruct(factors: list[torch.Tensor], weights: torch.Tensor) -> torch.Tensor:
-    """Reconstruct tensor from CP factors: T = Σ_r w_r * a_r ⊗ b_r ⊗ ..."""
+    """Reconstruct tensor from CP factors: T = Σ_r w_r * a_r ⊗ b_r ⊗ ...
+
+    The result has the promoted dtype of ``factors`` and ``weights`` and lives
+    on the factors' device.
+    """
     rank = weights.shape[0]
     ndim = len(factors)
     shape = tuple(f.shape[0] for f in factors)
+    dtype = weights.dtype
+    for f in factors:
+        dtype = torch.promote_types(dtype, f.dtype)
 
-    result = torch.zeros(shape)
+    result = torch.zeros(shape, dtype=dtype, device=factors[0].device)
     for r in range(rank):
         component = weights[r]
         outer = factors[0][:, r]

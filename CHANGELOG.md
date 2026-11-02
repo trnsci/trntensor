@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses the conjugated normal equations `(V^H V) A^T = (T_(k) conj(V))^T`.
   Weights are real (`tensor.real.dtype`). `nonneg=True` with complex input
   raises `ValueError`. Real float32 results are bit-identical.
+- **`cp_reconstruct` returns the factors' dtype on the factors' device
+  (#78).** Affected 0.1.1–0.23.0: it accumulated into a float32 host buffer
+  (`torch.zeros(shape)`), so bf16 or fp16 factors came back as float32 and
+  device factors raised a device mismatch. The buffer now has the promoted
+  dtype of `factors` and `weights` and the factors' device. float32 and
+  float64 results are unchanged.
 
 - **`einsum(..., out=)` now writes the result into `out` and returns it
   (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
