@@ -173,7 +173,6 @@ def xfail_decide(issue, why):
 
 XF_COMPLEX_PREC = xfail_open(69, 70, "kahan/dd/target_forward_error drop the imaginary part")
 XF_INT_PREC = xfail_open(69, 70, "kahan/dd round large integers")
-XF_MULTI_DTYPE = xfail_open(75, 76, "multi_einsum batching promotes mixed dtypes")
 XF_OUT = xfail_decide(77, "needs decision: einsum out= is never written")
 XF_CP_DTYPE = xfail_decide(78, "cp_decompose/cp_reconstruct hard-code float32 CPU buffers")
 XF_SHARD = xfail_decide(78, "output-parallel sharded einsum does not co-partition operands")
@@ -1028,12 +1027,15 @@ def test_multi_einsum_heterogeneous():
     assert_ref(list(got), [ref_einsum(s, *ops) for s, *ops in calls])
 
 
-@XF_MULTI_DTYPE
 def test_multi_einsum_mixed_dtype_batch():
     gen = torch.Generator().manual_seed(43)
     X, Y = torch.randn(4, 5, generator=gen), torch.randn(5, 6, generator=gen)
     got = tt.multi_einsum(("ij,jk->ik", d(X), d(Y)), ("ij,jk->ik", d(X.double()), d(Y.double())))
-    assert_ref(list(got), [ref_einsum("ij,jk->ik", X, Y), ref_einsum("ij,jk->ik", X.double(), Y)])
+    # Both references take matching dtypes: ref_einsum("ij,jk->ik", X.double(), Y)
+    # mixed float64 with float32 and raised inside torch, so the case
+    # xfailed on every backend whether or not batching promoted (#75).
+    ref = [ref_einsum("ij,jk->ik", X, Y), ref_einsum("ij,jk->ik", X.double(), Y.double())]
+    assert_ref(list(got), ref)
 
 
 _A = torch.randn(7, 5, generator=torch.Generator().manual_seed(44), dtype=torch.float64)
