@@ -641,14 +641,155 @@ def _get_dispatch_path() -> str:
     return _dispatch_path
 
 
+# ── Kernel operand dtypes: one guard at the kernel boundary ──────────────────
+#
+# Trainium has no fp64 datapath and the trntensor kernels are written for
+# fp32 (bf16 / fp16 where listed). Through 0.22.0 float64 (and integer, bool,
+# complex) tensors could reach them unchanged and come back inf, garbage or
+# in the wrong dtype (#87, the same class as trnblas#68, trnfft#109/#131,
+# trnsolver#83, trnsparse#78/#79). Two layers close it:
+#
+# - The host wrappers decide per dtype before any launch: the matmul family
+#   runs torch for a dtype the kernel does not take
+#   (:func:`_matmul_kernel_dtypes_ok`); the chemistry routes compute float64 /
+#   float16 in fp32 and cast the result back, and take aten for integer,
+#   bool and complex operands (:func:`_chem_kernel_operands`). Under
+#   ``TRNTENSOR_REQUIRE_NKI=1`` a dtype that would take torch instead of the
+#   kernel raises ``NotImplementedError`` (:func:`_no_kernel_for_dtype`).
+# - Every launch (native op, XLA call, simulator) checks its operands against
+#   ``KERNEL_OPERAND_DTYPES`` and raises ``TypeError`` otherwise, so no kernel
+#   is reached with a dtype it does not take even if a wrapper forgets the
+#   first layer. A native op without a table entry cannot be loaded.
+
+_MATMUL_DTYPES = frozenset({torch.float32, torch.bfloat16, torch.float16})
+_CHEM_DTYPES = frozenset({torch.float32, torch.bfloat16})  # mp2_energy, ao_to_mo
+_F32_DTYPES = frozenset({torch.float32})
+_INDEX_DTYPES = frozenset({torch.uint32})  # gather images (`_tril_gather_images`)
+
+# Allowed dtypes per positional tensor operand, keyed by the op name `_launch`
+# uses (and "all_reduce" for `collectives.nki_all_reduce_sum`).
+KERNEL_OPERAND_DTYPES: dict[str, tuple[frozenset, ...]] = {
+    "matmul": (_MATMUL_DTYPES,) * 2,
+    "batched_matmul": (_MATMUL_DTYPES,) * 2,
+    "mp2_energy": (_CHEM_DTYPES,) * 4,
+    "mp2_energy_row": (_CHEM_DTYPES,) * 6,
+    "ao_to_mo_transform": (_CHEM_DTYPES,) * 3,
+    "ao_to_mo_trn2": (_CHEM_DTYPES,) * 3,
+    "ao_to_mo_trn2_packed": (_CHEM_DTYPES, _INDEX_DTYPES, _CHEM_DTYPES, _CHEM_DTYPES),
+    # The df_* kernels run fp32 only: bf16 was never validated on device, and
+    # the df_coulomb host tail mixed a bf16 B with the kernel's fp32 d.
+    "df_half_packed": (_F32_DTYPES, _INDEX_DTYPES, _F32_DTYPES),
+    "df_exchange_syrk": (_F32_DTYPES,) * 2,
+    "df_coulomb_d": (_F32_DTYPES,) * 2,
+    "df_coulomb_j": (_F32_DTYPES,) * 2,
+    "all_reduce": (_MATMUL_DTYPES,),
+}
+# The output takes the first operand's dtype: every operand must share it.
+_SAME_DTYPE_KERNELS = frozenset({"matmul", "batched_matmul"})
+
+
+def _check_kernel_operands(op_name: str, tensors) -> None:
+    """Raise ``TypeError`` unless every operand dtype is one ``op_name`` takes."""
+    allowed = KERNEL_OPERAND_DTYPES.get(op_name)
+    if allowed is None:
+        raise TypeError(f"trntensor kernel {op_name!r} has no KERNEL_OPERAND_DTYPES entry")
+    tensors = tuple(tensors)
+    dts = [t.dtype for t in tensors]
+    ok = len(dts) == len(allowed) and all(d in a for d, a in zip(dts, allowed, strict=True))
+    if ok and op_name in _SAME_DTYPE_KERNELS:
+        ok = len(set(dts)) == 1
+    if not ok:
+        want = ", ".join("/".join(sorted(str(d) for d in a)) for a in allowed)
+        raise TypeError(
+            f"trntensor kernel {op_name!r} takes operands ({want}); got "
+            f"({', '.join(str(d) for d in dts)}). This is a trntensor bug: the "
+            "host wrapper should have cast the operands or run torch."
+        )
+
+
+def _require_nki_now() -> bool:
+    return _REQUIRE_NKI or os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _no_kernel_for_dtype(what: str, allowed, *tensors: torch.Tensor) -> None:
+    """Under ``TRNTENSOR_REQUIRE_NKI=1``, refuse a dtype the kernels do not take.
+
+    Without it the caller runs torch (the pytorch backend's computation)
+    instead. Matches trnblas's convention (trnblas#69).
+    """
+    if _require_nki_now():
+        dts = sorted({str(t.dtype) for t in tensors})
+        ok = "/".join(sorted(str(d) for d in allowed))
+        raise NotImplementedError(
+            f"trntensor {what}: the NKI kernels take {ok} operands, got {dts}. "
+            "Unset TRNTENSOR_REQUIRE_NKI to compute in torch."
+        )
+
+
+def _matmul_kernel_dtypes_ok(*tensors: torch.Tensor) -> bool:
+    """True when the matmul / batched-matmul kernels take these operands
+    (one shared fp32 / bf16 / fp16 dtype). Otherwise the wrapper runs torch:
+    float64 keeps its full precision there, and integer, bool, complex and
+    mixed dtypes get exactly the pytorch backend's result (or its error)."""
+    dts = {t.dtype for t in tensors}
+    return len(dts) == 1 and dts <= _MATMUL_DTYPES
+
+
+def _chem_kernel_operands(
+    what: str, *tensors: torch.Tensor, allowed: frozenset = _CHEM_DTYPES
+) -> tuple | None:
+    """Operands for the chemistry kernels, or None to take aten.
+
+    Real floating dtypes outside ``allowed`` (float64, float16; bf16 for the
+    fp32-only df_* kernels) are computed in fp32, and the caller casts the
+    result back to the aten route's dtype (#87/#88 for float64; the others
+    are a lossless upcast). Strides are kept (``preserve_format``) so layout detection still
+    sees the caller's layout. Integer, bool and complex operands take aten
+    (the pytorch backend's computation); under ``TRNTENSOR_REQUIRE_NKI=1``
+    they raise ``NotImplementedError``.
+    """
+    if not all(t.dtype.is_floating_point for t in tensors):
+        _no_kernel_for_dtype(what, allowed, *tensors)
+        return None
+    return tuple(t if t.dtype in allowed else t.to(torch.float32) for t in tensors)
+
+
 def _get_native_ops() -> dict:
-    """Import `_native` (registering the trntensor:: custom ops) on first use."""
+    """Import `_native` (registering the trntensor:: custom ops) on first use.
+
+    Every op must have a ``KERNEL_OPERAND_DTYPES`` entry: a new kernel without
+    one fails here rather than taking unchecked operands.
+    """
     global _native_ops
     if _native_ops is None:
         from . import _native
 
+        missing = sorted(set(_native.OPS) - set(KERNEL_OPERAND_DTYPES))
+        if missing:
+            raise TypeError(f"trntensor native ops without KERNEL_OPERAND_DTYPES: {missing}")
         _native_ops = _native.OPS
     return _native_ops
+
+
+def _native_op(op_name: str):
+    """The ``trntensor::<op_name>`` custom op, checking operand dtypes per call."""
+    op = _get_native_ops()[op_name]
+
+    def checked(*tensors, **consts):
+        _check_kernel_operands(op_name, tensors)
+        return op(*tensors, **consts)
+
+    return checked
+
+
+def _simulate(kernel, op_name: str, *tensors: torch.Tensor, **consts):
+    """``nki.simulate(kernel)`` on host numpy copies, after the dtype check."""
+    _check_kernel_operands(op_name, tensors)
+    return nki.simulate(kernel)(*(t.cpu().numpy() for t in tensors), **consts)
 
 
 def _launch(kernel, op_name: str, *tensors: torch.Tensor, **consts) -> torch.Tensor:
@@ -659,10 +800,12 @@ def _launch(kernel, op_name: str, *tensors: torch.Tensor, **consts) -> torch.Ten
     ``consts`` are compile-time kernel arguments (``use_sr``), passed by
     keyword on both paths. The result comes back on the device of
     ``tensors[0]``, so device-resident operands keep the result on the device.
+    Operand dtypes are checked against ``KERNEL_OPERAND_DTYPES`` on every path.
     """
+    _check_kernel_operands(op_name, tensors)
     if _get_dispatch_path() == "native":
         orig = tensors[0].device
-        op = _get_native_ops()[op_name]
+        op = _get_native_ops()[op_name]  # operands checked above
         return _to_host(op(*(t.to(_NEURON_DEVICE) for t in tensors), **consts), orig)
     xs, orig = _to_xla(*tensors)
     return kernel(*xs, **consts).to(orig)
@@ -961,6 +1104,13 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
         result = torch.matmul(A, B)
         return _stochastic_round_cpu(result, A.dtype) if use_sr else result
 
+    if not _matmul_kernel_dtypes_ok(A, B):
+        # float64 / integer / bool / complex / mixed: torch, as the pytorch
+        # backend (float64 reached the fp32 kernel through 0.22.0).
+        _no_kernel_for_dtype("matmul", _MATMUL_DTYPES, A, B)
+        result = torch.matmul(A, B)
+        return _stochastic_round_cpu(result, A.dtype) if use_sr else result
+
     if _on_native_path():
         _warn_native_kernel_deprecated("matmul")
 
@@ -987,9 +1137,7 @@ def nki_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -> torch.
             B_feed = B.contiguous()
 
         if _use_simulator():
-            out_np = nki.simulate(matmul_kernel)(
-                A_feed.cpu().numpy(), B_feed.cpu().numpy(), use_sr=use_sr
-            )
+            out_np = _simulate(matmul_kernel, "matmul", A_feed, B_feed, use_sr=use_sr)
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
             result = _launch(matmul_kernel, "matmul", A_feed, B_feed, use_sr=use_sr)
@@ -1053,12 +1201,7 @@ def _nki_mp2_energy(
     ev_b = ev_feed.reshape(1, -1).expand(TILE_M, -1).contiguous()
 
     if _use_simulator():
-        out_np = nki.simulate(mp2_energy_kernel)(
-            B_feed.cpu().numpy(),
-            eo_b.cpu().numpy(),
-            ev_feed.cpu().numpy(),
-            ev_b.cpu().numpy(),
-        )
+        out_np = _simulate(mp2_energy_kernel, "mp2_energy", B_feed, eo_b, ev_feed, ev_b)
         return torch.from_numpy(np.asarray(out_np)).to(B.device).sum()
 
     partial = _launch(mp2_energy_kernel, "mp2_energy", B_feed, eo_b, ev_feed, ev_b)
@@ -1280,7 +1423,7 @@ def _nki_mp2_energy_rows(
         B = B.to(_NEURON_DEVICE)
     Bt, Bx, eo, ex, evc, evr = _mp2_row_feeds(B, eps_occ, eps_vir, dims)
     nd_pad = dims["nd_pad"]
-    op = _get_native_ops()["mp2_energy_row"]
+    op = _native_op("mp2_energy_row")
     global _gc_may_free
     _gc_may_free = True
     acc = None
@@ -1345,10 +1488,8 @@ def _nki_ao_to_mo_transform(
         C_vir_feed = C_vir.contiguous()
 
     if _use_simulator():
-        out_np = nki.simulate(ao_to_mo_transform_kernel)(
-            eri_feed.cpu().numpy(),
-            C_occ_feed.cpu().numpy(),
-            C_vir_feed.cpu().numpy(),
+        out_np = _simulate(
+            ao_to_mo_transform_kernel, "ao_to_mo_transform", eri_feed, C_occ_feed, C_vir_feed
         )
         result = torch.from_numpy(np.asarray(out_np)).to(eri.device)
         return result[:, :nvir, :] if nvir_pad != nvir else result
@@ -1737,10 +1878,10 @@ def _nki_df_coulomb(B: torch.Tensor, pw: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("NKI not available")
     npair, naux = B.shape
     out_dtype = B.dtype
-    # The kernels take fp32 (or bf16). A float64 B went to them as is and
+    # The kernels take fp32. A float64 B went to them as is and
     # came back inf/garbage through 0.22.0; compute in fp32 and return B's
     # dtype, as the aten path does.
-    if B.dtype not in (torch.float32, torch.bfloat16):
+    if B.dtype != torch.float32:
         B = B.float()
     B = B.contiguous()
     pw = pw.reshape(npair, 1).to(B.dtype).contiguous()
@@ -1780,6 +1921,10 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
     if route != "nki":
         return torch.bmm(A, B)
 
+    if not _matmul_kernel_dtypes_ok(A, B):
+        _no_kernel_for_dtype("batched_matmul", _MATMUL_DTYPES, A, B)
+        return torch.bmm(A, B)
+
     if _on_native_path():
         _warn_native_kernel_deprecated("batched_matmul")
 
@@ -1806,8 +1951,8 @@ def nki_batched_matmul(A: torch.Tensor, B: torch.Tensor, use_sr: bool = False) -
             B_feed = B.contiguous()
 
         if _use_simulator():
-            out_np = nki.simulate(batched_matmul_kernel)(
-                A_feed.cpu().numpy(), B_feed.cpu().numpy(), use_sr=use_sr
+            out_np = _simulate(
+                batched_matmul_kernel, "batched_matmul", A_feed, B_feed, use_sr=use_sr
             )
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:

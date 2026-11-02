@@ -23,6 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One dtype guard at the NKI kernel boundary: float64, integer, bool and
+  complex operands no longer reach a kernel that does not take them**
+  (silent, trnsci/trnsci#35; the class of #87). `nki.dispatch` now has a
+  per-kernel operand-dtype table (`KERNEL_OPERAND_DTYPES`), and every launch
+  (native op, XLA call, simulator, the `mp2_energy` row loop, the
+  reduce-parallel all-reduce) checks it and raises `TypeError` otherwise; a
+  native op without an entry cannot be loaded. The host wrappers decide first:
+  - `einsum` / `multi_einsum` (matmul and batched-matmul kernels; fp32, bf16,
+    fp16, one shared dtype): float64, integer, bool, complex and mixed dtypes
+    run torch, as the pytorch backend does. Through 0.22.0 they reached the
+    kernels under `set_backend("nki")`, or `"auto"` above the size thresholds.
+  - `mp2_energy`, `ao_to_mo_transform` (fp32 / bf16 kernels) and
+    `df_exchange`, `df_coulomb` (fp32 kernels): float64 (#88), float16 and,
+    for `df_*`, bfloat16 operands are computed in fp32 and returned in the
+    aten route's dtype; integer, bool and complex take aten. bf16 `df_coulomb`
+    on the kernel route raised in the host tail whenever `npair` was not a
+    multiple of 256, and fell back to aten.
+  - reduce-parallel all-reduce: partials other than fp32 / bf16 / fp16 are
+    summed by `torch.distributed` instead of the NKI collective kernel.
+  - Under `TRNTENSOR_REQUIRE_NKI=1`, a dtype that would run torch instead of
+    the kernel raises `NotImplementedError` (trnblas's convention).
+  The `df_half_packed` op's fake (meta) output is now float32, like the
+  kernel's. Test: `tests/test_kernel_dtype_guard.py`.
 - **`einsum(precision="kahan")` rounded int32 values above 2**24 on the
   neuron device** (silent, #90). The device computes integer matmul in fp32.
   Since #70 integer operands contracted natively on any device. They now

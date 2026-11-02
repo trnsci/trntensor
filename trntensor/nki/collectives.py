@@ -78,12 +78,17 @@ def nki_all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
 
     Raises:
         RuntimeError: if no ``"neuron"`` process group is initialized.
+        TypeError: if ``t`` is not float32 / bfloat16 / float16 (the reduce-
+            parallel caller sends other dtypes to ``torch.distributed``).
     """
     global _kernel
     import torch.distributed as dist
 
+    from .dispatch import _check_kernel_operands
+
     if not (dist.is_available() and dist.is_initialized()):
         raise RuntimeError("nki_all_reduce_sum needs an initialized 'neuron' process group")
+    _check_kernel_operands("all_reduce", (t,))
     from nki.collectives import ReplicaGroup
     from torch_neuronx import wrap_nki
     from torch_neuronx.utils import get_logical_neuron_cores

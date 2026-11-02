@@ -281,13 +281,13 @@ class TestLaunchRouting:
             seen["use_sr"] = use_sr
             return a + b
 
-        monkeypatch.setattr(dispatch, "_native_ops", {"fake": op})
+        monkeypatch.setattr(dispatch, "_native_ops", {"matmul": op})
 
         def no_kernel(*t, **k):
             raise AssertionError("raw kernel must not be called on the native path")
 
         monkeypatch.setattr(dispatch, "_to_xla", _no_xla)
-        out = dispatch._launch(no_kernel, "fake", torch.ones(2, 1), torch.ones(2, 1), use_sr=True)
+        out = dispatch._launch(no_kernel, "matmul", torch.ones(2, 1), torch.ones(2, 1), use_sr=True)
         assert torch.equal(out, torch.full((2, 1), 2.0))
         assert out.device.type == "cpu"
         assert seen["use_sr"] is True
@@ -306,8 +306,10 @@ class TestLaunchRouting:
             raise AssertionError("native ops must not load on the XLA path")
 
         monkeypatch.setattr(dispatch, "_get_native_ops", no_ops)
-        out = dispatch._launch(lambda x, use_sr=False: x * 3, "unused", torch.ones(4, 1))
-        assert moved == [1]
+        out = dispatch._launch(
+            lambda x, y, use_sr=False: x * 3, "matmul", torch.ones(4, 1), torch.ones(1, 1)
+        )
+        assert moved == [2]
         assert torch.equal(out, torch.full((4, 1), 3.0))
 
     def test_cpu_launch_keeps_pre_native_behaviour(self, monkeypatch):
@@ -316,7 +318,7 @@ class TestLaunchRouting:
         monkeypatch.setattr(dispatch, "_dispatch_path", "cpu")
         monkeypatch.setitem(sys.modules, "torch_xla", None)
         with pytest.raises(ImportError):
-            dispatch._launch(lambda x: x, "unused", torch.ones(1, 1))
+            dispatch._launch(lambda x, y: x, "matmul", torch.ones(1, 1), torch.ones(1, 1))
 
 
 class TestPublicApiOnNativePath:

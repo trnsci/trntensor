@@ -90,7 +90,12 @@ def mp2_energy(
         if e is not None:
             return e.to(B.device)
     route = _mp2_energy_route(B)
+    kops = None
     if route != "aten":
+        # fp32 / bf16 kernels: float64 / float16 run in fp32; integer, bool
+        # and complex take aten (the dtype guard, `_chem_kernel_operands`).
+        kops = _dispatch._chem_kernel_operands("mp2_energy", B, eps_occ, eps_vir)
+    if kops is not None:
         from .nki import dispatch as _d
 
         try:
@@ -99,7 +104,7 @@ def mp2_energy(
             out_dtype = torch.promote_types(
                 torch.promote_types(B.dtype, eps_occ.dtype), eps_vir.dtype
             )
-            kB, keo, kev = (_kernel_operand(t) for t in (B, eps_occ, eps_vir))
+            kB, keo, kev = kops
             if route == "rows":
                 return _d._nki_mp2_energy_rows(kB, keo, kev).to(out_dtype)
             if _d._on_native_path():
@@ -130,17 +135,6 @@ def _on_device(fn, *tensors: torch.Tensor):
         if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
             raise
         return None
-
-
-def _kernel_operand(t: torch.Tensor) -> torch.Tensor:
-    """A float64 operand as float32 for the fp32 NKI kernels.
-
-    Trainium has no fp64 datapath. Through 0.22.0 float64 tensors reached the
-    chemistry kernels as is and came back inf (`ao_to_mo_transform`,
-    `df_exchange`, `df_coulomb`; #87). Strides are kept (`preserve_format`),
-    so layout detection still sees the caller's layout.
-    """
-    return t.float() if t.dtype == torch.float64 else t
 
 
 # Elements of the per-chunk T block (chunk·nocc·nvir²) the aten MP2 path
@@ -344,6 +338,11 @@ def ao_to_mo_transform(
             eri = eri.contiguous().to(C_occ.device)
 
     route = _ao_to_mo_route(eri, nocc, nvir, nbasis)
+    kops = None
+    if route != "aten":
+        kops = _dispatch._chem_kernel_operands("ao_to_mo_transform", eri, C_occ, C_vir)
+        if kops is None:  # integer / bool / complex: aten
+            route = "aten"
     if packed and route != "trn2":
         # aten / legacy consume the full square.
         return ao_to_mo_transform(unpack_tril(eri, nbasis), C_occ, C_vir)
@@ -360,7 +359,7 @@ def ao_to_mo_transform(
             )
         # The kernels compute in fp32; return the dtype the aten path gives.
         out_dtype = torch.promote_types(torch.promote_types(eri.dtype, C_occ.dtype), C_vir.dtype)
-        k_eri, k_co, k_cv = (_kernel_operand(t) for t in (eri, C_occ, C_vir))
+        k_eri, k_co, k_cv = kops
         try:
             if route == "trn2":
                 if packed:
@@ -462,10 +461,14 @@ def df_exchange(
         raise ValueError(f"B must be packed 2D or full 3D; got shape {tuple(B.shape)}")
     if B.device != C_occ.device:
         C_occ = C_occ.to(B.device)
+    kops = None
     if B.dim() == 2 and _dispatch._df_exchange_route(B, nocc, nbasis) == "trn2":
+        # C_occ is cast to the kernel dtype, as the aten route casts it to B's.
+        kops = _dispatch._chem_kernel_operands("df_exchange", B, allowed=_dispatch._F32_DTYPES)
+    if kops is not None:
         try:
             # fp32 kernel; the aten path returns B's dtype.
-            kB = _kernel_operand(B)
+            (kB,) = kops
             K = _dispatch._nki_df_exchange(kB, C_occ.to(kB.dtype)).to(B.dtype)
             return K * alpha if alpha != 1.0 else K
         except Exception:
@@ -557,9 +560,13 @@ def df_coulomb(B: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
     else:
         raise ValueError(f"D must be (nbasis, nbasis) or packed (npair,); got {tuple(D.shape)}")
     jp = None
+    kops = None
     if _dispatch._df_coulomb_route(B) == "trn2":
+        kops = _dispatch._chem_kernel_operands("df_coulomb", B, allowed=_dispatch._F32_DTYPES)
+    if kops is not None:
         try:
-            jp = _dispatch._nki_df_coulomb(B, pw)
+            (kB,) = kops
+            jp = _dispatch._nki_df_coulomb(kB, pw.to(kB.dtype)).to(B.dtype)
         except Exception:
             import os
 

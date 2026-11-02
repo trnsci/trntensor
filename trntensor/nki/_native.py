@@ -130,7 +130,8 @@ def _df_half_rows(eri_v, img, tp, tail):
             img.shape[1],
             C_occ.shape[1],
             C_occ.shape[0] // img.shape[1],
-        )
+        ),
+        dtype=torch.float32,  # the kernel's Xt is fp32 whatever eri_v's dtype
     ),
 )
 def df_half_packed(
