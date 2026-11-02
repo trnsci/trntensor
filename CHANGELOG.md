@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`trntensor.stream`: DF integrals streamed over the aux index**
+  (trnsolver#15). At nbasis 1658 the packed fp32 integrals were 33.4 GB and
+  only fit split over a Trn2 chip's 4 logical cores; at nbasis ≈ 3300 they
+  are about 270 GB.
+  - `AuxStream(chunks, nbasis, devices=..., resident_bytes=..., prefetch=...)`
+    holds `B` as `(npair, nq)` aux chunks (tensors, numpy memmaps or lazy
+    loaders), keeps chunks resident up to a per-device budget and uploads the
+    rest on every call from a loader thread, one chunk ahead per device, so
+    uploads overlap compute. `jk()` builds packed J and K in one pass
+    (`df_coulomb` / `df_exchange` per chunk, summed per device, then on the
+    host); `ao_to_mo()` writes `B_ia^P` chunk by chunk into a host tensor or
+    memmap. Chunks are dealt round-robin over `devices` (`neuron:0..3`).
+  - `aux_chunk_width` / `split_aux`: 128-multiple chunks under 2 GiB by
+    default, below the 4 GiB transposed-LHS limit (aws-neuron-sdk#1457, #97).
+  - `pack_density` / `unpack_packed`: the packed-density helpers, for use on
+    host tensors at large nbasis (the device gathers compile for > 40 min at
+    nbasis 1658, trnsolver#87).
+  - `mp2_energy_blocked`: DF-MP2 over occupied blocks of a host `B_ia^P`,
+    for `B` larger than one device.
+  - Memory-mapped chunks are read into RAM with one sequential read when
+    loaded. Left mapped, the row gathers of `df_exchange` fault pages in at
+    random, which was disk-bound on a disk-backed store.
+  - CPU-validated against dense references; device overlap and scaling are
+    still to be measured.
+
 ### Fixed
 
 - **`einsum(..., out=)` now writes the result into `out` and returns it
