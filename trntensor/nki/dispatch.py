@@ -562,6 +562,15 @@ def _to_xla(*tensors):
 # import, and the native probe never imports torch_xla.
 
 _NEURON_DEVICE = "neuron"
+
+# TorchNeuron's aten matmul with a transposed-view left operand returns wrong
+# values (or a DMA abort) once the right operand exceeds 2**32 bytes, fp32 and
+# bf16, LNC=1 and 2 (torch-neuronx 2.14.3; aws-neuron-sdk#1448, #97).
+# Measured: wrong above 2**32 bytes (exactly 2**32 is correct) when the
+# contraction dim is a multiple of 128; the guard starts at 2**32 and
+# ignores the multiple-of-128 condition.
+_ATEN_TRANSPOSED_LHS_MAX_BYTES = 1 << 32
+
 _dispatch_path: str | None = None
 _native_ops: dict | None = None
 

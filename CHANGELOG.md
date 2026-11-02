@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ao_to_mo_transform` aten route on the device: wrong results from 4 GiB of
+  `eri` (#97).** On TorchNeuron (torch-neuronx 2.14.3), a matmul whose left
+  operand is a transposed view returns wrong values, without an error, once the
+  right operand exceeds 2^32 bytes and the contraction dim is a multiple of 128.
+  If the right operand came straight from the host it aborts instead
+  (aws-neuron/aws-neuron-sdk#1448). Both `torch.einsum` steps of the aten route
+  lower to that matmul, so at nbasis 768 / naux 2304 the result was off by
+  about 1 relative. On the device, from 2^32 bytes of `eri` or of the
+  half-transformed tensor, the two steps now run as `mm` and `bmm` with
+  contiguous orbital transposes. At 768/64/2304 the error against float64 is
+  2.2e-7 (was 1.06), and a warm call takes 16.1 ms (the wrong route took
+  25 ms).
+
 - **`einsum(precision="kahan")` rounded int32 values above 2**24 on the
   neuron device** (silent, #90). The device computes integer matmul in fp32.
   Since #70 integer operands contracted natively on any device. They now
