@@ -118,6 +118,14 @@ def unpack_packed(jp: torch.Tensor, nbasis: int) -> torch.Tensor:
     return jp.index_select(0, idx).reshape(nbasis, nbasis)
 
 
+def _is_memmap(x) -> bool:
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(x, np.memmap)
+
+
 def _itemsize(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
@@ -235,6 +243,13 @@ class AuxStream:
         src = self._sources[i]
         if callable(src) and not isinstance(src, torch.Tensor):
             src = src()
+        if _is_memmap(src):
+            # One sequential read into RAM. Left mapped, the kernels' row
+            # gathers (df_exchange's tril rows) fault pages in at random, which
+            # on a disk-backed store ran > 10x slower than the read itself.
+            import numpy as np
+
+            src = np.array(src, copy=True)
         t = _as_tensor(src)
         if t.dtype != self.dtype:
             t = t.to(self.dtype)  # on the host: halves the bytes moved for fp64
