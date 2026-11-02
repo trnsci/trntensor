@@ -55,6 +55,31 @@ def ao_to_mo_trn2_tiling(naux: int, packed: bool = False) -> tuple[int, int]:
     return tp, ao_to_mo_trn2_nub(tp)
 
 
+def ao_to_mo_trn2_occ_blocks(nocc: int) -> list[tuple[int, int]]:
+    """``(offset, size)`` occupied blocks for stage 1 of the Trn2 AO→MO kernels.
+
+    Stage 1 puts the occupied index on PSUM partitions (and on the
+    stationary operand's columns), so a block holds at most 128 orbitals.
+    The blocks are as even as possible (e.g. 160 → 80 + 80, 257 → 86 + 86 +
+    85) rather than 128 + remainder: every block costs the same Tensor
+    Engine passes over the shared eri block, so balance does not change the
+    work, but it keeps every PSUM tile and store well above the tiny tails.
+    """
+    nob = max(1, -(-nocc // TILE_M))
+    base, extra = divmod(nocc, nob)
+    out, o0 = [], 0
+    for b in range(nob):
+        sz = base + (1 if b < extra else 0)
+        out.append((o0, sz))
+        o0 += sz
+    return out
+
+
+def ao_to_mo_trn2_groups(n: int, g: int) -> list[tuple[int, int]]:
+    """``(offset, size)`` runs of ``g`` (the last one shorter) covering ``range(n)``."""
+    return [(o, min(g, n - o)) for o in range(0, n, g)]
+
+
 def ao_to_mo_trn2_nub(tp: int) -> int:
     """ν per stage-1 block for aux chunk ``tp``: the largest power of two
     ≤ 8 with ``NUB·tp ≤ 2048``."""
@@ -539,8 +564,21 @@ if HAS_NKI:
         NPC = NAUX // TP
         NKB = NB // TILE
         NAV = NVIR // TILE
-        n_prog, pid, _axis = _programs(NPC)
-        NPC_per = NPC // n_prog
+        # Split the aux chunks across the programs; with an odd chunk count
+        # and NOCC > 128, split the occupied index instead (the dispatcher
+        # pads NOCC to even): each program then reads all of eri but runs
+        # half the occupied blocks and owns its rows of X and B (#80).
+        n_prog, pid, axis = _programs(NPC, NOCC if NOCC > TILE else 1)
+        if axis == 1:
+            NPC_per, c_base = NPC, 0
+            OCC_per = NOCC // n_prog
+            o_base = pid * OCC_per
+        else:
+            NPC_per = NPC // n_prog
+            c_base = pid * NPC_per
+            OCC_per, o_base = NOCC, 0
+        NUM = min(NUB, 512 // TP)  # ν per stage-1 matmul
+        NI = max(1, min(OCC_per, 512 // TP))  # occupied orbitals per stage-2 matmul
 
         B_out = nl.ndarray((NOCC, NVIR, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
         x_hbm = nl.ndarray((NOCC, NB, NAUX), dtype=eri.dtype, buffer=nl.shared_hbm)
@@ -556,7 +594,7 @@ if HAS_NKI:
             )
 
         for pc in nl.affine_range(NPC_per):
-            c = pid * NPC_per + pc
+            c = c_base + pc
             p_off = c * TP
             if img is not None:
                 # This chunk's gather indices: NKB·NB·4 bytes per partition.
@@ -583,39 +621,58 @@ if HAS_NKI:
                                 indirect_dim=0,
                             ),
                         )
-                x_sb = nl.ndarray((NOCC, NUB, TP), dtype=eri.dtype, buffer=nl.sbuf)
-                for u in nl.affine_range(NUB):
-                    px = nl.zeros((NOCC, TP), dtype=nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(NKB):
-                        nisa.nc_matmul(
-                            dst=px,
-                            stationary=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
-                            moving=e_blk[0:TILE, k, u, 0:TP],
-                            accumulate=True,
-                        )
-                    nisa.tensor_copy(src=px, dst=x_sb[0:NOCC, u, 0:TP])
-                nl.store(x_hbm[0:NOCC, v0 : v0 + NUB, p_off : p_off + TP], value=x_sb)
-            # Stage 2: B[i, a-tile, Pc].
-            for i in nl.affine_range(NOCC):
-                x_i = nl.ndarray((TILE, NKB * TP), dtype=eri.dtype, buffer=nl.sbuf)
+                # Occupied blocks of <= 128 (PSUM partitions / stationary
+                # columns) share the one eri block, so a program reads each
+                # eri block once for any NOCC (#80). Static sizes: a Python loop.
+                for b0, osz in ao_to_mo_trn2_occ_blocks(OCC_per):
+                    o0 = o_base + b0
+                    x_sb = nl.ndarray((osz, NUB, TP), dtype=eri.dtype, buffer=nl.sbuf)
+                    # NUM ν per matmul: one 512-column moving pass (one PSUM bank).
+                    for ug in nl.affine_range(NUB // NUM):
+                        u0 = ug * NUM
+                        px = nl.zeros((osz, NUM, TP), dtype=nl.float32, buffer=nl.psum)
+                        for k in nl.affine_range(NKB):
+                            nisa.nc_matmul(
+                                dst=px,
+                                stationary=co_sb[0:TILE, k * NOCC + o0 : k * NOCC + o0 + osz],
+                                moving=e_blk[0:TILE, k, u0 : u0 + NUM, 0:TP],
+                                accumulate=True,
+                            )
+                        nisa.tensor_copy(src=px, dst=x_sb[0:osz, u0 : u0 + NUM, 0:TP])
+                    nl.store(x_hbm[o0 : o0 + osz, v0 : v0 + NUB, p_off : p_off + TP], value=x_sb)
+            # Stage 2: B[i, a-tile, Pc], NI occupied orbitals per 512-column
+            # moving pass (static groups: NOCC need not divide).
+            for g0, ni in ao_to_mo_trn2_groups(OCC_per, NI):
+                i0 = o_base + g0
+                x_g = nl.ndarray((TILE, NKB, NI, TP), dtype=eri.dtype, buffer=nl.sbuf)
                 for k in nl.affine_range(NKB):
-                    x_i[0:TILE, k * TP : (k + 1) * TP] = nl.load(
-                        x_hbm[i, k * TILE : (k + 1) * TILE, p_off : p_off + TP]
+                    # One DMA for the group: X[i0:i0+ni, ν-tile, Pc] with ν
+                    # on partitions (explicit strides, no transpose).
+                    nisa.dma_copy(
+                        dst=x_g[0:TILE, k, 0:ni, 0:TP],
+                        src=x_hbm[i0 : i0 + 1, k * TILE : k * TILE + 1, p_off : p_off + 1].ap(
+                            pattern=[[NAUX, TILE], [NB * NAUX, ni], [1, TP]]
+                        ),
                     )
                 for av in nl.affine_range(NAV):
-                    pb = nl.zeros((TILE, TP), dtype=nl.float32, buffer=nl.psum)
+                    pb = nl.zeros((TILE, ni, TP), dtype=nl.float32, buffer=nl.psum)
                     for k in nl.affine_range(NKB):
                         nisa.nc_matmul(
                             dst=pb,
                             stationary=cv_sb[
                                 0:TILE, k * NVIR + av * TILE : k * NVIR + (av + 1) * TILE
                             ],
-                            moving=x_i[0:TILE, k * TP : (k + 1) * TP],
+                            moving=x_g[0:TILE, k, 0:ni, 0:TP],
                             accumulate=True,
                         )
-                    b_sb = nl.ndarray((TILE, TP), dtype=eri.dtype, buffer=nl.sbuf)
+                    b_sb = nl.ndarray((TILE, ni, TP), dtype=eri.dtype, buffer=nl.sbuf)
                     nisa.tensor_copy(src=pb, dst=b_sb)
-                    nl.store(B_out[i, av * TILE : (av + 1) * TILE, p_off : p_off + TP], value=b_sb)
+                    nisa.dma_copy(
+                        dst=B_out[i0 : i0 + 1, av * TILE : av * TILE + 1, p_off : p_off + 1].ap(
+                            pattern=[[NAUX, TILE], [NVIR * NAUX, ni], [1, TP]]
+                        ),
+                        src=b_sb,
+                    )
         return B_out
 
     @nki.jit
@@ -625,17 +682,21 @@ if HAS_NKI:
         Two plain GEMM stages per auxiliary chunk of ``TP`` columns:
 
         1. ``X[i, ν, Pc] = Σ_μ C_occ[μ, i] · eri[μ, ν, Pc]``: stationary
-           ``C_occ`` μ-tile (resident in SBUF), moving ``eri[μ-tile, ν, Pc]``.
-           X goes to kernel-scratch HBM, i-major.
+           ``C_occ`` μ-tile (resident in SBUF), moving ``eri[μ-tile, ν, Pc]``
+           for ``512 // TP`` consecutive ν at once. Occupied blocks of ≤ 128
+           (PSUM partitions) reuse the one eri block, so eri is read once
+           for any NOCC (#80). X goes to kernel-scratch HBM, i-major.
         2. ``B[i, a, Pc] = Σ_ν C_vir[ν, a] · X[i, ν, Pc]``: stationary ``C_vir``
-           tile (resident), moving ``X[i, ν-tile, Pc]`` (ν on partitions).
+           tile (resident), moving ``X[i, ν-tile, Pc]`` (ν on partitions) for
+           ``512 // TP`` consecutive i at once, fetched and stored with one
+           strided DMA per group.
 
         Every load has the contraction index on the partition axis, so there
         are no DMA transposes. The aux chunks are split across the programs
         of the logical core (both physical cores at LNC=2); each program
         reads back only the X it wrote.
 
-        NBASIS, NVIR multiples of 128; NOCC ≤ 128; NAUX a multiple of 128.
+        NBASIS, NVIR multiples of 128; NAUX a multiple of 128; any NOCC.
         """
         NB, _, NAUX = eri.shape
         TP, NUB = ao_to_mo_trn2_tiling(NAUX)

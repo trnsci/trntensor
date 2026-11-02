@@ -230,8 +230,9 @@ def ao_to_mo_transform(
     - Native TorchNeuron path (Trn2/Trn3): ``ao_to_mo_trn2_kernel``. Both
       stages are plain GEMMs with the contraction index on the partition
       axis (no DMA transposes), and the auxiliary index is split across both
-      physical cores at LNC=2. ``"auto"`` uses it for device-resident ``eri``
-      with ``nocc ≤ 128`` when its SBUF working set fits and the stage-1
+      physical cores at LNC=2; ``nocc > 128`` runs in occupied blocks of
+      ≤ 128 over one read of ``eri`` (#80). ``"auto"`` uses it for
+      device-resident ``eri`` when its SBUF working set fits and the stage-1
       work ``nocc·nbasis²·naux`` is at least 5e8 multiply-adds (about
       nbasis ≥ 256). There it measured 1.3-1.6x faster than the two aten
       einsums on Trn2 (#51). Otherwise the
@@ -350,8 +351,8 @@ def ao_to_mo_transform(
         from .nki import dispatch as _d
 
         # The original kernel: NOCC ≤ 128 is the stationary M dim of its
-        # step-2 nc_matmul; M-tiling not implemented. (The Trn2 kernel's
-        # route already requires nocc ≤ 128.)
+        # step-2 nc_matmul; M-tiling not implemented. (The Trn2 kernel
+        # tiles the occupied index itself, #80.)
         if route == "legacy" and nocc > 128:
             raise NotImplementedError(
                 f"ao_to_mo_transform NKI path requires nocc ≤ 128 "
@@ -393,8 +394,34 @@ def _cpu_ao_to_mo_transform(
     Contracting ``μ`` first (``inP``), then ``ν``, is the O(nbasis²·nocc·naux)
     order; it never builds the 4-index ``C_occ ⊗ C_vir`` outer product.
     """
+    if eri.device.type == _dispatch._NEURON_DEVICE and (
+        eri.numel() * eri.element_size() >= _dispatch._ATEN_TRANSPOSED_LHS_MAX_BYTES
+        or C_occ.shape[1] * eri.shape[1] * eri.shape[2] * eri.element_size()
+        >= _dispatch._ATEN_TRANSPOSED_LHS_MAX_BYTES
+    ):
+        return _ao_to_mo_contiguous_lhs(eri, C_occ, C_vir)
     half = torch.einsum("mi,mnP->inP", C_occ, eri)
     return torch.einsum("na,inP->iaP", C_vir, half)
+
+
+def _ao_to_mo_contiguous_lhs(
+    eri: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """The two aten steps with contiguous left operands (large ``eri`` on a device).
+
+    ``torch.einsum`` lowers both steps to a matmul whose left operand is a
+    transposed view (``C_occ.T``, ``C_vir.T``). On TorchNeuron that matmul
+    returns wrong values without an error (or aborts with a DMA error) once
+    the right operand reaches 4 GiB (#97, aws-neuron-sdk#1448). With
+    the transposes materialised (a few MB) the same products are correct.
+    """
+    nbasis, _, naux = eri.shape
+    nocc, nvir = C_occ.shape[1], C_vir.shape[1]
+    half = torch.mm(C_occ.T.contiguous(), eri.reshape(nbasis, nbasis * naux))
+    half = half.reshape(nocc, nbasis, naux)
+    return torch.bmm(C_vir.T.contiguous().expand(nocc, nvir, nbasis), half)
 
 
 # Bytes of gathered packed rows the aten df_exchange path materialises at
