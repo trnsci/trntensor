@@ -171,7 +171,6 @@ def xfail_decide(issue, why):
     return pytest.mark.xfail(strict=True, reason=f"trnsci/trntensor#{issue}: {why}")
 
 
-XF_CP_DTYPE = xfail_decide(78, "cp_decompose/cp_reconstruct hard-code float32 CPU buffers")
 XF_SHARD = xfail_decide(78, "output-parallel sharded einsum does not co-partition operands")
 
 
@@ -964,7 +963,6 @@ def test_cp_reconstruct_formula():
         assert_ref(got, torch.einsum("r,ir,jr,kr,lr->ijkl", w, *f), tol=tol, check_dtype=False)
 
 
-@XF_CP_DTYPE
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_cp_reconstruct_keeps_dtype(dtype):
     gen = torch.Generator().manual_seed(37)
@@ -973,9 +971,8 @@ def test_cp_reconstruct_keeps_dtype(dtype):
     assert_ref(tt.cp_reconstruct([d(x) for x in f], d(w)), torch.einsum("r,ir,jr,kr->ijk", w, *f))
 
 
-@XF_CP_DTYPE
 @pytest.mark.parametrize("warm", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float64, torch.complex64])
+@pytest.mark.parametrize("dtype", [torch.float64, torch.complex64, torch.complex128])
 def test_cp_decompose_non_fp32(dtype, warm):
     gen = torch.Generator().manual_seed(38)
     vs = [torch.randn(n, generator=gen, dtype=dtype) for n in (4, 5, 3)]

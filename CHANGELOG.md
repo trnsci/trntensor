@@ -36,6 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cp_decompose` works in the input dtype, including float64 and complex
+  (#103).** Affected 0.1.1–0.23.0: the random init and the Khatri-Rao buffer
+  were float32 on the host, so float64 or complex input raised `expected m1
+  and m2 to have the same dtype` on every backend (and a float64 warm start
+  was truncated to float32 inside the Khatri-Rao product). The init, the
+  Khatri-Rao buffer and the weights now follow `tensor.dtype` and
+  `tensor.device`, warm-start factors are cast to them, and complex input
+  uses the conjugated normal equations `(V^H V) A^T = (T_(k) conj(V))^T`.
+  Weights are real (`tensor.real.dtype`). `nonneg=True` with complex input
+  raises `ValueError`. Real float32 results are bit-identical.
+- **`cp_reconstruct` returns the factors' dtype on the factors' device
+  (#78).** Affected 0.1.1–0.23.0: it accumulated into a float32 host buffer
+  (`torch.zeros(shape)`), so bf16 or fp16 factors came back as float32 and
+  device factors raised a device mismatch. The buffer now has the promoted
+  dtype of `factors` and `weights` and the factors' device. float32 and
+  float64 results are unchanged.
 - **`plan_contraction` fills `ContractionPlan.estimated_flops` (#83).**
   Affected 0.1.1–0.23.0: the documented multiply-add estimate was never set
   and always read 0. `matmul`, `bmm` and `torch` plans now carry
