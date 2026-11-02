@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
+
 ### Fixed
 
 - **`einsum(precision="dd")` on float32 / float64 operands was less accurate
@@ -36,13 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inf in the buffer (e.g. `torch.empty`) made the result NaN (silent, every
   backend). Affects 0.3.0 through 0.22.0. `beta == 0` now ignores `out`, as
   in BLAS, cuTENSOR and trnblas (#71).
-### Fixed
-
 - **`tucker_decompose` returned a wrong core for complex tensors** (silent,
   every backend): it projected with `Uᵀ` instead of `Uᴴ`, so even a
   full-rank reconstruction was off by ~140 %. Affects every release through
   0.22.0. `tt_decompose` now also accepts complex tensors instead of raising
   (#73). Real tensors are unchanged.
+- **`precision="kahan"` / `"dd"` / `target_forward_error` dropped the imaginary
+  part of complex operands and rounded large integers** (silent, every
+  backend). Affects `"kahan"` in 0.4.0 through 0.22.0, and `"dd"` and
+  `target_forward_error` in 0.17.0 through 0.22.0. Complex operands now
+  accumulate in complex128, and integer operands contract natively, which is
+  exact (#69).
 
 ## [0.22.0] — 2026-11-01
 
