@@ -965,7 +965,6 @@ def test_cp_reconstruct_formula():
         assert_ref(got, torch.einsum("r,ir,jr,kr,lr->ijkl", w, *f), tol=tol, check_dtype=False)
 
 
-@XF_CP_DTYPE
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_cp_reconstruct_keeps_dtype(dtype):
     gen = torch.Generator().manual_seed(37)

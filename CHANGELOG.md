@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cp_reconstruct` returns the factors' dtype on the factors' device
+  (#78).** Affected 0.1.1–0.23.0: it accumulated into a float32 host buffer
+  (`torch.zeros(shape)`), so bf16 or fp16 factors came back as float32 and
+  device factors raised a device mismatch. The buffer now has the promoted
+  dtype of `factors` and `weights` and the factors' device. float32 and
+  float64 results are unchanged.
+
 - **`einsum(..., out=)` now writes the result into `out` and returns it
   (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
   and never written, so the documented in-place accumulation example
