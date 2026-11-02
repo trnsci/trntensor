@@ -71,7 +71,9 @@ def einsum(
         beta: Scalar multiplier applied to ``out`` before accumulation (default 0.0).
         out: Optional accumulation tensor. When provided the return value is
             ``alpha * contract(operands) + beta * out``. Must have the same
-            shape as the contraction result.
+            shape as the contraction result. With ``beta == 0`` (the
+            default) ``out`` is not read, as in BLAS and cuTENSOR, so NaN or
+            inf in it does not propagate.
         dtype: Optional compute dtype. When set, all operands are cast to this
             dtype before contracting and the result is returned in that dtype.
             Accepts ``torch.dtype`` instances or strings: ``"bf16"``,
@@ -150,6 +152,11 @@ def einsum(
         operands = tuple(op.to(target) for op in operands)
     plan = plan_contraction(subscripts, *operands, precision=precision)
     result = _execute_contraction(subscripts, operands, plan)
+    if beta == 0.0:
+        # BLAS / cuTENSOR / trnblas convention: with beta == 0 ``out`` is not
+        # read, so NaN or inf in it (e.g. a torch.empty buffer) cannot leak
+        # into the result through 0 * NaN.
+        out = None
     if alpha == 1.0 and out is None:
         return result
     return _scale_add(result, alpha, beta, out, operands)
@@ -416,8 +423,28 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
                 "GEMM kernels (trnblas#22). Use precision='kahan' (fp64 accumulation) "
                 "as an alternative."
             )
-        # CPU: Ozaki-2 for matmul; recurse for path (binary steps get Ozaki);
-        # kahan fallback for bmm and torch strategies.
+        dts = {op.dtype for op in operands}
+        if dts == {torch.float32}:
+            # fp32 x fp32 products are exact in fp64, so fp64 accumulation
+            # (K * 2**-53) already beats the dd bound K * u_fp32**2 (#84).
+            return _einsum_fp64(subscripts, operands)
+        if dts == {torch.float64}:
+            # Double-word accumulation of exact products (#84); the generic
+            # "torch" strategy has no dd kernel and accumulates in fp64.
+            from .nki.dispatch import _dd_matmul_fp64_cpu
+
+            if plan.strategy == "matmul":
+                A, B = operands
+                a = A.T if plan.transA else A
+                b = B.T if plan.transB else B
+                return _dd_matmul_fp64_cpu(a, b)
+            if plan.strategy == "bmm":
+                return _dd_matmul_fp64_cpu(*operands)
+            if plan.strategy == "path":
+                return _execute_path(subscripts, operands, plan)
+            return _einsum_fp64(subscripts, operands)
+        # bf16/fp16 (and other dtypes): Ozaki-2 for matmul; recurse for path
+        # (binary steps get Ozaki); kahan fallback for bmm and torch strategies.
         if plan.strategy == "matmul":
             A, B = operands
             a = A.T if plan.transA else A

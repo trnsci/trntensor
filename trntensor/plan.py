@@ -158,7 +158,7 @@ def plan_contraction(
         precision: Accumulation precision. ``"fast"`` (default) uses native dtype
             and may route to NKI kernels. ``"kahan"`` promotes operands to fp64
             before contracting and casts the result back to the original dtype.
-            ``"dd"`` requests double-double accumulation (not yet available).
+            ``"dd"`` requests double-double accumulation (see below).
             ``"sr"`` applies stochastic rounding at the PSUM→SBUF downcast step
             in the NKI matmul kernel — reduces accumulation bias for long
             K-reductions in BF16 (correctness requirement for K ≥ ~300).
@@ -168,12 +168,14 @@ def plan_contraction(
             Without it a one-time ``RuntimeWarning`` is emitted and results are
             round-to-nearest; with it, *all* downcasts in the process round
             stochastically, including ``"fast"``.
-            ``"dd"`` double-double accumulation via Ogita–Rump–Oishi error-free
-            split: splits each FP32 operand into two BF16-precision summands,
-            computes four BF16-precision matmuls, sums in FP32.
-            On CPU: ``_ozaki_matmul_cpu`` (named mock for trnblas#22).
-            Applies to ``matmul`` strategy; ``path`` execution propagates to binary
-            matmul steps; ``bmm`` and ``torch`` strategies fall back to kahan.
+            ``"dd"`` double-double accumulation. On CPU, by operand dtype:
+            BF16/FP16 run ``_ozaki_matmul_cpu`` (Ozaki-2, named mock for
+            trnblas#22) on ``matmul`` plans and ``path`` steps, kahan on
+            ``bmm`` / ``torch`` plans; FP32 runs as kahan (FP32 products are
+            exact in FP64, so FP64 accumulation is inside K·u²); FP64 runs
+            ``_dd_matmul_fp64_cpu`` (exact TwoProduct products, double-word
+            accumulation) on ``matmul`` / ``bmm`` plans and ``path`` steps, and
+            plain FP64 accumulation on ``torch`` plans.
             On Trainium: requires trnblas Phase 2 GEMM kernels (trnblas#22).
     """
     _validate_subscripts(subscripts, operands)
@@ -461,6 +463,12 @@ def forward_error_bound(mode: str, dtype: torch.dtype, K: int) -> float:
 
     Here ``u`` is the operand unit roundoff; the result is returned in the
     operand dtype, so ``u_out == u``. ``u_out`` is the floor no mode can beat.
+
+    ``"dd"`` on CPU: float32 operands run with fp64 accumulation, whose
+    K · 2⁻⁵³ is inside K · u²; float64 operands use double-word accumulation
+    (at most ~3 K · u², far below ``u_out`` for any feasible K), except on
+    generic ``torch``-strategy plans, which accumulate in plain fp64 and get
+    the ``"kahan"`` bound.
     """
     u = _UNIT_ROUNDOFF.get(dtype, _UNIT_ROUNDOFF[torch.float32])
     if mode == "fast":
