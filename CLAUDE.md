@@ -21,7 +21,9 @@ trntensor/
 │   ├── __init__.py
 │   ├── einsum.py        # einsum(), multi_einsum()
 │   ├── plan.py          # ContractionPlan, plan_contraction(), estimate_flops()
-│   ├── decompose.py     # cp_decompose, tucker_decompose (HOSVD)
+│   ├── decompose.py     # cp_decompose, tucker_decompose (HOSVD), tt_decompose
+│   ├── quantum.py       # mp2_energy, ao_to_mo_transform, df_exchange, df_coulomb
+│   ├── parallel.py      # ShardedTensor, scatter, gather
 │   └── nki/
 │       ├── __init__.py
 │       ├── _kernels.py  # @nki.jit kernels
@@ -38,8 +40,10 @@ trntensor/
 ## Contraction Planning
 
 The planner analyzes einsum subscripts and selects:
-- **matmul**: 2D contraction over single index → `torch.matmul`
-- **bmm**: batched 2D contraction → `torch.bmm`
+- **matmul**: 2D contraction over single index, output `[A free, B free]` → `torch.matmul`
+- **bmm**: exactly `bij,bjk->bik` → `torch.bmm`
+  (other index orders go to `torch.einsum`; before 0.22.0 they silently
+  returned the wrong layout, #64)
 - **torch**: complex patterns → `torch.einsum`
 - **(future) nki**: fused multi-index contractions on Tensor Engine
 

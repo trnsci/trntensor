@@ -7,8 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
+  trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
+  `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
+  closure variable or a module global that is not a constant expression
+  (reviewed exceptions are allow-listed with a reason), and checks each
+  kernel's `__closure__` at runtime against a stub `nki`.
+- Tests: `conftest.py` no longer turns the NKI trace cache off. Neuron tests
+  run with it on, as under `import torch_neuronx`, with a fresh
+  `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
+  traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
+- README: known platform issue note for #1454.
+
 ### Fixed
 
+- **`einsum(precision="dd")` on float32 / float64 operands was less accurate
+  than `"fast"`** (silent; 0.17.0 through 0.22.0, the CPU emulation; Trainium
+  raises `NotImplementedError`). The CPU route split every operand into two
+  bf16-precision pieces (~16 mantissa bits) and rounded float64 operands to
+  float32, so the error was ~1e-5 instead of the documented K·u² + u_out
+  (6e-8 fp32, 1.1e-16 fp64). float32 operands now accumulate in fp64 (exact
+  products, inside K·u²). float64 operands form exact TwoProduct products and
+  sum them in double-word arithmetic on `matmul` / `bmm` plans and `path`
+  steps; generic `torch` plans accumulate in fp64. bf16 / fp16 `"dd"` and
+  every `"fast"` result are unchanged (#84).
+- **`einsum(..., out=C)` with `beta=0` (the default) read `C`**, so NaN or
+  inf in the buffer (e.g. `torch.empty`) made the result NaN (silent, every
+  backend). Affects 0.3.0 through 0.22.0. `beta == 0` now ignores `out`, as
+  in BLAS, cuTENSOR and trnblas (#71).
+- **`tucker_decompose` returned a wrong core for complex tensors** (silent,
+  every backend): it projected with `Uᵀ` instead of `Uᴴ`, so even a
+  full-rank reconstruction was off by ~140 %. Affects every release through
+  0.22.0. `tt_decompose` now also accepts complex tensors instead of raising
+  (#73). Real tensors are unchanged.
 - **`precision="kahan"` / `"dd"` / `target_forward_error` dropped the imaginary
   part of complex operands and rounded large integers** (silent, every
   backend). Affects `"kahan"` in 0.4.0 through 0.22.0, and `"dd"` and
