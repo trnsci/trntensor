@@ -52,7 +52,7 @@ the planner returns.
 | `contraction_indices` | `list[str]` | Indices summed over |
 | `batch_indices` | `list[str]` | Shared batch indices |
 | `output_indices` | `list[str]` | Output index order |
-| `estimated_flops` | `int` | Multiply-add estimate |
+| `estimated_flops` | `int` | Multiply-adds of the plan: `estimate_flops(...)` for `"matmul"` / `"bmm"` / `"torch"`, the sum over binary steps for `"path"` (always 0 through 0.23.0, #83) |
 | `contraction_path` | `list[tuple[int,int]]` | Greedy pair order for `"path"` strategy (opt_einsum convention) |
 | `precision` | `str` | `"fast"` \| `"kahan"` \| `"dd"` \| `"sr"` |
 

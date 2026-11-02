@@ -172,7 +172,6 @@ def xfail_decide(issue, why):
 
 
 XF_SHARD = xfail_decide(78, "output-parallel sharded einsum does not co-partition operands")
-XF_FLOPS = xfail_decide(83, "ContractionPlan.estimated_flops is never filled in")
 
 
 # --------------------------------------------------------------------------- #
@@ -1115,7 +1114,6 @@ def test_estimate_flops(sub, shapes):
     assert tt.estimate_flops(sub, *ops) == int(np.prod(list(sizes.values())))
 
 
-@XF_FLOPS
 @pytest.mark.parametrize(
     "sub,shapes", [("ij,jk->ik", [(6, 5), (5, 7)]), ("ij,jk->ki", [(6, 5), (5, 7)])]
 )
