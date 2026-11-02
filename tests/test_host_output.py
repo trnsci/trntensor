@@ -104,10 +104,10 @@ class TestScaleAddEpilogue:
         want = torch.einsum("ij,jk->ik", A, B).mul(alpha)
         if with_out:
             want = want.add(C, alpha=beta)
-        C0 = C.clone()
         got = trntensor.einsum("ij,jk->ik", A, B, alpha=alpha, beta=beta, out=out)
         assert torch.equal(got, want)
-        assert torch.equal(C, C0)  # out is read, never written
+        if with_out:
+            assert got is C  # out is the output operand (#77)
 
     def test_view_of_operand_is_not_overwritten(self):
         import trntensor

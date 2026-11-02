@@ -70,11 +70,16 @@ def einsum(
         *operands: Input tensors.
         alpha: Scalar multiplier applied to the contraction result (default 1.0).
         beta: Scalar multiplier applied to ``out`` before accumulation (default 0.0).
-        out: Optional accumulation tensor. When provided the return value is
-            ``alpha * contract(operands) + beta * out``. Must have the same
-            shape as the contraction result. With ``beta == 0`` (the
-            default) ``out`` is not read, as in BLAS and cuTENSOR, so NaN or
-            inf in it does not propagate.
+        out: Optional output tensor, as in ``torch.einsum`` and cuTENSOR.
+            When provided, ``alpha * contract(operands) + beta * out`` is
+            written into ``out`` and ``out`` is returned. Must have the same
+            shape as the contraction result, and the result dtype must be
+            castable to ``out.dtype`` (``torch.can_cast``). With ``beta == 0``
+            (the default) the old contents of ``out`` are not read, as in BLAS
+            and cuTENSOR, so NaN or inf in it does not propagate. Like
+            ``torch.einsum(out=)``, it raises ``RuntimeError`` when grad mode
+            is on and an operand or ``out`` requires grad. ``out`` may alias
+            an operand: the result is formed before ``out`` is written.
         dtype: Optional compute dtype. When set, all operands are cast to this
             dtype before contracting and the result is returned in that dtype.
             Accepts ``torch.dtype`` instances or strings: ``"bf16"``,
@@ -105,8 +110,11 @@ def einsum(
         # Force bf16 compute (e.g. to hit NKI bf16 matmul kernel)
         einsum("ij,jk->ik", A, B, dtype="bf16")
 
-        # Scaled GEMM: 2*A@B + 0.5*C  (cuTENSOR-style alpha/beta)
+        # Scaled GEMM, in place: C = 2*A@B + 0.5*C  (cuTENSOR-style alpha/beta)
         einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
+
+        # In-place accumulation: acc += A@B
+        einsum("ij,jk->ik", A, B, beta=1.0, out=acc)
 
         # DF-MP2 energy contraction
         einsum("iap,jbp->ijab", B, B)
@@ -148,19 +156,56 @@ def einsum(
             )
         return _execute_sharded(subscripts, operands, alpha=alpha, dtype=dtype, precision=precision)
 
+    if (
+        out is not None
+        and torch.is_grad_enabled()
+        and any(isinstance(t, torch.Tensor) and t.requires_grad for t in (*operands, out))
+    ):
+        raise RuntimeError(
+            "einsum(): functions with out=... arguments don't support automatic "
+            "differentiation, but one of the arguments requires grad."
+        )
     target = _resolve_dtype(dtype)
     if target is not None:
         operands = tuple(op.to(target) for op in operands)
     plan = plan_contraction(subscripts, *operands, precision=precision)
     result = _execute_contraction(subscripts, operands, plan)
-    if beta == 0.0:
-        # BLAS / cuTENSOR / trnblas convention: with beta == 0 ``out`` is not
-        # read, so NaN or inf in it (e.g. a torch.empty buffer) cannot leak
-        # into the result through 0 * NaN.
-        out = None
-    if alpha == 1.0 and out is None:
-        return result
-    return _scale_add(result, alpha, beta, out, operands)
+    if out is None:
+        return result if alpha == 1.0 else _scale_add(result, alpha, beta, None, operands)
+    # BLAS / cuTENSOR / trnblas convention: with beta == 0 ``out`` is not
+    # read, so NaN or inf in it (e.g. a torch.empty buffer) cannot leak
+    # into the result through 0 * NaN.
+    addend = None if beta == 0.0 else out
+    if alpha != 1.0 or addend is not None:
+        result = _scale_add(result, alpha, beta, addend, operands)
+    return _write_out(result, out)
+
+
+def _write_out(result: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Write ``result`` into ``out`` and return ``out`` (trntensor#77).
+
+    Same checks as ``torch.einsum(out=)``: the result must fit ``out``'s shape
+    and its dtype must be castable to ``out``'s. ``result`` is fully formed
+    before ``out`` is touched, and is cloned first when it shares storage with
+    ``out`` (``out`` aliasing an operand of a view-returning contraction such
+    as ``"ij->ji"``), so aliasing cannot corrupt the result.
+    """
+    if tuple(result.shape) != tuple(out.shape):
+        raise ValueError(
+            f"einsum(): out has shape {tuple(out.shape)} but the result has shape "
+            f"{tuple(result.shape)}"
+        )
+    if not torch.can_cast(result.dtype, out.dtype):
+        raise RuntimeError(
+            f"einsum(): result type {result.dtype} can't be cast to the desired "
+            f"output type {out.dtype}"
+        )
+    if result.untyped_storage().data_ptr() == out.untyped_storage().data_ptr():
+        if result.data_ptr() == out.data_ptr() and result.stride() == out.stride():
+            return out
+        result = result.clone()
+    out.copy_(result)
+    return out
 
 
 def _owns(result: torch.Tensor, others) -> bool:
