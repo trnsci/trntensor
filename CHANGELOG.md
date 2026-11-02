@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trntensor::`
+  custom-op call cost about 0.1 ms of host time before the kernel was queued,
+  against 0.016 ms for aten. Most of it went to nki's `Kernel.__call__`,
+  which rebuilds the torch handle on every call, plus the `torch.library`
+  layer. `dispatch._launch` and the `mp2_energy_row` loop now call a
+  `torch_neuronx.wrap_nki` handle built once per kernel; compile-time keyword
+  arguments (`use_sr`, `nub`, `tp`, `tail`, `banks`) pass through unchanged.
+  On trn2 (LNC=2), a 256x128x512 `matmul` launch drops from 0.143 to
+  0.036 ms of issue time (e2e 0.222 to 0.128 ms), `_nki_mp2_energy_rows` with
+  nocc=8 from 2.94 to 2.34 ms, and the `df_exchange` kernel pair's issue time
+  from 0.78 to 0.36 ms. Results are bit-identical. `torch.compile`,
+  requires-grad, int64 and tensor-subclass inputs keep the custom op.
+  `TRNTENSOR_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
+
 ### Added
 
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
