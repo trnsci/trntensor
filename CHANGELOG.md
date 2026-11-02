@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`einsum(..., out=)` now writes the result into `out` and returns it
+  (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
+  and never written, so the documented in-place accumulation example
+  `einsum(..., beta=1.0, out=acc)` silently left `acc` unchanged. `out` now
+  behaves as in `torch.einsum` and cuTENSOR: it receives
+  `alpha * contract + beta * out` (old contents not read when `beta == 0`),
+  must have the result's shape (`ValueError` otherwise), must accept the
+  result dtype under `torch.can_cast` (`RuntimeError` otherwise), and may
+  alias an operand. Like `torch.einsum(out=)`, it raises `RuntimeError` when
+  grad mode is on and an operand or `out` requires grad. Callers that reused
+  `C` after passing it as `out=C` now see it overwritten; pass `out=C.clone()`
+  to keep the old behaviour.
+
 ## [0.23.0] — 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

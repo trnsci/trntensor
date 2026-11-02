@@ -66,12 +66,19 @@ Matches cuTENSOR's GEMM-style interface:
 `alpha·contract(A, B) + beta·C`.
 
 ```python
-# Scaled GEMM: 2·A@B + 0.5·C
-result = trntensor.einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
+# Scaled GEMM, written into C: C = 2·A@B + 0.5·C
+trntensor.einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
 
-# In-place accumulation (beta=1, alpha=1): result += A@B
+# In-place accumulation (beta=1, alpha=1): acc += A@B
 trntensor.einsum("ij,jk->ik", A, B, beta=1.0, out=acc)
 ```
+
+As in `torch.einsum` and cuTENSOR, `out=` is the output operand: the result
+is written into it and `out` is returned. `out` must have the result's shape,
+and the result dtype must be castable to `out.dtype`. With `beta=0` the old
+contents of `out` are not read. `out=` raises `RuntimeError` when grad mode is
+on and an operand or `out` requires grad, as `torch.einsum(out=)` does.
+Releases 0.3.0–0.23.0 returned the result without writing `out` (#77).
 
 ### `dtype` — mixed-precision compute
 
