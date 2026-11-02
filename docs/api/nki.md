@@ -258,7 +258,9 @@ Kernel status on the native path after #51:
 - **AO→MO: kept, rewritten for Trn2** (`ao_to_mo_trn2_kernel`). It is
   1.3–1.6× faster than the two aten einsums at nbasis 256–768, and native
   `"auto"` uses it there for device-resident `eri`. Below nbasis ≈ 256
-  `"auto"` keeps aten.
+  `"auto"` keeps aten. Since #80 it takes any `nocc` (occupied blocks of
+  ≤ 128 in stage 1); at nocc 160–384 it is 1.8–2.4× faster than aten (full
+  `eri`) and 2.7–3.5× (packed), at nbasis 512.
 - **MP2 energy: kept, rewritten for Trn2** (`mp2_energy_row_kernel`). It is
   1.25–1.9× faster than aten once each row launch carries at least 3 GFLOP,
   and native `"auto"` uses it there.
