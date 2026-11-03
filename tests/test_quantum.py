@@ -44,6 +44,32 @@ class TestMp2EnergyReference:
         monkeypatch.setattr(q, "_MP2_CHUNK_ELEMS", 2 * 5 * 6 * 6)  # chunk = 2 -> 2,2,1
         torch.testing.assert_close(q._cpu_mp2_energy(B, eps_occ, eps_vir), full)
 
+    def test_chunked_over_j_bounds_t_block(self, monkeypatch):
+        """When one i row's T (nocc·nvir²) exceeds the chunk, j is chunked too:
+        same energy, and no einsum output above the chunk size."""
+        import trntensor.quantum as q
+
+        torch.manual_seed(4)
+        B = torch.randn(7, 6, 5, dtype=torch.float64) * 0.1
+        eps_occ = -torch.rand(7, dtype=torch.float64) - 0.5
+        eps_vir = torch.rand(6, dtype=torch.float64) + 0.1
+        full = q._cpu_mp2_energy(B, eps_occ, eps_vir)
+        cap = 2 * 6 * 6  # under one i row (7 * 36): j blocks of 2
+        monkeypatch.setattr(q, "_MP2_CHUNK_ELEMS", cap)
+        seen = []
+        real = torch.einsum
+
+        def spy(eq, *ops):
+            out = real(eq, *ops)
+            seen.append(out.numel())
+            return out
+
+        monkeypatch.setattr(q.torch, "einsum", spy)
+        got = q._cpu_mp2_energy(B, eps_occ, eps_vir)
+        monkeypatch.setattr(q.torch, "einsum", real)
+        torch.testing.assert_close(got, full)
+        assert seen and max(seen) <= cap
+
     def test_shape_errors(self):
         B3 = torch.randn(3, 4, 5)
         eps_occ = torch.randn(3)

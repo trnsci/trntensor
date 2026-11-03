@@ -163,16 +163,23 @@ def _cpu_mp2_energy(
     Trainium device ran 10-40x slower than this form (#41).
     """
     nocc, nvir, _naux = B.shape
-    chunk = max(1, _MP2_CHUNK_ELEMS // max(1, nocc * nvir * nvir))
+    # T blocks of at most _MP2_CHUNK_ELEMS elements (i and j both chunked).
+    # Chunking i alone left one i row's T at nocc·nvir² elements: 1.37 GB
+    # (with ~4 temporaries per step) at nocc=161, nvir=1461, which ran a
+    # 24 GiB NeuronCore out of memory with only 5.7 GB of B resident.
+    jstep = max(1, min(nocc, _MP2_CHUNK_ELEMS // max(1, nvir * nvir)))
+    istep = max(1, _MP2_CHUNK_ELEMS // max(1, jstep * nvir * nvir))
     eps_occ = eps_occ.to(B.device)
     eps_vir = eps_vir.to(B.device)
     ev = eps_vir[:, None] + eps_vir[None, :]  # (a, b)
     e = B.new_zeros(())
-    for i0 in range(0, nocc, chunk):
-        Bi = B[i0 : i0 + chunk]
-        T = torch.einsum("iap,jbp->ijab", Bi, B)
-        denom = (eps_occ[i0 : i0 + chunk, None] + eps_occ[None, :])[:, :, None, None] - ev
-        e = e + (T * (2 * T - T.transpose(2, 3)) / denom).sum()
+    for i0 in range(0, nocc, istep):
+        Bi = B[i0 : i0 + istep]
+        for j0 in range(0, nocc, jstep):
+            T = torch.einsum("iap,jbp->ijab", Bi, B[j0 : j0 + jstep])
+            eij = eps_occ[i0 : i0 + istep, None] + eps_occ[None, j0 : j0 + jstep]
+            denom = eij[:, :, None, None] - ev
+            e = e + (T * (2 * T - T.transpose(2, 3)) / denom).sum()
     return e
 
 
