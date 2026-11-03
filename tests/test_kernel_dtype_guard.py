@@ -143,6 +143,10 @@ def guarded(monkeypatch):
     """Native path on CPU; every `trntensor::` op is a dtype-checking stub."""
     rec = _Recorder()
     monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_torch_neuronx(rec))
+    # Record the real state first, so teardown removes the stub-backed `_native`
+    # imported below (a later test in the session would otherwise get stub ops).
+    monkeypatch.setitem(sys.modules, "trntensor.nki._native", None)
+    monkeypatch.setattr(trntensor.nki, "_native", None, raising=False)
     monkeypatch.delitem(sys.modules, "trntensor.nki._native", raising=False)
     monkeypatch.delattr(trntensor.nki, "_native", raising=False)
     monkeypatch.setattr(dispatch, "_native_ops", None)
