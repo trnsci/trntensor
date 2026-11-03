@@ -96,6 +96,20 @@ KERNEL_INPUTS = {
                 {},
             ),
         ),
+        (
+            "nb256_nocc258_nvir128_naux384_oddchunks",
+            lambda: (
+                (_r(32896 * 3, 128), _u32(3, 128, 512), _r(256, 258), _r(256, 128)),
+                {},
+            ),
+        ),
+        (
+            "nb384_nocc200_nvir256_naux512",
+            lambda: (
+                (_r(73920 * 2, 256), _u32(2, 128, 1152), _r(384, 200), _r(384, 256)),
+                {},
+            ),
+        ),
     ],
     "df_half_packed_kernel": [
         # (packed (npair·NPC, TP) rows, (NPC, NVG, 128, NKB·NVC) uint32 indices, C_occ)
@@ -150,6 +164,20 @@ KERNEL_INPUTS = {
         (
             "nb128_nocc8_nvir128_naux128",
             lambda: ((_r(128, 128, 128), _r(128, 8), _r(128, 128)), {}),
+        ),
+        # nocc > 128: occupied blocks in stage 1 (#80).
+        (
+            "nb256_nocc129_nvir128_naux256",
+            lambda: ((_r(256, 256, 256), _r(256, 129), _r(256, 128)), {}),
+        ),
+        (
+            "nb384_nocc257_nvir128_naux256",
+            lambda: ((_r(384, 384, 256), _r(384, 257), _r(384, 128)), {}),
+        ),
+        # Odd aux chunk count (3 x 128): the programs split the occupied index.
+        (
+            "nb256_nocc200_nvir128_naux384",
+            lambda: ((_r(256, 256, 384), _r(256, 200), _r(256, 128)), {}),
         ),
     ],
 }

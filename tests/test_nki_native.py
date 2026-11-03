@@ -274,7 +274,17 @@ class TestEagerHandle:
 class TestNativeTrn2Kernels:
     """#51: the Trn2 AO→MO and MP2 row kernels on hardware (LNC=1 and LNC=2)."""
 
-    @pytest.mark.parametrize("nbasis,nocc,nvir,naux", [(128, 8, 120, 128), (256, 32, 200, 512)])
+    @pytest.mark.parametrize(
+        "nbasis,nocc,nvir,naux",
+        [
+            (128, 8, 120, 128),
+            (256, 32, 200, 512),
+            # nocc > 128: occupied blocks in stage 1, ragged stage-2 groups (#80).
+            (256, 129, 127, 512),
+            (300, 200, 100, 700),
+            (384, 257, 127, 256),
+        ],
+    )
     def test_ao_to_mo_trn2_matches_reference(self, nbasis, nocc, nvir, naux):
         from trntensor.nki import dispatch
 
@@ -289,7 +299,14 @@ class TestNativeTrn2Kernels:
 
     @pytest.mark.parametrize(
         "nbasis,nocc,nvir,naux",
-        [(128, 8, 120, 128), (200, 20, 180, 300), (256, 32, 224, 768), (256, 32, 200, 512)],
+        [
+            (128, 8, 120, 128),
+            (200, 20, 180, 300),
+            (256, 32, 224, 768),
+            (256, 32, 200, 512),
+            (256, 129, 127, 512),
+            (300, 200, 100, 700),
+        ],
     )
     def test_ao_to_mo_trn2_packed_matches_full_kernel(self, nbasis, nocc, nvir, naux):
         """#54: the packed kernel gathers the same blocks the full kernel loads,

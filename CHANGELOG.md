@@ -27,6 +27,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`trntensor.stream`: DF integrals streamed over the aux index**
+  (trnsolver#15). At nbasis 1658 the packed fp32 integrals were 33.4 GB and
+  only fit split over a Trn2 chip's 4 logical cores; at nbasis ≈ 3300 they
+  are about 270 GB.
+  - `AuxStream(chunks, nbasis, devices=..., resident_bytes=..., prefetch=...)`
+    holds `B` as `(npair, nq)` aux chunks (tensors, numpy memmaps or lazy
+    loaders), keeps chunks resident up to a per-device budget and uploads the
+    rest on every call from a loader thread, one chunk ahead per device, so
+    uploads overlap compute. `jk()` builds packed J and K in one pass
+    (`df_coulomb` / `df_exchange` per chunk, summed per device, then on the
+    host); `ao_to_mo()` writes `B_ia^P` chunk by chunk into a host tensor or
+    memmap. Chunks are dealt round-robin over `devices` (`neuron:0..3`).
+  - `aux_chunk_width` / `split_aux`: 128-multiple chunks under 2 GiB by
+    default, below the 4 GiB transposed-LHS limit (aws-neuron-sdk#1457, #97).
+  - `pack_density` / `unpack_packed`: the packed-density helpers, for use on
+    host tensors at large nbasis (the device gathers compile for > 40 min at
+    nbasis 1658, trnsolver#87).
+  - `mp2_energy_blocked`: DF-MP2 over occupied blocks of a host `B_ia^P`,
+    for `B` larger than one device.
+  - Memory-mapped chunks are read into RAM with one sequential read when
+    loaded. Left mapped, the row gathers of `df_exchange` fault pages in at
+    random, which was disk-bound on a disk-backed store.
+  - CPU-validated against dense references; device overlap and scaling are
+    still to be measured.
+
+### Fixed
+
+- **`cp_decompose` works in the input dtype, including float64 and complex
+  (#103).** Affected 0.1.1–0.23.0: the random init and the Khatri-Rao buffer
+  were float32 on the host, so float64 or complex input raised `expected m1
+  and m2 to have the same dtype` on every backend (and a float64 warm start
+  was truncated to float32 inside the Khatri-Rao product). The init, the
+  Khatri-Rao buffer and the weights now follow `tensor.dtype` and
+  `tensor.device`, warm-start factors are cast to them, and complex input
+  uses the conjugated normal equations `(V^H V) A^T = (T_(k) conj(V))^T`.
+  Weights are real (`tensor.real.dtype`). `nonneg=True` with complex input
+  raises `ValueError`. Real float32 results are bit-identical.
+- **`cp_reconstruct` returns the factors' dtype on the factors' device
+  (#78).** Affected 0.1.1–0.23.0: it accumulated into a float32 host buffer
+  (`torch.zeros(shape)`), so bf16 or fp16 factors came back as float32 and
+  device factors raised a device mismatch. The buffer now has the promoted
+  dtype of `factors` and `weights` and the factors' device. float32 and
+  float64 results are unchanged.
+- **`plan_contraction` fills `ContractionPlan.estimated_flops` (#83).**
+  Affected 0.1.1–0.23.0: the documented multiply-add estimate was never set
+  and always read 0. `matmul`, `bmm` and `torch` plans now carry
+  `estimate_flops(subscripts, *operands)` (the product of all index sizes);
+  `path` plans carry the multiply-adds of the planned binary steps, which is
+  what runs and is less than the dense all-index product. Plans are cached by
+  shape, so the field is exact for the cached shapes.
+
+- **`einsum(..., out=)` now writes the result into `out` and returns it
+  (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
+  and never written, so the documented in-place accumulation example
+  `einsum(..., beta=1.0, out=acc)` silently left `acc` unchanged. `out` now
+  behaves as in `torch.einsum` and cuTENSOR: it receives
+  `alpha * contract + beta * out` (old contents not read when `beta == 0`),
+  must have the result's shape (`ValueError` otherwise), must accept the
+  result dtype under `torch.can_cast` (`RuntimeError` otherwise), and may
+  alias an operand. Like `torch.einsum(out=)`, it raises `RuntimeError` when
+  grad mode is on and an operand or `out` requires grad. Callers that reused
+  `C` after passing it as `out=C` now see it overwritten; pass `out=C.clone()`
+  to keep the old behaviour.
+
+## [0.23.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** `kahan`/`dd` dropped the imaginary part of complex operands and rounded large integers (#69, #90); `beta=0` read `out=` (#71); complex `tucker_decompose` used Uᵀ (#73); `multi_einsum` returned fp32 results as fp64 (#75); `einsum(precision="dd")` missed its documented bound (#84); float64 chemistry kernels returned inf on device (#87); `ao_to_mo_transform` on device with operands over 4 GiB was silently wrong and is now guarded (#97). New: native AO→MO for any nocc, 1.8–3.5× faster than aten at nocc 160–384 (#94).
+
+### Changed
+
+- **`ao_to_mo_transform`'s Trn2 kernels now run any `nocc` (#80).** They
+  needed `nocc ≤ 128`, so larger systems fell back to aten under `"auto"`.
+  - Stage 1 runs occupied blocks of ≤ 128 over each eri block, so `eri` is
+    read once whatever `nocc` is. `C_occ` and `C_vir` stay resident in SBUF.
+  - Both stages move 512 columns per Tensor Engine pass (`512 // TP` ν in
+    stage 1, `512 // TP` orbitals in stage 2), and stage 2 fetches and
+    stores each group with one strided DMA.
+  - With an odd aux-chunk count and `nocc > 128`, the two programs of an
+    LNC=2 core split the occupied index instead of the aux chunks (the
+    dispatcher appends one zero orbital when `nocc` is odd), so both
+    physical cores still work.
+  - The packed kernel gets the same treatment and keeps its in-place gather.
+  - Trn2, LNC=2, fp32, warm: at nbasis 512 / naux 1536 the kernel is
+    1.8–2.4× faster than aten at nocc 160–384 (full `eri`) and 2.7–3.5×
+    with packed `eri`. It is 1.3–1.7× faster than launching the old kernel
+    once per 128 orbitals. At LNC=1 it is 1.3–1.7× (full) and 2.3–2.6×
+    (packed) faster than aten. Tables on #80.
+  - At `nocc ≤ 128` it is 0.99–1.08× the speed of `main` (the 512-column
+    passes), and the first-call compile is shorter.
+  - With an odd aux-chunk count and `nocc > 128` the occupied split is
+    1.3–1.6× faster than one program (e.g. 512/257/1152: 17.8 → 11.7 ms).
+- **`"auto"` routing for `ao_to_mo_transform` (#80).**
+  - The `nocc ≤ 128` condition is gone.
+  - A full `eri` whose nbasis or naux is not a 128 multiple now stays on
+    aten. The kernel pads a copy of the whole square first, and that copy
+    costs more than aten (300/100/700: 5.6 ms against 2.0 ms). This also
+    changes routing at `nocc ≤ 128`. Pass packed `eri` to keep the kernel:
+    it pads nbasis only in its gather indices.
+  - A packed `eri` with a padded nbasis needs 2e9 multiply-adds of stage-1
+    work instead of 5e8.
+  - The kernel's SBUF budget goes from 144 to 176 KiB (df_exchange's). At
+    n_ao 970, nocc 161, packed naux 4608 it needs 158 KiB and runs in
+    118 ms on Trn2 (LNC=2); aten ran out of device memory there.
+
+### Added
+
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
   trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
   `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
@@ -40,6 +148,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 
 ### Fixed
+
+- **`ao_to_mo_transform` aten route on the device: wrong results from 4 GiB of
+  `eri` (#97).** On TorchNeuron (torch-neuronx 2.14.3), a matmul whose left
+  operand is a transposed view returns wrong values, without an error, once the
+  right operand exceeds 2^32 bytes and the contraction dim is a multiple of 128.
+  If the right operand came straight from the host it aborts instead
+  (aws-neuron/aws-neuron-sdk#1448). Both `torch.einsum` steps of the aten route
+  lower to that matmul, so at nbasis 768 / naux 2304 the result was off by
+  about 1 relative. On the device, from 2^32 bytes of `eri` or of the
+  half-transformed tensor, the two steps now run as `mm` and `bmm` with
+  contiguous orbital transposes. At 768/64/2304 the error against float64 is
+  2.2e-7 (was 1.06), and a warm call takes 16.1 ms (the wrong route took
+  25 ms). Not fixed here: at LNC=1, the device `index_select` that builds a
+  square `eri` over 4 GiB is itself wrong (it unpacks packed input for the aten
+  route), so that case still returns wrong values or NaN (#97).
 
 - **`einsum(precision="kahan")` rounded int32 values above 2**24 on the
   neuron device** (silent, #90). The device computes integer matmul in fp32.

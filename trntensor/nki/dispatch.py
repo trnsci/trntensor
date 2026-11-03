@@ -563,6 +563,15 @@ def _to_xla(*tensors):
 # import, and the native probe never imports torch_xla.
 
 _NEURON_DEVICE = "neuron"
+
+# TorchNeuron's aten matmul with a transposed-view left operand returns wrong
+# values (or a DMA abort) once the right operand exceeds 2**32 bytes, fp32 and
+# bf16, LNC=1 and 2 (torch-neuronx 2.14.3; aws-neuron-sdk#1448, #97).
+# Measured: wrong above 2**32 bytes (exactly 2**32 is correct) when the
+# contraction dim is a multiple of 128; the guard starts at 2**32 and
+# ignores the multiple-of-128 condition.
+_ATEN_TRANSPOSED_LHS_MAX_BYTES = 1 << 32
+
 _dispatch_path: str | None = None
 _native_ops: dict | None = None
 
@@ -1468,14 +1477,28 @@ def _nki_ao_to_mo_transform(
 # native path).
 _AO_TO_MO_CHOICES = ("auto", "trn2", "aten", "legacy")
 # SBUF bytes per partition `ao_to_mo_trn2_kernel` keeps live (C_occ, C_vir,
-# one stage-1 eri block, one X[i] strip); same budget as the MP2 kernel.
-_AO_TO_MO_SBUF_BUDGET = 144 * 1024
+# one stage-1 eri block and X block, one stage-2 X group and B block); same
+# budget as df_exchange's launch 1 (of 192 KiB per partition). It was 144 KiB;
+# n_ao = 970, nocc = 161, packed naux = 4608 needs 158 KiB and compiles and
+# runs at 118 ms, where aten runs out of device memory (#80).
+_AO_TO_MO_SBUF_BUDGET = 176 * 1024
 # Under "auto" the kernel needs stage-1 work nocc·nbasis²·naux of at least
 # this many multiply-adds. Below it, the custom-op launch floor and the
 # padding copies lose to aten: nbasis=128, nocc=16, naux=256 (6.7e7) measured
 # 0.57 ms against 0.49 ms; nbasis=256, nocc=32, naux=512 (1.1e9) 0.92 ms
 # against 1.23 ms (#51).
 _AO_TO_MO_MIN_MACS = 5.0e8
+# Two more conditions from the nocc > 128 measurements (#80, Trn2, LNC=2):
+# - A full eri whose nbasis or naux is not a 128 multiple stays on aten: the
+#   kernel pads a copy of the whole square first, and that copy alone costs
+#   more than aten. 300/100/700 (6.3e9 multiply-adds) took 5.6 ms against
+#   2.0 ms, 300/129/700 6.3 against 2.6 ms; the unpadded 384/129/768 2.7
+#   against 4.2 ms. Packed eri pads nbasis only in the gather indices.
+# - A packed eri with nbasis padded wastes the padded rows' Tensor Engine
+#   work, so it needs more work: 160/129/256 (8.5e8) took 2.1 against 1.6 ms,
+#   192/150/384 (2.1e9) 2.1 against 2.2 ms, 300/129/700 (8.1e9) 4.1 against
+#   5.5 ms.
+_AO_TO_MO_MIN_MACS_PADDED = 2.0e9
 
 
 def _ao_to_mo_trn2_sbuf_bytes(
@@ -1483,7 +1506,9 @@ def _ao_to_mo_trn2_sbuf_bytes(
 ) -> int:
     nkb = _round_up(nbasis, TILE_K) // TILE_K
     tp, nub = ao_to_mo_trn2_tiling(_round_up(naux, TILE_K), packed)
-    cols = nkb * (nocc + _round_up(nvir, TILE_M) + nub * tp + tp) + nub * tp
+    # Stage 2 moves up to 512 columns (NI orbitals of one chunk) per matmul.
+    gw = max(1, min(nocc, 512 // tp)) * tp
+    cols = nkb * (nocc + _round_up(nvir, TILE_M) + nub * tp + gw) + nub * tp + gw
     # The packed kernel also keeps one chunk's gather indices (uint32).
     idx = 4 * nkb * nkb * TILE_K if packed else 0
     return itemsize * cols + idx
@@ -1518,8 +1543,7 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int, nbasis: int | None 
     nb = (nbasis if packed else eri.shape[0]) or 0
     naux = eri.shape[-1]
     fits = (
-        nocc <= 128
-        and _ao_to_mo_trn2_sbuf_bytes(nb, nocc, nvir, naux, eri.element_size(), packed)
+        _ao_to_mo_trn2_sbuf_bytes(nb, nocc, nvir, naux, eri.element_size(), packed)
         <= _AO_TO_MO_SBUF_BUDGET
     )
     if not fits:
@@ -1528,8 +1552,30 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int, nbasis: int | None 
         return "trn2"
     if ("ao2mo", tuple(eri.shape), nocc, nvir) in _native_kernel_failed:
         return "aten"
-    big = nocc * nb**2 * naux >= _AO_TO_MO_MIN_MACS
+    if not packed and (nb % TILE_K or naux % TILE_K):
+        # The kernel would pad a copy of the full square first (#80).
+        return "aten"
+    macs = nocc * nb**2 * naux
+    big = macs >= (_AO_TO_MO_MIN_MACS_PADDED if nb % TILE_K else _AO_TO_MO_MIN_MACS)
     return "trn2" if big and eri.device.type == _NEURON_DEVICE else "aten"
+
+
+def _ao_to_mo_pad_occ(C_occ: torch.Tensor, naux_pad: int, packed: bool) -> torch.Tensor:
+    """``C_occ`` with a zero orbital appended when the kernel splits the
+    occupied index across programs and ``nocc`` is odd.
+
+    ``ao_to_mo_trn2_kernel`` splits the aux chunks across the two programs
+    of an LNC=2 core; with an odd chunk count and ``nocc > 128`` it splits
+    the occupied index instead, which needs an even ``nocc`` (#80). The
+    zero orbital gives a zero row of ``B``, sliced off (a view) on return.
+    """
+    nocc = C_occ.shape[1]
+    tp = ao_to_mo_trn2_tiling(naux_pad, packed)[0]
+    if nocc <= TILE_M or nocc % 2 == 0 or (naux_pad // tp) % 2 == 0:
+        return C_occ
+    co = torch.zeros(C_occ.shape[0], nocc + 1, dtype=C_occ.dtype, device=C_occ.device)
+    co[:, :nocc] = C_occ
+    return co
 
 
 def _nki_ao_to_mo_trn2(
@@ -1560,7 +1606,10 @@ def _nki_ao_to_mo_trn2(
         cv = torch.zeros(nbp, nvp, dtype=C_vir.dtype, device=C_vir.device)
         cv[:nbasis, :nvir] = C_vir
         C_vir = cv
+    C_occ = _ao_to_mo_pad_occ(C_occ, nxp, packed=False)
     out = _launch(None, "ao_to_mo_trn2", eri.contiguous(), C_occ.contiguous(), C_vir.contiguous())
+    if out.shape[0] != nocc:
+        out = out[:nocc]
     return out[:, :nvir, :naux] if (nvp, nxp) != (nvir, naux) else out
 
 
@@ -1654,6 +1703,7 @@ def _nki_ao_to_mo_trn2_packed(
     tp = _packed_tp(nxp)
     dev = eri_p.device if eri_p.device.type == _NEURON_DEVICE else None
     img = _tril_gather_images(nbasis, nbp, nxp, tp, dev)
+    C_occ = _ao_to_mo_pad_occ(C_occ, nxp, packed=True)
     out = _launch(
         None,
         "ao_to_mo_trn2_packed",
@@ -1662,6 +1712,8 @@ def _nki_ao_to_mo_trn2_packed(
         C_occ.contiguous(),
         C_vir.contiguous(),
     )
+    if out.shape[0] != nocc:
+        out = out[:nocc]
     return out[:, :nvir, :naux] if (nvp, nxp) != (nvir, naux) else out
 
 

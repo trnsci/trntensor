@@ -5,7 +5,7 @@ Einstein summation, contraction planning, and tensor decompositions
 for scientific computing. Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 from .decompose import (
     cp_decompose,
@@ -35,6 +35,14 @@ from .quantum import (
     mp2_energy,
     pack_tril,
     unpack_tril,
+)
+from .stream import (
+    AuxStream,
+    aux_chunk_width,
+    mp2_energy_blocked,
+    pack_density,
+    split_aux,
+    unpack_packed,
 )
 
 __all__ = [
@@ -66,6 +74,12 @@ __all__ = [
     "df_coulomb",
     "pack_tril",
     "unpack_tril",
+    "AuxStream",
+    "aux_chunk_width",
+    "split_aux",
+    "pack_density",
+    "unpack_packed",
+    "mp2_energy_blocked",
     "ShardedTensor",
     "scatter",
     "gather",

@@ -1308,9 +1308,23 @@ class TestNativeKernelRetirement:
         assert dispatch._ao_to_mo_route(small, 16, 112) == "aten"
         assert dispatch._ao_to_mo_route(large, 32, 224) == "trn2"
         assert dispatch._ao_to_mo_route(torch.empty(256, 256, 512), 32, 224) == "aten"
-        assert dispatch._ao_to_mo_route(large, 129, 224) == "aten"
+        # nocc > 128 runs occupied blocks in the kernel (#80).
+        assert dispatch._ao_to_mo_route(large, 129, 127) == "trn2"
+        assert dispatch._ao_to_mo_route(torch.empty(512, 512, 1024, device="meta"), 384, 128) == (
+            "trn2"
+        )
         huge = torch.empty(4096, 4096, 512, device="meta")
         assert dispatch._ao_to_mo_route(huge, 32, 4000) == "aten"  # SBUF
+        # A full eri that would need a padded copy stays on aten (#80) ...
+        assert dispatch._ao_to_mo_route(torch.empty(300, 300, 700, device="meta"), 100, 200) == (
+            "aten"
+        )
+        assert dispatch._ao_to_mo_route(torch.empty(384, 384, 700, device="meta"), 129, 255) == (
+            "aten"
+        )
+        assert dispatch._ao_to_mo_route(torch.empty(384, 384, 768, device="meta"), 129, 255) == (
+            "trn2"
+        )
         monkeypatch.setattr(dispatch, "_backend", "nki")
         assert dispatch._ao_to_mo_route(small, 16, 112) == "trn2"
         monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "legacy")
@@ -1325,12 +1339,39 @@ class TestNativeKernelRetirement:
         assert dispatch._ao_to_mo_route(torch.empty(npair, 512), 32, 224, 256) == "aten"
         small = torch.empty(128 * 129 // 2, 256, device="meta")
         assert dispatch._ao_to_mo_route(small, 16, 112, 128) == "aten"
+        # ... a packed one only pads the gather indices, but padded nbasis
+        # rows waste work: 160/129/256 (8.5e8) stays on aten, 300/129/700 runs.
+        pk160 = torch.empty(160 * 161 // 2, 256, device="meta")
+        assert dispatch._ao_to_mo_route(pk160, 129, 31, 160) == "aten"
+        pk300 = torch.empty(300 * 301 // 2, 700, device="meta")
+        assert dispatch._ao_to_mo_route(pk300, 129, 171, 300) == "trn2"
         monkeypatch.setattr(dispatch, "_backend", "nki")
         assert dispatch._ao_to_mo_route(small, 16, 112, 128) == "trn2"
         # The gather-index chunk counts against SBUF.
         full_b = dispatch._ao_to_mo_trn2_sbuf_bytes(1024, 32, 1000, 512, 4)
         pk_b = dispatch._ao_to_mo_trn2_sbuf_bytes(1024, 32, 1000, 512, 4, packed=True)
         assert pk_b - full_b == 4 * 8 * 1024
+
+    @pytest.mark.parametrize("nocc", [1, 5, 128, 129, 160, 200, 256, 257, 384, 500])
+    def test_ao_to_mo_occ_blocks_cover_nocc(self, nocc):
+        from trntensor.nki._kernels import ao_to_mo_trn2_occ_blocks
+
+        blocks = ao_to_mo_trn2_occ_blocks(nocc)
+        assert len(blocks) == -(-nocc // 128)
+        assert all(0 < sz <= 128 for _, sz in blocks)
+        assert max(sz for _, sz in blocks) - min(sz for _, sz in blocks) <= 1
+        assert [o for o, _ in blocks] == [
+            sum(sz for _, sz in blocks[:b]) for b in range(len(blocks))
+        ]
+        assert sum(sz for _, sz in blocks) == nocc
+
+    @pytest.mark.parametrize("n,g", [(1, 4), (4, 4), (5, 4), (129, 4), (257, 2), (7, 1)])
+    def test_ao_to_mo_groups_cover_range(self, n, g):
+        from trntensor.nki._kernels import ao_to_mo_trn2_groups
+
+        runs = ao_to_mo_trn2_groups(n, g)
+        assert [i for o, sz in runs for i in range(o, o + sz)] == list(range(n))
+        assert all(sz == g for _, sz in runs[:-1]) and 0 < runs[-1][1] <= g
 
     @pytest.mark.parametrize("nbasis,nbp,naux,tp", [(256, 256, 768, 384), (200, 256, 512, 256)])
     def test_tril_gather_images_address_the_packed_rows(self, nbasis, nbp, naux, tp):
@@ -1828,3 +1869,43 @@ class TestKernelRoutesTakeFp32:
         ref = 2.0 * torch.einsum("lmp,li,knp,ki->mn", eri, co, eri, co)
         assert K.dtype == torch.float64
         torch.testing.assert_close(K, ref, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.parametrize("big", ["eri", "half"])
+def test_ao_to_mo_aten_large_operand_avoids_transposed_lhs(monkeypatch, big):
+    """Large device operands skip einsum's transposed-LHS matmul (#97, aws-neuron-sdk#1448)."""
+    from trntensor import quantum
+
+    nb, naux, nocc, nvir = 12, 20, 5, 7
+    g = torch.Generator().manual_seed(0)
+    eri = torch.randn(nb, nb, naux, generator=g)
+    C_occ, C_vir = torch.randn(nb, nocc, generator=g), torch.randn(nb, nvir, generator=g)
+    ref = torch.einsum(
+        "na,inP->iaP", C_vir.double(), torch.einsum("mi,mnP->inP", C_occ.double(), eri.double())
+    )
+    calls = []
+    real_einsum = torch.einsum
+    monkeypatch.setattr(torch, "einsum", lambda *a, **k: calls.append(a[0]) or real_einsum(*a, **k))
+    # Below the limit (or off the device): the einsum route, unchanged.
+    out = quantum._cpu_ao_to_mo_transform(eri, C_occ, C_vir)
+    assert calls == ["mi,mnP->inP", "na,inP->iaP"]
+    torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
+    # CPU standing in for the device; the limit at the eri or the half-transformed size.
+    monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
+    limit = eri.numel() * 4 if big == "eri" else nocc * nb * naux * 4
+    monkeypatch.setattr(dispatch, "_ATEN_TRANSPOSED_LHS_MAX_BYTES", limit)
+    calls.clear()
+    out = quantum._cpu_ao_to_mo_transform(eri, C_occ, C_vir)
+    assert calls == []
+    assert out.shape == (nocc, nvir, naux)
+    torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
+    # The public entry point takes the same route (full and packed eri).
+    eri_s = eri + eri.transpose(0, 1)
+    ref_s = torch.einsum(
+        "na,inP->iaP", C_vir.double(), torch.einsum("mi,mnP->inP", C_occ.double(), eri_s.double())
+    )
+    for arg in (eri_s, quantum.pack_tril(eri_s)):
+        calls.clear()
+        out = trntensor.ao_to_mo_transform(arg, C_occ, C_vir)
+        assert "mi,mnP->inP" not in calls
+        torch.testing.assert_close(out.double(), ref_s, rtol=1e-5, atol=1e-5)

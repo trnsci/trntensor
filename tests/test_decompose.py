@@ -45,6 +45,118 @@ class TestCP:
         assert weights.shape == (2,)
 
 
+def _np_cp_als(T, init, n_iter):
+    """Independent NumPy CP-ALS reference (trntensor#103).
+
+    Each mode update is the least-squares solution of ``T_(k) ≈ A_k V^T``
+    computed with ``np.linalg.lstsq`` on an einsum-built Khatri-Rao product
+    (no normal equations), then columns are normalized into the weights.
+    """
+    A = [np.array(f, copy=True) for f in init]
+    nd = T.ndim
+    w = np.ones(A[0].shape[1])
+    for _ in range(n_iter):
+        for k in range(nd):
+            rest = [A[i] for i in range(nd) if i != k]
+            V = rest[0]
+            for M in rest[1:]:
+                V = np.einsum("ir,jr->ijr", V, M).reshape(-1, V.shape[1])
+            Tk = np.moveaxis(T, k, 0).reshape(T.shape[k], -1)
+            Ak = np.linalg.lstsq(V, Tk.T, rcond=None)[0].T
+            w = np.linalg.norm(Ak, axis=0)
+            A[k] = Ak / (w + 1e-10)
+    return A, w
+
+
+class TestCPInputDtype:
+    """cp_decompose works in the input dtype (trntensor#103)."""
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.complex128])
+    def test_matches_numpy_als_fp64(self, dtype):
+        gen = torch.Generator().manual_seed(103)
+        shape, rank = (6, 5, 4), 3
+        true = [torch.randn(n, rank, generator=gen, dtype=dtype) for n in shape]
+        T = torch.einsum("ir,jr,kr->ijk", *true)
+        T = T + 1e-3 * torch.randn(shape, generator=gen, dtype=dtype)
+        init = [torch.randn(n, rank, generator=gen, dtype=dtype) for n in shape]
+
+        factors, weights = trntensor.cp_decompose(T, rank, max_iter=8, tol=0.0, factors=init)
+        ref_f, ref_w = _np_cp_als(T.numpy(), [f.numpy() for f in init], 8)
+
+        assert all(f.dtype == dtype for f in factors)
+        assert weights.dtype == torch.float64
+        for f, r in zip(factors, ref_f, strict=True):
+            np.testing.assert_allclose(f.numpy(), r, rtol=1e-8, atol=1e-10)
+        np.testing.assert_allclose(weights.numpy(), ref_w, rtol=1e-8)
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.complex128])
+    def test_random_init_recovers_rank1(self, dtype):
+        gen = torch.Generator().manual_seed(7)
+        vs = [torch.randn(n, generator=gen, dtype=dtype) for n in (4, 5, 3)]
+        T = torch.einsum("i,j,k->ijk", *vs)
+        torch.manual_seed(0)
+        factors, weights = trntensor.cp_decompose(T, 1, max_iter=50, tol=1e-12)
+        R = torch.einsum("r,ir,jr,kr->ijk", weights.to(dtype), *factors)
+        assert factors[0].dtype == dtype
+        assert (torch.linalg.norm(R - T) / torch.linalg.norm(T)).item() < 1e-10
+
+    def test_complex_nonneg_raises(self):
+        T = torch.randn(3, 4, 2, dtype=torch.complex128)
+        with pytest.raises(ValueError, match="real"):
+            trntensor.cp_decompose(T, 2, nonneg=True)
+
+    def test_float32_unchanged(self):
+        """Real float32 results are bit-identical to the pre-#103 normal equations."""
+        gen = torch.Generator().manual_seed(11)
+        T = torch.randn(5, 4, 3, generator=gen)
+        init = [torch.randn(n, 2, generator=gen) for n in T.shape]
+        factors, weights = trntensor.cp_decompose(T, 2, max_iter=3, tol=0.0, factors=init)
+        A = [f.clone() for f in init]
+        for _ in range(3):
+            for k in range(3):
+                rest = [A[i] for i in range(3) if i != k]
+                V = torch.stack([torch.kron(rest[0][:, r], rest[1][:, r]) for r in range(2)], dim=1)
+                Tk = T.moveaxis(k, 0).reshape(T.shape[k], -1)
+                Ak = torch.linalg.solve(V.T @ V, (Tk @ V).T).T
+                w = torch.linalg.norm(Ak, dim=0)
+                A[k] = Ak / (w.unsqueeze(0) + 1e-10)
+        for f, r in zip(factors, A, strict=True):
+            assert torch.equal(f, r)
+        assert torch.equal(weights, w)
+
+
+class TestCPReconstructDtype:
+    """cp_reconstruct follows the factors' dtype and device (trntensor#78)."""
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float64])
+    def test_dtype_matches_fp64_reference(self, dtype):
+        gen = torch.Generator().manual_seed(78)
+        f = [torch.randn(n, 3, generator=gen, dtype=torch.float64) for n in (4, 5, 2)]
+        w = torch.rand(3, generator=gen, dtype=torch.float64)
+        ref = np.einsum("r,ir,jr,kr->ijk", w.numpy(), *[x.numpy() for x in f])
+        lo_f, lo_w = [x.to(dtype) for x in f], w.to(dtype)
+        # reference from the rounded inputs, evaluated in fp64
+        ref_lo = np.einsum(
+            "r,ir,jr,kr->ijk", lo_w.double().numpy(), *[x.double().numpy() for x in lo_f]
+        )
+        out = trntensor.cp_reconstruct(lo_f, lo_w)
+        assert out.dtype == dtype
+        tol = {torch.bfloat16: 5e-2, torch.float16: 5e-3, torch.float64: 1e-12}[dtype]
+        np.testing.assert_allclose(out.double().numpy(), ref_lo, rtol=tol, atol=tol)
+        if dtype == torch.float64:
+            np.testing.assert_allclose(out.numpy(), ref, rtol=1e-12)
+
+    def test_mixed_dtypes_promote(self):
+        f = [torch.randn(3, 2, dtype=torch.bfloat16), torch.randn(4, 2, dtype=torch.float32)]
+        out = trntensor.cp_reconstruct(f, torch.ones(2, dtype=torch.bfloat16))
+        assert out.dtype == torch.float32
+
+    def test_device_follows_factors(self):
+        f = [torch.empty(n, 2, device="meta") for n in (3, 4, 2)]
+        out = trntensor.cp_reconstruct(f, torch.empty(2, device="meta"))
+        assert out.device.type == "meta" and out.shape == (3, 4, 2)
+
+
 class TestTucker:
     def test_full_rank(self):
         """Full-rank Tucker should reconstruct exactly."""
