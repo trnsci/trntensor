@@ -96,6 +96,14 @@ class _Recorder:
 
 def _fake_torch_neuronx(rec: _Recorder):
     mod = types.ModuleType("torch_neuronx")
+    real = sys.modules.get("torch_neuronx")
+    if real is not None:
+        # On a Neuron host the real runtime keeps reading module state from
+        # `sys.modules["torch_neuronx"]` while the stand-in is installed (e.g.
+        # `torch.manual_seed` -> `torch_neuronx._is_in_bad_fork`), so the
+        # stand-in starts as a copy of the real module; `nki_op` and
+        # `device_count` are replaced below.
+        mod.__dict__.update({k: v for k, v in vars(real).items() if not k.startswith("__")})
 
     def nki_op(name, fn=None, mutates_args={}, fake_fn=None):  # noqa: B006
         short = name.split("::", 1)[1]
