@@ -94,6 +94,7 @@ def split_aux(B, max_bytes: int = DEFAULT_CHUNK_BYTES, multiple: int = 128, dtyp
     return [t[:, q0 : q0 + width].to(dtype).contiguous() for q0 in range(0, naux, width)]
 
 
+@_dispatch._fp64_host_guard("pack_density")
 def pack_density(D: torch.Tensor) -> torch.Tensor:
     """Weighted packed density ``w · D[μ, ν]`` (``ν ≤ μ``; ``w`` = 1 on the
     diagonal, 2 off it), the ``(npair,)`` vector :func:`df_coulomb` and
@@ -109,6 +110,7 @@ def pack_density(D: torch.Tensor) -> torch.Tensor:
     return D.reshape(-1).index_select(0, r[0] * n + r[1]) * w
 
 
+@_dispatch._fp64_host_guard("unpack_packed")
 def unpack_packed(jp: torch.Tensor, nbasis: int) -> torch.Tensor:
     """Symmetric ``(nbasis, nbasis)`` from a packed ``(npair,)`` vector (on
     its device; pass a host vector for large nbasis, see :func:`pack_density`)."""
@@ -197,7 +199,13 @@ class AuxStream:
         self.nbasis = nbasis
         self.npair = nbasis * (nbasis + 1) // 2
         self.devices = [torch.device(d) for d in (devices or ["cpu"])]
-        self.device = self.devices[0]
+        self.device = self.devices[0]  # where results go by default
+        # float64 policy: device arithmetic is fp32, so under "auto" a float64
+        # stream bound for the neuron device keeps its chunks on the host and
+        # computes there; results still default to the first device given.
+        host = _dispatch._fp64_host_devices("AuxStream", dtype, self.devices)
+        if host is not None:
+            self.devices = host
         self.dtype = dtype
         self.prefetch = max(0, int(prefetch))
         self._sources = list(chunks)
@@ -502,6 +510,9 @@ def mp2_energy_blocked(
     nocc, nvir, naux = Bt.shape
     dtype = dtype or Bt.dtype
     devs = [torch.device(d) for d in (devices or ["cpu"])]
+    # float64 policy: under "auto" a float64 energy bound for the neuron
+    # device is computed on the host (device arithmetic is fp32).
+    devs = _dispatch._fp64_host_devices("mp2_energy_blocked", dtype, devs) or devs
     if occ_block is None:
         occ_block = max(1, min(nocc, max_bytes // max(1, nvir * naux * _itemsize(dtype))))
     blocks = [(i0, min(nocc, i0 + occ_block)) for i0 in range(0, nocc, occ_block)]

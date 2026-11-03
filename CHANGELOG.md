@@ -16,6 +16,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (copy, then upload) to 12–14 GB/s (upload from the mapping). For water61 /
   aug-cc-pVDZ (114.6 GB of B, 49.7 GB streamed per SCF iteration over 4
   cores), the per-iteration upload wait went from 12.5 s to 4.3 s.
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trntensor::`
+  custom-op call cost about 0.1 ms of host time before the kernel was queued,
+  against 0.016 ms for aten. Most of it went to nki's `Kernel.__call__`,
+  which rebuilds the torch handle on every call, plus the `torch.library`
+  layer. `dispatch._launch` and the `mp2_energy_row` loop now call a
+  `torch_neuronx.wrap_nki` handle built once per kernel; compile-time keyword
+  arguments (`use_sr`, `nub`, `tp`, `tail`, `banks`) pass through unchanged.
+  On trn2 (LNC=2), a 256x128x512 `matmul` launch drops from 0.143 to
+  0.036 ms of issue time (e2e 0.222 to 0.128 ms), `_nki_mp2_energy_rows` with
+  nocc=8 from 2.94 to 2.34 ms, and the `df_exchange` kernel pair's issue time
+  from 0.78 to 0.36 ms. Results are bit-identical. `torch.compile`,
+  requires-grad, int64 and tensor-subclass inputs keep the custom op.
+  `TRNTENSOR_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
 
 ### Added
 
@@ -44,7 +61,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - CPU-validated against dense references; device overlap and scaling are
     still to be measured.
 
+### Changed
+
+- **float64 follows the trnsci float64 policy (#92, trnsci/trnsci#35).**
+  Trainium computes float64 at fp32 precision, so a float64 operand on a
+  kernel route cannot get float64 accuracy there. This applies to the matmul /
+  batched-matmul kernels (`einsum`, `multi_einsum`) and to the chemistry
+  kernels (`mp2_energy`, `ao_to_mo_transform`, `df_exchange`, `df_coulomb`):
+  - **`"auto"`:** float64 under `auto` now computes in torch at float64
+    accuracy (previously cast to fp32 on the NKI path). For the chemistry
+    kernels the cast came in with #88 and was in 0.23.0. Through 0.22.0
+    float64 reached them unchanged and returned inf. torch runs on the
+    operands' own device; float64 host operands stay on the host.
+  - **Explicit `set_backend("nki")` (or `TRNTENSOR_FORCE_BACKEND=nki`):**
+    float64 is cast to fp32, the kernel runs, and the result comes back as
+    float64. A one-time `UserWarning` per op says the precision is fp32.
+    Through 0.23.0 the chemistry kernels cast without a warning; the matmul
+    kernels got float64 operands unchanged.
+  - **`TRNTENSOR_REQUIRE_NKI=1`:** float64 on a kernel route raises
+    `NotImplementedError` (trnblas#69's convention), under explicit `"nki"`
+    and `"auto"` alike. **Callers who ran float64 chemistry inputs under
+    `TRNTENSOR_REQUIRE_NKI=1` (0.23.0: the kernel ran in fp32) now get an
+    error.** Pass float32 operands to run the kernels, or unset the variable.
+  - **Result dtype:** always the pytorch backend's dtype for the same inputs,
+    including bf16 / fp16 and mixed-dtype promotion (`torch.promote_types`
+    of the operands).
+
+  - **float64 already on the `neuron` device:** under `"auto"`, "torch on
+    the operands' device" would be device aten, which computes float64 at
+    fp32 precision (measured on Trn2). float64 / complex128 operands on the
+    `neuron` device are now copied to the host, computed in host torch at
+    float64 accuracy, and the result is returned on the original device in
+    float64 / complex128. This covers `einsum`, `multi_einsum` (which returns
+    host tensors, as before), `gather` (device `torch.cat` rounds float64 to
+    fp32), `einsum(dtype=float64)` on fp32 / bf16 device operands, the
+    chemistry calls and the CP / Tucker / TT
+    decompositions and reconstructions. One `UserWarning` per op per process:
+    "float64 on the neuron device is computed on the host for float64
+    accuracy (device arithmetic is fp32); pass float32 to stay on device".
+    **New: `TRNTENSOR_FP64_ON_DEVICE=1`** keeps device aten (fp32 precision,
+    no warning) for callers who prefer speed. **Under
+    `TRNTENSOR_REQUIRE_NKI=1`, float64 / complex128 on the `neuron` device
+    now raises `NotImplementedError` at every guarded entry point** (backends
+    `"auto"` and `"nki"`, no host copy, ahead of `TRNTENSOR_FP64_ON_DEVICE`);
+    before, only the kernel routes raised, and an `einsum` with no kernel
+    route (below the size thresholds, or not a matmul) or a decomposition
+    ran device aten at fp32 precision with no error. Host-resident float64 is
+    unchanged, and `multi_einsum` no longer pins host float64 / complex128
+    operands to the device under `"auto"`; through 0.23.0 shared operands
+    were pinned, so device aten computed them at fp32 precision.
+    `--backend auto --conformance-device neuron` now holds float64 and
+    complex128 to the float64 tolerance.
+    The routes that place their own compute follow the same rule:
+    `trntensor.stream.AuxStream(..., dtype=float64)` and
+    `mp2_energy_blocked` with a `neuron` device in `devices` keep the chunks
+    and the arithmetic on the host (results still default to the first
+    device given), and `pack_tril` / `unpack_tril` / `pack_density` /
+    `unpack_packed` gather float64 / complex128 on the host, because on the
+    neuron device both the gather (`index_select`, fancy indexing) and
+    `torch.cat` round float64 to fp32 (measured on Trn2, rel err ~4e-8).
+
+  Affected versions: the old behaviour is 0.23.0 for the chemistry kernels
+  (the silent fp32 cast) and 0.23.0 and earlier for the matmul kernels
+  (float64 unchanged). The new behaviour lands in the next release (0.24.0).
+  Docs: "Precision and dtypes" in `docs/api/nki.md`.
+  `tests/test_conformance.py` now holds float64 to the float64 tolerance
+  for host inputs under `--backend auto`, as under `pytorch`.
+
 ### Fixed
+
+- **One dtype guard at the NKI kernel boundary: float64, integer, bool and
+  complex operands no longer reach a kernel that does not take them**
+  (silent, trnsci/trnsci#35; the class of #87). `nki.dispatch` now has a
+  per-kernel operand-dtype table (`KERNEL_OPERAND_DTYPES`). Every launch
+  checks it and raises `TypeError` if a dtype is not listed: the native op
+  and the eager-handle fast path (`_native_call`), the XLA call, the
+  simulator, the `mp2_energy` row loop and the reduce-parallel all-reduce. A native op without an entry cannot be loaded.
+  The host wrappers decide first:
+  - `einsum` / `multi_einsum` (matmul and batched-matmul kernels; fp32, bf16,
+    fp16, one shared dtype): integer, bool, complex and mixed dtypes run
+    torch, as the pytorch backend does; float64 follows the policy above.
+    Through 0.23.0 they reached the kernels under `set_backend("nki")`, or
+    under `"auto"` above the size thresholds.
+  - `mp2_energy`, `ao_to_mo_transform` (fp32 / bf16 kernels) and
+    `df_exchange`, `df_coulomb` (fp32 kernels): float16 operands, and
+    bfloat16 operands of `df_*`, are computed in fp32 (a lossless upcast).
+    The result is returned in the aten route's dtype. float64 follows the
+    policy above. Integer, bool and complex operands take aten. On the kernel
+    route, bf16 `df_coulomb` raised in the host tail whenever `npair` was not
+    a multiple of 256, then fell back to aten. Re-allowing bf16 on the `df_*`
+    kernels waits on a Trn2 bf16 run (#92).
+  - reduce-parallel all-reduce: partials other than fp32 / bf16 / fp16 are
+    summed by `torch.distributed` instead of the NKI collective kernel.
+    float64 partials are summed there at full precision.
+  - Under `TRNTENSOR_REQUIRE_NKI=1`, a dtype that would run torch instead of
+    the kernel raises `NotImplementedError` (trnblas's convention).
+  The `df_half_packed` op's fake (meta) output is now float32, like the
+  kernel's. Test: `tests/test_kernel_dtype_guard.py`.
+
+- **`unpack_tril` / `pack_tril` on the neuron device at LNC=1 returned
+  wrong data once the gathered output reached 4 GiB (#97).** Affected
+  0.20.0–0.23.0: `unpack_tril`, `pack_tril`, and the packed-`eri` aten /
+  legacy routes of `ao_to_mo_transform`, which unpack with `unpack_tril`: on
+  the neuron device at LNC=1, one `index_select` along dim 0 whose output
+  reaches 2^32 bytes can be silently wrong (about half the elements, at
+  times NaN) or hit the runtime's 30 s execution timeout. Measured on Trn2:
+  exact at 2^32 − 16 KiB, wrong at exactly 2^32, and 154 M mismatched
+  elements for `unpack_tril` at nbasis 736 / naux 2304 (4.99e9 bytes). It
+  is exact at LNC=2 and on the host. Device gathers are now split into row blocks of at most
+  2 GiB of output and concatenated in order (exact). Host gathers are one
+  `index_select` as before.
+- **Complex `tucker_decompose` on the neuron device used `U^T`, not `U^H`
+  (#89).** Affected 0.23.0 (the release that switched the core to
+  `factors[mode].mH`, #73): `.mH` of a complex tensor is a lazy conj view,
+  and device matmul ignores the conj bit (aws-neuron/aws-neuron-sdk#1455),
+  so the core of a device-resident complex tensor was silently computed
+  with the unconjugated factors. CPU results were correct. The conjugate
+  transpose is now materialized with `resolve_conj()` before the mode
+  product, as trnsolver's `factor._mH` does; real input is unchanged (no
+  copy). The complex `cp_decompose` added in this release (#103) had the
+  same pattern (`V.mH @ V`, `T_mode @ V.conj()`) and is fixed the same way.
+  A CPU `TorchFunctionMode` test fails if any lazy conj view reaches a
+  matmul, einsum, solve or pinv in either decomposition.
 
 - **`cp_decompose` works in the input dtype, including float64 and complex
   (#103).** Affected 0.1.1–0.23.0: the random init and the Khatri-Rao buffer
@@ -69,7 +207,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `path` plans carry the multiply-adds of the planned binary steps, which is
   what runs and is less than the dense all-index product. Plans are cached by
   shape, so the field is exact for the cached shapes.
-
 - **`einsum(..., out=)` now writes the result into `out` and returns it
   (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
   and never written, so the documented in-place accumulation example

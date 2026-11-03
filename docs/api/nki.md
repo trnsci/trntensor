@@ -22,6 +22,64 @@ Return the current backend selection.
 Module-level flag set at import time. `True` when `nki` (0.3.0+) is
 importable, otherwise `False`.
 
+## Precision and dtypes
+
+Trainium has no fp64 datapath: the NKI kernels compute in fp32 (bf16 / fp16
+where a kernel takes them). The trntensor kernels are the matmul and
+batched-matmul kernels behind `einsum` / `multi_einsum`, and the chemistry
+kernels behind `mp2_energy`, `ao_to_mo_transform`, `df_exchange` and
+`df_coulomb`. float64 operands that would reach one of them follow the
+trnsci suite's float64 policy (#92):
+
+| setting | float64 on a kernel route |
+|---|---|
+| `set_backend("auto")` (default) | runs torch on the operands' own device, the pytorch backend's computation, at float64 accuracy on the host. No kernel is launched |
+| `set_backend("nki")` / `TRNTENSOR_FORCE_BACKEND=nki` | cast to fp32, the kernel runs, and the result is returned as float64 with fp32 accuracy. A `UserWarning` is emitted once per op per process |
+| `TRNTENSOR_REQUIRE_NKI=1` (takes precedence over both) | raises `NotImplementedError`, so a downcast never happens silently |
+
+- **Result dtype.** The result dtype always matches what the pytorch backend
+  returns for the same inputs, including bf16 / fp16 and mixed-dtype
+  promotion (`torch.promote_types` of the operands). Where a kernel computes
+  in fp32, the result is cast back.
+- **Other dtypes.** Integer, bool and complex operands run torch on every
+  backend (trntensor has no complex kernels), and raise `NotImplementedError`
+  under `TRNTENSOR_REQUIRE_NKI=1` when the call would otherwise have run a
+  kernel. float16 chemistry operands, and bf16 on the fp32-only `df_*`
+  kernels, are upcast to fp32 without loss.
+- **On the device.** Device aten computes float64 at fp32 precision
+  (measured on Trn2), so under `"auto"` float64 / complex128 operands that
+  already live on the `neuron` device are copied to the host, computed in host
+  torch at float64 accuracy, and the result is returned on the operands'
+  device in float64 / complex128. This covers every public compute entry
+  point: `einsum`, `multi_einsum`, `mp2_energy`, `ao_to_mo_transform`,
+  `df_exchange`, `df_coulomb`, the CP / Tucker / TT decompositions and
+  reconstructions, `gather` (device `torch.cat` also rounds float64 to
+  fp32), and the gathers `pack_tril` / `unpack_tril` / `pack_density` /
+  `unpack_packed` (device `index_select` and fancy indexing round float64 to
+  fp32 too; plain copies such as `.to`, `clone` and `.contiguous` are exact). `einsum(dtype=float64)` (or `"f64"`) on fp32 / bf16 device operands
+  asks for a float64 computation and takes the same host path. One `UserWarning` per op per process says: "float64 on the
+  neuron device is computed on the host for float64 accuracy (device
+  arithmetic is fp32); pass float32 to stay on device". `multi_einsum`
+  returns host tensors, as it always has. An `einsum(out=)` tensor on the
+  device is written in place. `einsum(dtype=...)` with a non-float64 compute
+  dtype stays on the device.
+  - `TRNTENSOR_FP64_ON_DEVICE=1` keeps device aten (fp32 precision, no
+    transfer, no warning), for callers who prefer speed to float64 accuracy.
+  - Host-resident float64 is unchanged: it stays in host torch (and
+    `multi_einsum` no longer pins host float64 operands to the device).
+  - Explicit `set_backend("nki")` / `"pytorch"` are unaffected: their rows
+    in the table above apply.
+  - `TRNTENSOR_REQUIRE_NKI=1` (backends `"auto"` and `"nki"`): a float64 /
+    complex128 computation on the `neuron` device raises
+    `NotImplementedError` at every guarded entry point (and in
+    `trntensor.stream` with a `neuron` device), with no host copy, ahead of
+    `TRNTENSOR_FP64_ON_DEVICE=1`. Before, only kernel routes raised; the
+    routes without a kernel (an `einsum` below the kernel size thresholds or
+    not a matmul, the decompositions, `precision="kahan"`) ran device aten
+    at fp32 precision, or the host, with no error.
+  - `precision="kahan"` always contracts in fp64 on the host. `precision="dd"`
+    still raises `NotImplementedError` with NKI installed (trnblas#22).
+
 ## Dispatch path
 
 On Neuron hardware, kernels run on one of two `torch-neuronx` lineages,
@@ -116,11 +174,13 @@ supported in maintenance mode."
 
 | Variable | Effect |
 |---|---|
-| `TRNTENSOR_REQUIRE_NKI=1` | Re-raise kernel exceptions instead of falling back to PyTorch. Useful in the validation loop to surface silent kernel breakage. |
+| `TRNTENSOR_REQUIRE_NKI=1` | Re-raise kernel exceptions instead of falling back to PyTorch. Useful in the validation loop to surface silent kernel breakage. A dtype the kernel does not take (float64 included) raises `NotImplementedError` instead of running torch or downcasting; see [Precision and dtypes](#precision-and-dtypes). |
+| `TRNTENSOR_FP64_ON_DEVICE=1` | Under `"auto"`, compute float64 / complex128 operands that are already on the `neuron` device in device aten at fp32 precision, instead of on the host at float64 accuracy (the default); see [Precision and dtypes](#precision-and-dtypes). |
 | `TRNTENSOR_MIN_NKI_FLOPS=<int>` | XLA path: override the FLOP threshold (M·K·N) below which dispatch skips NKI and uses `torch.matmul` / `torch.bmm` directly. Default: `2_000_000_000`. Set to `0` to force NKI for kernel validation. |
 | `TRNTENSOR_MIN_NKI_FLOPS_PINNED=<int>` | XLA path, operands already on the device. Default: `1_000_000_000`. |
 | `TRNTENSOR_MIN_NKI_FLOPS_NATIVE=<int>` | Native (TorchNeuron) path, operands on CPU: M·K·N at which the work leaves the host for the `neuron` device. Below it, `torch.matmul` / `torch.bmm` run on the host. Above it, the operands are offloaded. The offload runs aten unless the pinned threshold below selects NKI. Default: `500_000_000` (measured on Trn2, see below). |
 | `TRNTENSOR_MIN_NKI_FLOPS_NATIVE_PINNED=<int>\|never` | Native path: M·K·N at which the NKI kernel replaces aten on the device. Below it, device-resident operands run `torch.matmul` / `torch.bmm` (aten) on `neuron`. Default: `never`, because on Trn2 aten beat the NKI kernels at every measured size. |
+| `TRNTENSOR_NKI_EAGER_HANDLE=1\|0` | Native path only. `1` (default): eager NKI kernel calls on plain `neuron` tensors go through a `torch_neuronx.wrap_nki` handle built once per kernel instead of the `trntensor::` custom op, which cuts host time per call from about 0.1 ms to 0.02-0.03 ms on trn2 (trnblas#92). Compile-time keyword arguments (`use_sr`, `nub`, `tp`, `tail`, `banks`) pass through unchanged. Under `torch.compile`, and for tensors that require grad, int64 tensors and tensor subclasses, the custom op runs as before; so do ops whose body is more than one kernel call. `0` always uses the custom op. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Force the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. Emit the one-time XLA-path and `to_xla` / `from_xla` deprecation warnings. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting (not trntensor's). Turns off the cross-process NKI kernel cache, which cannot version editable installs and may serve a stale kernel after a source edit. Set it with `pip install -e`, or if you write your own NKI kernel factories ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)). The test suite keeps the cache on, with a fresh cache directory per session. |
