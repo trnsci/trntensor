@@ -172,6 +172,22 @@ def df_coulomb_j(B: torch.Tensor, d_b: torch.Tensor) -> torch.Tensor:
     return _k.df_coulomb_j_kernel(B, d_b)
 
 
+# The kernel each single-kernel op's body calls, as (module, attribute), for
+# the eager handle in `dispatch._native_call`; resolved there at call time.
+KERNELS = {
+    "matmul": (_k, "matmul_kernel"),
+    "batched_matmul": (_k, "batched_matmul_kernel"),
+    "mp2_energy": (_k, "mp2_energy_kernel"),
+    "ao_to_mo_transform": (_k, "ao_to_mo_transform_kernel"),
+    "mp2_energy_row": (_k, "mp2_energy_row_kernel"),
+    "ao_to_mo_trn2": (_k, "ao_to_mo_trn2_kernel"),
+    "ao_to_mo_trn2_packed": (_k, "ao_to_mo_trn2_packed_kernel"),
+    "df_half_packed": (_k, "df_half_packed_kernel"),
+    "df_exchange_syrk": (_k, "df_exchange_syrk_kernel"),
+    "df_coulomb_d": (_k, "df_coulomb_d_kernel"),
+    "df_coulomb_j": (_k, "df_coulomb_j_kernel"),
+}
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "matmul": matmul,

@@ -927,3 +927,92 @@ def test_multi_einsum_does_not_pin_host_fp64(guarded, monkeypatch):
     assert pinned == []  # one float64 contraction keeps the batch unpinned
     trntensor.multi_einsum(("ij,jk->ik", af, bf), ("ij,jk->ik", af, bf))
     assert len(pinned) == 2  # float32 still pins
+
+
+# ── trntensor.stream: routes that place their own compute (#97) ──────────────
+# `AuxStream` and `mp2_energy_blocked` take a `devices=` list and upload the
+# operands there themselves, so the operand guard cannot see a neuron-bound
+# float64 computation. Here "meta" stands for the neuron device: if the policy
+# did not move the compute to the host, it would run on meta and give no values.
+
+
+@pytest.fixture
+def meta_is_neuron(guarded, monkeypatch):
+    monkeypatch.setattr(dispatch, "_device_is_neuron", lambda d: torch.device(d).type == "meta")
+    _set_backend(monkeypatch, "auto")
+    return guarded
+
+
+def _stream_case(dt):
+    from trntensor import stream
+
+    g = torch.Generator().manual_seed(3)
+    nbasis, naux = 6, 10
+    npair = nbasis * (nbasis + 1) // 2
+    Bp = torch.randn(npair, naux, generator=g, dtype=torch.float64).to(dt)
+    D = torch.randn(nbasis, nbasis, generator=g, dtype=torch.float64)
+    pw = stream.pack_density(D + D.T).to(dt)
+    B = torch.randn(3, 4, naux, generator=g, dtype=torch.float64).to(dt)
+    eo = -1.0 - torch.rand(3, generator=g, dtype=torch.float64).to(dt)
+    ev = 1.0 + torch.rand(4, generator=g, dtype=torch.float64).to(dt)
+    return stream, nbasis, Bp, pw, B, eo, ev
+
+
+def test_stream_fp64_bound_for_the_device_computes_on_host(meta_is_neuron):
+    stream, nbasis, Bp, pw, B, eo, ev = _stream_case(_F64)
+    want_j = stream.AuxStream([Bp], nbasis, dtype=_F64).coulomb(pw)
+    want_e = stream.mp2_energy_blocked(B, eo, ev, occ_block=1)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        aux = stream.AuxStream([Bp[:, :4], Bp[:, 4:]], nbasis, devices=["meta"], dtype=_F64)
+        got_j = aux.coulomb(pw, out_device="cpu")
+        stream.AuxStream([Bp], nbasis, devices=["meta"], dtype=_F64)
+        got_e = stream.mp2_energy_blocked(B, eo, ev, devices=["meta"], occ_block=1)
+    assert aux.devices == [torch.device("cpu")] and aux.device == torch.device("meta")
+    assert sorted(_host_warnings(record)) == ["AuxStream", "mp2_energy_blocked"]
+    assert meta_is_neuron.calls == []
+    torch.testing.assert_close(got_j, want_j, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(got_e, want_e, rtol=1e-12, atol=1e-12)
+
+
+def test_stream_fp64_device_path_kept_off_the_host_policy(meta_is_neuron, monkeypatch):
+    """float32, TRNTENSOR_FP64_ON_DEVICE=1, explicit "nki" / "pytorch" and a
+    host-only device list keep the devices the caller gave."""
+    stream, nbasis, Bp, *_ = _stream_case(_F64)
+
+    def devices(dt=_F64, devs=("meta",)):
+        return stream.AuxStream([Bp.to(dt)], nbasis, devices=list(devs), dtype=dt).devices
+
+    meta = [torch.device("meta")]
+    assert devices(F32) == meta
+    assert devices(_F64, ("cpu",)) == [torch.device("cpu")]
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
+    assert devices() == meta
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", False)
+    for backend in ("nki", "pytorch"):
+        _set_backend(monkeypatch, backend)
+        assert devices() == meta
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_device_fp64_blocked_tril_gather_concatenates_on_host(guarded, monkeypatch, override):
+    """`pack_tril` / `unpack_tril` split device gathers into blocks (#97) and
+    join them with `torch.cat`, which rounds float64 to fp32 on the device (see
+    `gather`): under "auto" float64 blocks are joined on the host, one warning
+    per op; TRNTENSOR_FP64_ON_DEVICE=1 keeps the device `torch.cat`."""
+    import trntensor.quantum as q
+
+    monkeypatch.setattr(q, "_gather_in_blocks", lambda t: True)
+    monkeypatch.setattr(q, "_GATHER_MAX_BYTES", 256)
+    monkeypatch.setattr(dispatch, "_device_is_neuron", lambda d: True)
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", override)
+    _set_backend(monkeypatch, "auto")
+    e = torch.randn(9, 9, 5, dtype=_F64)
+    e = e + e.transpose(0, 1)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            full = trntensor.unpack_tril(trntensor.pack_tril(e), 9)
+        trntensor.unpack_tril(trntensor.pack_tril(e.float()), 9)  # fp32: device cat
+    assert torch.equal(full, e)
+    assert sorted(_host_warnings(record)) == ([] if override else ["pack_tril", "unpack_tril"])

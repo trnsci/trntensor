@@ -18,6 +18,23 @@ import torch
 from .nki.dispatch import _fp64_host_guard
 
 
+def _mH(x: torch.Tensor) -> torch.Tensor:
+    """Conjugate transpose with the conjugation applied (as trnsolver's ``factor._mH``).
+
+    ``x.mH`` and ``x.conj()`` of a complex tensor are lazy views: they set the
+    conj bit and leave the data unconjugated. On a Neuron device matmul ignores
+    that bit (aws-neuron/aws-neuron-sdk#1455), so ``A.mH @ B`` computes
+    ``A.mT @ B``, silently. ``resolve_conj()`` materializes the conjugate; for
+    real input it is a no-op (no copy).
+    """
+    return x.mH.resolve_conj()
+
+
+def _conj(x: torch.Tensor) -> torch.Tensor:
+    """``x.conj()`` materialized (see :func:`_mH`); real input is returned as is."""
+    return x.conj().resolve_conj()
+
+
 @_fp64_host_guard("cp_decompose")
 def cp_decompose(
     tensor: torch.Tensor,
@@ -42,12 +59,23 @@ def cp_decompose(
             ``(tensor.shape[k], rank)``. When provided the random initialization
             step is skipped. Works with or without ``nonneg``.
 
+    The factors are computed in ``tensor``'s dtype and on its device. Complex
+    input is supported (not with ``nonneg``): the model is unconjugated,
+    ``T ≈ Σ_r λ_r a_r ⊗ b_r ⊗ ...``, and each ALS step is the least-squares
+    solution of ``T_(k) ≈ A_k V^T``. Warm-start factors are cast to
+    ``tensor``'s dtype and device.
+
     Returns:
         factors: List of factor matrices [(I_0, R), (I_1, R), ...]
-        weights: Component weights (R,). For ``nonneg=True`` weights are all 1.
+        weights: Component weights (R,), real (``tensor.real.dtype`` for complex
+            input). For ``nonneg=True`` weights are all 1.
     """
     ndim = tensor.dim()
     shape = tensor.shape
+    dtype, device = tensor.dtype, tensor.device
+    real_dtype = tensor.real.dtype if tensor.is_complex() else dtype
+    if nonneg and tensor.is_complex():
+        raise ValueError("cp_decompose(nonneg=True) needs real input, got complex")
 
     if factors is not None:
         # Warm-start: validate and clone so we don't mutate caller's tensors
@@ -61,24 +89,27 @@ def cp_decompose(
                     f"warm-start factors[{k}] has shape {tuple(f.shape)}, "
                     f"expected ({shape[k]}, {rank})"
                 )
-        factors = [f.clone() for f in factors]
+        factors = [f.to(dtype=dtype, device=device, copy=True) for f in factors]
         if nonneg:
             factors = [f.clamp(min=1e-10) for f in factors]
     elif nonneg:
-        factors = [torch.rand(s, rank).clamp(min=1e-10) for s in shape]
+        factors = [torch.rand(s, rank, dtype=dtype, device=device).clamp(min=1e-10) for s in shape]
     else:
-        factors = [torch.randn(s, rank) for s in shape]
+        factors = [torch.randn(s, rank, dtype=dtype, device=device) for s in shape]
         for k in range(ndim):
             norms = torch.linalg.norm(factors[k], dim=0, keepdim=True)
             factors[k] = factors[k] / (norms + 1e-10)
 
-    weights = torch.ones(rank)
+    weights = torch.ones(rank, dtype=real_dtype, device=device)
 
     for _ in range(max_iter):
         for mode in range(ndim):
             V = _khatri_rao_except(factors, mode)
             T_mode = _unfold(tensor, mode)
-            VtV = V.T @ V
+            # Normal equations of the least-squares problem T_mode ≈ A V^T:
+            # A conj(V^H V) = T_mode conj(V), i.e. (V^H V) A^T = (T_mode conj(V))^T.
+            # For real input V.mH is V.T and conj() is a no-op.
+            VtV = _mH(V) @ V
 
             if nonneg:
                 # Multiplicative update: ensures non-negativity
@@ -87,11 +118,11 @@ def cp_decompose(
                 factors[mode] = (factors[mode] * numer / denom).clamp(min=1e-10)
             else:
                 # ALS: solve normal equations
-                rhs = T_mode @ V
+                rhs = T_mode @ _conj(V)
                 try:
                     factors[mode] = torch.linalg.solve(VtV, rhs.T).T
                 except RuntimeError:
-                    factors[mode] = rhs @ torch.linalg.pinv(VtV)
+                    factors[mode] = rhs @ torch.linalg.pinv(_conj(VtV))
                 # Extract norms as weights
                 norms = torch.linalg.norm(factors[mode], dim=0)
                 weights = norms
@@ -108,12 +139,19 @@ def cp_decompose(
 
 @_fp64_host_guard("cp_reconstruct")
 def cp_reconstruct(factors: list[torch.Tensor], weights: torch.Tensor) -> torch.Tensor:
-    """Reconstruct tensor from CP factors: T = Σ_r w_r * a_r ⊗ b_r ⊗ ..."""
+    """Reconstruct tensor from CP factors: T = Σ_r w_r * a_r ⊗ b_r ⊗ ...
+
+    The result has the promoted dtype of ``factors`` and ``weights`` and lives
+    on the factors' device.
+    """
     rank = weights.shape[0]
     ndim = len(factors)
     shape = tuple(f.shape[0] for f in factors)
+    dtype = weights.dtype
+    for f in factors:
+        dtype = torch.promote_types(dtype, f.dtype)
 
-    result = torch.zeros(shape)
+    result = torch.zeros(shape, dtype=dtype, device=factors[0].device)
     for r in range(rank):
         component = weights[r]
         outer = factors[0][:, r]
@@ -154,10 +192,11 @@ def tucker_decompose(
 
     # Core tensor: G = T ×_1 U_1^H ×_2 U_2^H ×_3 U_3^H ... (the conjugate
     # transpose: U^T is not the inverse of a complex unitary U; for real
-    # tensors .mH is .T)
+    # tensors .mH is .T). Resolved, not a lazy conj view: device matmul
+    # ignores the conj bit (#89, aws-neuron-sdk#1455).
     core = tensor.clone()
     for mode in range(ndim):
-        core = _mode_product(core, factors[mode].mH, mode)
+        core = _mode_product(core, _mH(factors[mode]), mode)
 
     return core, factors
 
@@ -281,7 +320,7 @@ def _khatri_rao_except(factors: list[torch.Tensor], skip: int) -> torch.Tensor:
         # Khatri-Rao: column-wise Kronecker
         R = result.shape[1]
         new_rows = result.shape[0] * factors[i].shape[0]
-        kr = torch.zeros(new_rows, R)
+        kr = torch.zeros(new_rows, R, dtype=result.dtype, device=result.device)
         for r in range(R):
             kr[:, r] = torch.kron(result[:, r], factors[i][:, r])
         result = kr

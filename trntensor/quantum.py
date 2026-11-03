@@ -13,6 +13,8 @@ is the product.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .nki import dispatch as _dispatch
@@ -171,6 +173,39 @@ def _cpu_mp2_energy(
     return e
 
 
+# ``index_select`` along dim 0 on the neuron device returns wrong data at
+# LNC=1 once its output passes 2^32 bytes, with no error (#97). Device gathers
+# are split into row blocks whose output stays at or below this many bytes.
+_GATHER_MAX_BYTES = 1 << 31
+
+
+def _gather_in_blocks(t: torch.Tensor) -> bool:
+    """Whether gathers from ``t`` are split (any non-CPU device; patched in tests)."""
+    return t.device.type != "cpu"
+
+
+def _index_select_rows(
+    src: torch.Tensor, idx: torch.Tensor, what: str = "unpack_tril"
+) -> torch.Tensor:
+    """``src.index_select(0, idx)``, in blocks of at most ``_GATHER_MAX_BYTES``
+    of output on a device (#97). Exact: the blocks are concatenated in order.
+
+    Device ``torch.cat`` rounds float64 to fp32 (see ``parallel.gather``), so
+    under ``"auto"`` float64 / complex128 blocks are concatenated on the host
+    and the result goes back to ``src``'s device (one warning per op), unless
+    ``TRNTENSOR_FP64_ON_DEVICE=1``."""
+    from .nki.dispatch import _fp64_host_devices
+
+    row_bytes = math.prod(src.shape[1:]) * src.element_size()
+    if not _gather_in_blocks(src) or idx.numel() * row_bytes <= _GATHER_MAX_BYTES:
+        return src.index_select(0, idx)
+    step = max(1, _GATHER_MAX_BYTES // max(1, row_bytes))
+    blocks = [src.index_select(0, idx[i : i + step]) for i in range(0, idx.numel(), step)]
+    if _fp64_host_devices(what, src.dtype, [src.device]) is not None:
+        return torch.cat([b.cpu() for b in blocks]).to(src.device)
+    return torch.cat(blocks)
+
+
 def pack_tril(eri: torch.Tensor) -> torch.Tensor:
     """``(nbasis, nbasis, naux)`` μ↔ν-symmetric integrals → packed ``(npair, naux)``.
 
@@ -183,13 +218,16 @@ def pack_tril(eri: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"eri must be (nbasis, nbasis, naux); got shape {tuple(eri.shape)}")
     n = eri.shape[0]
     r = torch.tril_indices(n, n)
-    return eri.reshape(n * n, eri.shape[2]).index_select(0, (r[0] * n + r[1]).to(eri.device))
+    rows = (r[0] * n + r[1]).to(eri.device)
+    return _index_select_rows(eri.reshape(n * n, eri.shape[2]), rows, "pack_tril")
 
 
 def unpack_tril(eri_packed: torch.Tensor, nbasis: int) -> torch.Tensor:
     """Inverse of :func:`pack_tril`: packed ``(npair, naux)`` → full ``(nbasis, nbasis, naux)``.
 
-    One ``index_select`` on the packed tensor's device (exact).
+    One ``index_select`` on the packed tensor's device (exact), split into
+    row blocks of at most 2 GiB of output on a device (#97: one gather with
+    an output over 4 GiB is silently wrong on the neuron device at LNC=1).
     """
     npair, naux = eri_packed.shape
     if npair != nbasis * (nbasis + 1) // 2:
@@ -199,7 +237,7 @@ def unpack_tril(eri_packed: torch.Tensor, nbasis: int) -> torch.Tensor:
     from .nki.dispatch import _tril_rows
 
     idx = _tril_rows(nbasis).reshape(-1).to(eri_packed.device)
-    return eri_packed.index_select(0, idx).reshape(nbasis, nbasis, naux)
+    return _index_select_rows(eri_packed, idx, "unpack_tril").reshape(nbasis, nbasis, naux)
 
 
 def _as_packed_rows(eri: torch.Tensor, nbasis: int) -> torch.Tensor:

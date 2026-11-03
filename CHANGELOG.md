@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trntensor::`
+  custom-op call cost about 0.1 ms of host time before the kernel was queued,
+  against 0.016 ms for aten. Most of it went to nki's `Kernel.__call__`,
+  which rebuilds the torch handle on every call, plus the `torch.library`
+  layer. `dispatch._launch` and the `mp2_energy_row` loop now call a
+  `torch_neuronx.wrap_nki` handle built once per kernel; compile-time keyword
+  arguments (`use_sr`, `nub`, `tp`, `tail`, `banks`) pass through unchanged.
+  On trn2 (LNC=2), a 256x128x512 `matmul` launch drops from 0.143 to
+  0.036 ms of issue time (e2e 0.222 to 0.128 ms), `_nki_mp2_energy_rows` with
+  nocc=8 from 2.94 to 2.34 ms, and the `df_exchange` kernel pair's issue time
+  from 0.78 to 0.36 ms. Results are bit-identical. `torch.compile`,
+  requires-grad, int64 and tensor-subclass inputs keep the custom op.
+  `TRNTENSOR_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
+
+### Added
+
+- **`trntensor.stream`: DF integrals streamed over the aux index**
+  (trnsolver#15). At nbasis 1658 the packed fp32 integrals were 33.4 GB and
+  only fit split over a Trn2 chip's 4 logical cores; at nbasis ≈ 3300 they
+  are about 270 GB.
+  - `AuxStream(chunks, nbasis, devices=..., resident_bytes=..., prefetch=...)`
+    holds `B` as `(npair, nq)` aux chunks (tensors, numpy memmaps or lazy
+    loaders), keeps chunks resident up to a per-device budget and uploads the
+    rest on every call from a loader thread, one chunk ahead per device, so
+    uploads overlap compute. `jk()` builds packed J and K in one pass
+    (`df_coulomb` / `df_exchange` per chunk, summed per device, then on the
+    host); `ao_to_mo()` writes `B_ia^P` chunk by chunk into a host tensor or
+    memmap. Chunks are dealt round-robin over `devices` (`neuron:0..3`).
+  - `aux_chunk_width` / `split_aux`: 128-multiple chunks under 2 GiB by
+    default, below the 4 GiB transposed-LHS limit (aws-neuron-sdk#1457, #97).
+  - `pack_density` / `unpack_packed`: the packed-density helpers, for use on
+    host tensors at large nbasis (the device gathers compile for > 40 min at
+    nbasis 1658, trnsolver#87).
+  - `mp2_energy_blocked`: DF-MP2 over occupied blocks of a host `B_ia^P`,
+    for `B` larger than one device.
+  - Memory-mapped chunks are read into RAM with one sequential read when
+    loaded. Left mapped, the row gathers of `df_exchange` fault pages in at
+    random, which was disk-bound on a disk-backed store.
+  - CPU-validated against dense references; device overlap and scaling are
+    still to be measured.
+
 ### Changed
 
 - **float64 follows the trnsci float64 policy (#92, trnsci/trnsci#35).**
@@ -52,6 +97,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     were pinned, so device aten computed them at fp32 precision.
     `--backend auto --conformance-device neuron` now holds float64 and
     complex128 to the float64 tolerance.
+    The routes that place their own compute follow the same rule:
+    `trntensor.stream.AuxStream(..., dtype=float64)` and
+    `mp2_energy_blocked` with a `neuron` device in `devices` keep the chunks
+    and the arithmetic on the host (results still default to the first
+    device given), and `pack_tril` / `unpack_tril` join the blocks of a split
+    device gather (#97) on the host for float64 / complex128, because device
+    `torch.cat` rounds float64 to fp32.
 
   Affected versions: the old behaviour is 0.23.0 for the chemistry kernels
   (the silent fp32 cast) and 0.23.0 and earlier for the matmul kernels
@@ -66,9 +118,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complex operands no longer reach a kernel that does not take them**
   (silent, trnsci/trnsci#35; the class of #87). `nki.dispatch` now has a
   per-kernel operand-dtype table (`KERNEL_OPERAND_DTYPES`). Every launch
-  checks it and raises `TypeError` if a dtype is not listed: the native op,
-  the XLA call, the simulator, the `mp2_energy` row loop and the
-  reduce-parallel all-reduce. A native op without an entry cannot be loaded.
+  checks it and raises `TypeError` if a dtype is not listed: the native op
+  and the eager-handle fast path (`_native_call`), the XLA call, the
+  simulator, the `mp2_energy` row loop and the reduce-parallel all-reduce. A native op without an entry cannot be loaded.
   The host wrappers decide first:
   - `einsum` / `multi_einsum` (matmul and batched-matmul kernels; fp32, bf16,
     fp16, one shared dtype): integer, bool, complex and mixed dtypes run
@@ -90,6 +142,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the kernel raises `NotImplementedError` (trnblas's convention).
   The `df_half_packed` op's fake (meta) output is now float32, like the
   kernel's. Test: `tests/test_kernel_dtype_guard.py`.
+
+- **`unpack_tril` / `pack_tril` on the neuron device at LNC=1 returned
+  wrong data once the gathered output reached 4 GiB (#97).** Affected
+  0.20.0–0.23.0: `unpack_tril`, `pack_tril`, and the packed-`eri` aten /
+  legacy routes of `ao_to_mo_transform`, which unpack with `unpack_tril`: on
+  the neuron device at LNC=1, one `index_select` along dim 0 whose output
+  reaches 2^32 bytes can be silently wrong (about half the elements, at
+  times NaN) or hit the runtime's 30 s execution timeout. Measured on Trn2:
+  exact at 2^32 − 16 KiB, wrong at exactly 2^32, and 154 M mismatched
+  elements for `unpack_tril` at nbasis 736 / naux 2304 (4.99e9 bytes). It
+  is exact at LNC=2 and on the host. Device gathers are now split into row blocks of at most
+  2 GiB of output and concatenated in order (exact). Host gathers are one
+  `index_select` as before.
+- **Complex `tucker_decompose` on the neuron device used `U^T`, not `U^H`
+  (#89).** Affected 0.23.0 (the release that switched the core to
+  `factors[mode].mH`, #73): `.mH` of a complex tensor is a lazy conj view,
+  and device matmul ignores the conj bit (aws-neuron/aws-neuron-sdk#1455),
+  so the core of a device-resident complex tensor was silently computed
+  with the unconjugated factors. CPU results were correct. The conjugate
+  transpose is now materialized with `resolve_conj()` before the mode
+  product, as trnsolver's `factor._mH` does; real input is unchanged (no
+  copy). The complex `cp_decompose` added in this release (#103) had the
+  same pattern (`V.mH @ V`, `T_mode @ V.conj()`) and is fixed the same way.
+  A CPU `TorchFunctionMode` test fails if any lazy conj view reaches a
+  matmul, einsum, solve or pinv in either decomposition.
+
+- **`cp_decompose` works in the input dtype, including float64 and complex
+  (#103).** Affected 0.1.1–0.23.0: the random init and the Khatri-Rao buffer
+  were float32 on the host, so float64 or complex input raised `expected m1
+  and m2 to have the same dtype` on every backend (and a float64 warm start
+  was truncated to float32 inside the Khatri-Rao product). The init, the
+  Khatri-Rao buffer and the weights now follow `tensor.dtype` and
+  `tensor.device`, warm-start factors are cast to them, and complex input
+  uses the conjugated normal equations `(V^H V) A^T = (T_(k) conj(V))^T`.
+  Weights are real (`tensor.real.dtype`). `nonneg=True` with complex input
+  raises `ValueError`. Real float32 results are bit-identical.
+- **`cp_reconstruct` returns the factors' dtype on the factors' device
+  (#78).** Affected 0.1.1–0.23.0: it accumulated into a float32 host buffer
+  (`torch.zeros(shape)`), so bf16 or fp16 factors came back as float32 and
+  device factors raised a device mismatch. The buffer now has the promoted
+  dtype of `factors` and `weights` and the factors' device. float32 and
+  float64 results are unchanged.
+- **`plan_contraction` fills `ContractionPlan.estimated_flops` (#83).**
+  Affected 0.1.1–0.23.0: the documented multiply-add estimate was never set
+  and always read 0. `matmul`, `bmm` and `torch` plans now carry
+  `estimate_flops(subscripts, *operands)` (the product of all index sizes);
+  `path` plans carry the multiply-adds of the planned binary steps, which is
+  what runs and is less than the dense all-index product. Plans are cached by
+  shape, so the field is exact for the cached shapes.
 - **`einsum(..., out=)` now writes the result into `out` and returns it
   (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
   and never written, so the documented in-place accumulation example

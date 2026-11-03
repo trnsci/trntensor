@@ -36,6 +36,14 @@ from .quantum import (
     pack_tril,
     unpack_tril,
 )
+from .stream import (
+    AuxStream,
+    aux_chunk_width,
+    mp2_energy_blocked,
+    pack_density,
+    split_aux,
+    unpack_packed,
+)
 
 __all__ = [
     "einsum",
@@ -66,6 +74,12 @@ __all__ = [
     "df_coulomb",
     "pack_tril",
     "unpack_tril",
+    "AuxStream",
+    "aux_chunk_width",
+    "split_aux",
+    "pack_density",
+    "unpack_packed",
+    "mp2_energy_blocked",
     "ShardedTensor",
     "scatter",
     "gather",

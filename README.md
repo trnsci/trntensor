@@ -129,6 +129,21 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 - [x] Mixed precision / `dtype` override for bf16/fp16
 - [x] `precision=` kwarg (`"fast"` / `"kahan"` fp64 promotion / `"sr"` / `"dd"`: CPU emulation only, raises on Trainium until trnblas#22)
 
+## Known issues in earlier releases
+
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Details are in the [CHANGELOG](CHANGELOG.md).
+
+| Bug | Affected | Fixed in |
+|-----|----------|----------|
+| `einsum` returned the wrong layout for transposed or permuted outputs (e.g. `ij,jk->ki` gave `A@B`), every backend (#64) | through 0.21.0 | 0.22.0 |
+| `einsum(..., out=C)` with `beta=0` read `C`, so NaN/inf in it made the result NaN (#71) | 0.3.0–0.22.0 | 0.23.0 |
+| `tucker_decompose` used `Uᵀ` instead of `Uᴴ` for complex tensors, giving a wrong core (#73) | through 0.22.0 | 0.23.0 |
+| `precision="kahan"` / `"dd"` / `target_forward_error` dropped the imaginary part of complex operands and rounded large integers (#69) | `"kahan"` 0.4.0–0.22.0; `"dd"`, `target_forward_error` 0.17.0–0.22.0 | 0.23.0 |
+| `einsum(precision="dd")` on float32/float64 was less accurate than `"fast"` (CPU emulation, #84) | 0.17.0–0.22.0 | 0.23.0 |
+| `multi_einsum` returned float32 results as float64 in mixed-dtype batches (#75) | 0.17.0–0.22.0 | 0.23.0 |
+| NKI chemistry kernels returned inf for float64 operands, and some kernel routes changed the result dtype (#87) | `df_*` 0.21.0–0.22.0; `ao_to_mo_transform` every release with its kernels | 0.23.0 |
+| `ao_to_mo_transform` aten route on the TorchNeuron device was wrong once `eri` exceeded 4 GiB (#97; one LNC=1 case is still open) | through 0.22.0 | 0.23.0 |
+
 ## Related Projects
 
 | Project | What |
