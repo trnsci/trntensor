@@ -54,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`unpack_tril` / `pack_tril` on the neuron device at LNC=1 returned
+  wrong data once the gathered output reached 4 GiB (#97).** Affected
+  0.20.0–0.23.0: `unpack_tril`, `pack_tril`, and the packed-`eri` aten /
+  legacy routes of `ao_to_mo_transform`, which unpack with `unpack_tril`: on
+  the neuron device at LNC=1, one `index_select` along dim 0 whose output
+  reaches 2^32 bytes can be silently wrong (about half the elements, at
+  times NaN) or hit the runtime's 30 s execution timeout. Measured on Trn2:
+  exact at 2^32 − 16 KiB, wrong at exactly 2^32, and 154 M mismatched
+  elements for `unpack_tril` at nbasis 736 / naux 2304 (4.99e9 bytes). It
+  is exact at LNC=2 and on the host. Device gathers are now split into row blocks of at most
+  2 GiB of output and concatenated in order (exact). Host gathers are one
+  `index_select` as before.
+
 - **`cp_decompose` works in the input dtype, including float64 and complex
   (#103).** Affected 0.1.1–0.23.0: the random init and the Khatri-Rao buffer
   were float32 on the host, so float64 or complex input raised `expected m1
