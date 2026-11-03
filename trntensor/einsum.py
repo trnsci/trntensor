@@ -24,6 +24,7 @@ import math
 
 import torch
 
+from .nki.dispatch import _fp64_host_guard
 from .plan import ContractionPlan, _parse_subscripts, plan_contraction
 
 # Mapping of user-friendly dtype strings to torch.dtype
@@ -51,6 +52,7 @@ def _resolve_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
         raise ValueError(f"unknown dtype {dtype!r}; valid strings: {sorted(_DTYPE_MAP)}") from None
 
 
+@_fp64_host_guard("einsum")
 def einsum(
     subscripts: str,
     *operands: torch.Tensor,
@@ -726,6 +728,7 @@ def _try_batched_multi_einsum(
     return [out_stack[i] for i in range(len(contractions))]
 
 
+@_fp64_host_guard("multi_einsum", results_on_host=True)
 def multi_einsum(
     *contractions: tuple,
     precision: str = "fast",
@@ -790,8 +793,18 @@ def multi_einsum(
     # Every operand of a contraction that uses a pinned tensor is pinned too:
     # a contraction must not mix host and device operands (aten raises
     # "input tensor is on cpu device, expected neuron" on the native path).
+    # Host float64 / complex128 is computed in host torch (the fp64 policy,
+    # #92): a batch with any such contraction is not pinned, since pinning it
+    # would compute it in device aten at fp32 precision.
+    from .nki.dispatch import _fp64_stays_on_host
+
     pinned_map: dict[int, torch.Tensor] = {}
-    if HAS_NKI and _use_nki() and shared_ids:
+    if (
+        HAS_NKI
+        and _use_nki()
+        and shared_ids
+        and not any(_fp64_stays_on_host(*c[1:]) for c in contractions)
+    ):
         from .nki.dispatch import _to_device
 
         pin_ids = set(shared_ids)

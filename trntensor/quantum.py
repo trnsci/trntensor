@@ -13,12 +13,15 @@ is the product.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .nki import dispatch as _dispatch
-from .nki.dispatch import _ao_to_mo_route, _mp2_energy_route
+from .nki.dispatch import _ao_to_mo_route, _fp64_host_guard, _mp2_energy_route
 
 
+@_fp64_host_guard("mp2_energy")
 def mp2_energy(
     B: torch.Tensor,
     eps_occ: torch.Tensor,
@@ -90,7 +93,12 @@ def mp2_energy(
         if e is not None:
             return e.to(B.device)
     route = _mp2_energy_route(B)
+    kops = None
     if route != "aten":
+        # fp32 / bf16 kernels: float64 / float16 run in fp32; integer, bool
+        # and complex take aten (the dtype guard, `_chem_kernel_operands`).
+        kops = _dispatch._chem_kernel_operands("mp2_energy", B, eps_occ, eps_vir)
+    if kops is not None:
         from .nki import dispatch as _d
 
         try:
@@ -99,7 +107,7 @@ def mp2_energy(
             out_dtype = torch.promote_types(
                 torch.promote_types(B.dtype, eps_occ.dtype), eps_vir.dtype
             )
-            kB, keo, kev = (_kernel_operand(t) for t in (B, eps_occ, eps_vir))
+            kB, keo, kev = kops
             if route == "rows":
                 return _d._nki_mp2_energy_rows(kB, keo, kev).to(out_dtype)
             if _d._on_native_path():
@@ -130,17 +138,6 @@ def _on_device(fn, *tensors: torch.Tensor):
         if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
             raise
         return None
-
-
-def _kernel_operand(t: torch.Tensor) -> torch.Tensor:
-    """A float64 operand as float32 for the fp32 NKI kernels.
-
-    Trainium has no fp64 datapath. Through 0.22.0 float64 tensors reached the
-    chemistry kernels as is and came back inf (`ao_to_mo_transform`,
-    `df_exchange`, `df_coulomb`; #87). Strides are kept (`preserve_format`),
-    so layout detection still sees the caller's layout.
-    """
-    return t.float() if t.dtype == torch.float64 else t
 
 
 # Elements of the per-chunk T block (chunk·nocc·nvir²) the aten MP2 path
@@ -183,6 +180,41 @@ def _cpu_mp2_energy(
     return e
 
 
+# ``index_select`` along dim 0 on the neuron device returns wrong data at
+# LNC=1 once its output passes 2^32 bytes, with no error (#97). Device gathers
+# are split into row blocks whose output stays at or below this many bytes.
+_GATHER_MAX_BYTES = 1 << 31
+
+
+def _gather_in_blocks(t: torch.Tensor) -> bool:
+    """Whether gathers from ``t`` are split (any non-CPU device; patched in tests)."""
+    return t.device.type != "cpu"
+
+
+def _index_select_rows(
+    src: torch.Tensor, idx: torch.Tensor, what: str = "unpack_tril"
+) -> torch.Tensor:
+    """``src.index_select(0, idx)``, in blocks of at most ``_GATHER_MAX_BYTES``
+    of output on a device (#97), concatenated in order.
+
+    On the neuron device both the gather (``index_select`` / fancy indexing)
+    and ``torch.cat`` round float64 to fp32 (measured on Trn2: rel err ~4e-8;
+    fp32 and narrower dtypes are exact). So under ``"auto"`` a float64 /
+    complex128 ``src`` on the neuron device is gathered on the host and the
+    result goes back to ``src``'s device (one warning per op), unless
+    ``TRNTENSOR_FP64_ON_DEVICE=1``; ``TRNTENSOR_REQUIRE_NKI=1`` raises."""
+    from .nki.dispatch import _fp64_host_devices
+
+    if _fp64_host_devices(what, src.dtype, [src.device]) is not None:
+        return src.cpu().index_select(0, idx.cpu()).to(src.device)
+    row_bytes = math.prod(src.shape[1:]) * src.element_size()
+    if not _gather_in_blocks(src) or idx.numel() * row_bytes <= _GATHER_MAX_BYTES:
+        return src.index_select(0, idx)
+    step = max(1, _GATHER_MAX_BYTES // max(1, row_bytes))
+    blocks = [src.index_select(0, idx[i : i + step]) for i in range(0, idx.numel(), step)]
+    return torch.cat(blocks)
+
+
 def pack_tril(eri: torch.Tensor) -> torch.Tensor:
     """``(nbasis, nbasis, naux)`` μ↔ν-symmetric integrals → packed ``(npair, naux)``.
 
@@ -195,13 +227,19 @@ def pack_tril(eri: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"eri must be (nbasis, nbasis, naux); got shape {tuple(eri.shape)}")
     n = eri.shape[0]
     r = torch.tril_indices(n, n)
-    return eri.reshape(n * n, eri.shape[2]).index_select(0, (r[0] * n + r[1]).to(eri.device))
+    rows = (r[0] * n + r[1]).to(eri.device)
+    return _index_select_rows(eri.reshape(n * n, eri.shape[2]), rows, "pack_tril")
 
 
 def unpack_tril(eri_packed: torch.Tensor, nbasis: int) -> torch.Tensor:
     """Inverse of :func:`pack_tril`: packed ``(npair, naux)`` → full ``(nbasis, nbasis, naux)``.
 
-    One ``index_select`` on the packed tensor's device (exact).
+    One ``index_select`` on the packed tensor's device, split into row
+    blocks of at most 2 GiB of output on a device (#97: one gather with an
+    output over 4 GiB is silently wrong on the neuron device at LNC=1). Exact
+    for fp32 and narrower; a float64 / complex128 input on the neuron device
+    is gathered on the host under ``"auto"`` (device gathers round float64 to
+    fp32), see ``_index_select_rows``.
     """
     npair, naux = eri_packed.shape
     if npair != nbasis * (nbasis + 1) // 2:
@@ -211,7 +249,7 @@ def unpack_tril(eri_packed: torch.Tensor, nbasis: int) -> torch.Tensor:
     from .nki.dispatch import _tril_rows
 
     idx = _tril_rows(nbasis).reshape(-1).to(eri_packed.device)
-    return eri_packed.index_select(0, idx).reshape(nbasis, nbasis, naux)
+    return _index_select_rows(eri_packed, idx, "unpack_tril").reshape(nbasis, nbasis, naux)
 
 
 def _as_packed_rows(eri: torch.Tensor, nbasis: int) -> torch.Tensor:
@@ -227,6 +265,7 @@ def _as_packed_rows(eri: torch.Tensor, nbasis: int) -> torch.Tensor:
     )
 
 
+@_fp64_host_guard("ao_to_mo_transform")
 def ao_to_mo_transform(
     eri: torch.Tensor,
     C_occ: torch.Tensor,
@@ -265,7 +304,8 @@ def ao_to_mo_transform(
     ``ao_to_mo_trn2_packed_kernel``, which gathers its rows in place: the
     full square never exists in device memory, and only half the bytes
     cross the host link. The aten and legacy routes unpack it with one
-    ``index_select`` (exact).
+    ``index_select`` (exact for fp32; float64 operands on the neuron device
+    already run on the host under ``"auto"``).
 
     **Host inputs (#56).** Under native ``"auto"`` with ``eri``, ``C_occ``
     and ``C_vir`` all on the host, the inputs are uploaded (``eri`` in the
@@ -352,6 +392,11 @@ def ao_to_mo_transform(
             eri = eri.contiguous().to(C_occ.device)
 
     route = _ao_to_mo_route(eri, nocc, nvir, nbasis)
+    kops = None
+    if route != "aten":
+        kops = _dispatch._chem_kernel_operands("ao_to_mo_transform", eri, C_occ, C_vir)
+        if kops is None:  # integer / bool / complex: aten
+            route = "aten"
     if packed and route != "trn2":
         # aten / legacy consume the full square.
         return ao_to_mo_transform(unpack_tril(eri, nbasis), C_occ, C_vir)
@@ -368,7 +413,7 @@ def ao_to_mo_transform(
             )
         # The kernels compute in fp32; return the dtype the aten path gives.
         out_dtype = torch.promote_types(torch.promote_types(eri.dtype, C_occ.dtype), C_vir.dtype)
-        k_eri, k_co, k_cv = (_kernel_operand(t) for t in (eri, C_occ, C_vir))
+        k_eri, k_co, k_cv = kops
         try:
             if route == "trn2":
                 if packed:
@@ -437,6 +482,7 @@ def _ao_to_mo_contiguous_lhs(
 _DF_K_GATHER_BYTES = 1 << 30
 
 
+@_fp64_host_guard("df_exchange")
 def df_exchange(
     B: torch.Tensor,
     C_occ: torch.Tensor,
@@ -496,10 +542,14 @@ def df_exchange(
         raise ValueError(f"B must be packed 2D or full 3D; got shape {tuple(B.shape)}")
     if B.device != C_occ.device:
         C_occ = C_occ.to(B.device)
+    kops = None
     if B.dim() == 2 and _dispatch._df_exchange_route(B, nocc, nbasis) == "trn2":
+        # C_occ is cast to the kernel dtype, as the aten route casts it to B's.
+        kops = _dispatch._chem_kernel_operands("df_exchange", B, allowed=_dispatch._F32_DTYPES)
+    if kops is not None:
         try:
             # fp32 kernel; the aten path returns B's dtype.
-            kB = _kernel_operand(B)
+            (kB,) = kops
             K = _dispatch._nki_df_exchange(kB, C_occ.to(kB.dtype)).to(B.dtype)
             return K * alpha if alpha != 1.0 else K
         except Exception:
@@ -533,6 +583,7 @@ def _aten_df_exchange(B: torch.Tensor, C_occ: torch.Tensor, alpha: float) -> tor
     return torch.matmul(Xm, Xm.T) * alpha if alpha != 1.0 else torch.matmul(Xm, Xm.T)
 
 
+@_fp64_host_guard("df_coulomb")
 def df_coulomb(B: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
     """Density-fitted Coulomb matrix from packed three-centre integrals.
 
@@ -591,9 +642,13 @@ def df_coulomb(B: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
     else:
         raise ValueError(f"D must be (nbasis, nbasis) or packed (npair,); got {tuple(D.shape)}")
     jp = None
+    kops = None
     if _dispatch._df_coulomb_route(B) == "trn2":
+        kops = _dispatch._chem_kernel_operands("df_coulomb", B, allowed=_dispatch._F32_DTYPES)
+    if kops is not None:
         try:
-            jp = _dispatch._nki_df_coulomb(B, pw)
+            (kB,) = kops
+            jp = _dispatch._nki_df_coulomb(kB, pw.to(kB.dtype)).to(B.dtype)
         except Exception:
             import os
 

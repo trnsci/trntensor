@@ -279,3 +279,67 @@ class TestDfCoulomb:
             trntensor.df_coulomb(torch.zeros(10, 3), torch.zeros(11))
         with pytest.raises(ValueError):
             trntensor.df_coulomb(torch.zeros(4, 4, 3), torch.zeros(4, 4))
+
+
+class _GatherSizes(torch.overrides.TorchFunctionMode):
+    """Records the output bytes of every index_select."""
+
+    def __init__(self):
+        super().__init__()
+        self.out_bytes = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        if func in (torch.index_select, torch.Tensor.index_select):
+            self.out_bytes.append(out.numel() * out.element_size())
+        return out
+
+
+class TestDeviceGatherBlocks:
+    """On the neuron device at LNC=1, one index_select whose output passes
+    4 GiB returns wrong data (#97). Device gathers are split into blocks of at
+    most ``_GATHER_MAX_BYTES`` of output; the result is exact."""
+
+    @pytest.fixture
+    def small_limit(self, monkeypatch):
+        import trntensor.quantum as q
+
+        monkeypatch.setattr(q, "_gather_in_blocks", lambda t: True)  # CPU stands in
+        monkeypatch.setattr(q, "_GATHER_MAX_BYTES", 4096)
+        return 4096
+
+    @pytest.mark.parametrize("nbasis,naux", [(9, 7), (16, 33), (23, 1)])
+    def test_unpack_pack_blocked_exact(self, small_limit, nbasis, naux):
+        e = torch.randn(nbasis, nbasis, naux)
+        e = e + e.transpose(0, 1)
+        with _GatherSizes() as m:
+            pk = trntensor.pack_tril(e)
+            full = trntensor.unpack_tril(pk, nbasis)
+        assert torch.equal(full, e)
+        assert torch.equal(pk, torch.cat([e[mu, : mu + 1] for mu in range(nbasis)]))
+        # Every gather output is within the limit (or a single row past it).
+        row = naux * e.element_size()
+        assert m.out_bytes and max(m.out_bytes) <= max(small_limit, row)
+        if nbasis * nbasis * row > small_limit:
+            assert len(m.out_bytes) > 2  # actually split
+
+    def test_rows_wider_than_limit(self, small_limit):
+        from trntensor.quantum import _index_select_rows
+
+        src = torch.randn(5, 2048)  # one row = 8 KiB > limit
+        idx = torch.tensor([4, 0, 0, 3, 1])
+        assert torch.equal(_index_select_rows(src, idx), src.index_select(0, idx))
+
+    def test_cpu_is_one_gather(self, monkeypatch):
+        import trntensor.quantum as q
+
+        monkeypatch.setattr(q, "_GATHER_MAX_BYTES", 64)
+        e = torch.randn(8, 8, 5)
+        with _GatherSizes() as m:
+            trntensor.unpack_tril(trntensor.pack_tril(e), 8)
+        assert len(m.out_bytes) == 2  # host: one gather each, no split
+
+    def test_default_limit_below_4gib(self):
+        import trntensor.quantum as q
+
+        assert q._GATHER_MAX_BYTES < 2**32
