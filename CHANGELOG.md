@@ -91,7 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     "float64 on the neuron device is computed on the host for float64
     accuracy (device arithmetic is fp32); pass float32 to stay on device".
     **New: `TRNTENSOR_FP64_ON_DEVICE=1`** keeps device aten (fp32 precision,
-    no warning) for callers who prefer speed. Host-resident float64 is
+    no warning) for callers who prefer speed. **Under
+    `TRNTENSOR_REQUIRE_NKI=1`, float64 / complex128 on the `neuron` device
+    now raises `NotImplementedError` at every guarded entry point** (backends
+    `"auto"` and `"nki"`, no host copy, ahead of `TRNTENSOR_FP64_ON_DEVICE`);
+    before, only the kernel routes raised, and an `einsum` with no kernel
+    route (below the size thresholds, or not a matmul) or a decomposition
+    ran device aten at fp32 precision with no error. Host-resident float64 is
     unchanged, and `multi_einsum` no longer pins host float64 / complex128
     operands to the device under `"auto"`; through 0.23.0 shared operands
     were pinned, so device aten computed them at fp32 precision.

@@ -65,8 +65,16 @@ trnsci suite's float64 policy (#92):
     transfer, no warning), for callers who prefer speed to float64 accuracy.
   - Host-resident float64 is unchanged: it stays in host torch (and
     `multi_einsum` no longer pins host float64 operands to the device).
-  - Explicit `set_backend("nki")` / `"pytorch"` and `TRNTENSOR_REQUIRE_NKI=1`
-    are unaffected: their rows in the table above apply.
+  - Explicit `set_backend("nki")` / `"pytorch"` are unaffected: their rows
+    in the table above apply.
+  - `TRNTENSOR_REQUIRE_NKI=1` (backends `"auto"` and `"nki"`): a float64 /
+    complex128 computation on the `neuron` device raises
+    `NotImplementedError` at every guarded entry point (and in
+    `trntensor.stream` with a `neuron` device), with no host copy, ahead of
+    `TRNTENSOR_FP64_ON_DEVICE=1`. Before, only kernel routes raised; the
+    routes without a kernel (an `einsum` below the kernel size thresholds or
+    not a matmul, the decompositions, `precision="kahan"`) ran device aten
+    at fp32 precision, or the host, with no error.
   - `precision="kahan"` always contracts in fp64 on the host. `precision="dd"`
     still raises `NotImplementedError` with NKI installed (trnblas#22).
 

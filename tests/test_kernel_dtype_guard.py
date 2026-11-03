@@ -1016,3 +1016,101 @@ def test_device_fp64_blocked_tril_gather_concatenates_on_host(guarded, monkeypat
         trntensor.unpack_tril(trntensor.pack_tril(e.float()), 9)  # fp32: device cat
     assert torch.equal(full, e)
     assert sorted(_host_warnings(record)) == ([] if override else ["pack_tril", "unpack_tril"])
+
+
+# ── TRNTENSOR_REQUIRE_NKI=1 with float64 on the neuron device ────────────────
+# Every guarded entry point raises NotImplementedError, before any host copy,
+# kernel or device aten. Routes with no kernel (an einsum below the kernel
+# size thresholds or not a matmul, the decompositions) used to run device
+# aten at fp32 precision with no error.
+
+
+@pytest.mark.parametrize("backend", ["auto", "nki"])
+@pytest.mark.parametrize("dtype", [_F64, _C128], ids=str)
+@pytest.mark.parametrize("name,env,fn", _HOST_CALLS, ids=_HOST_IDS)
+def test_device_fp64_require_nki_raises_on_every_entry(
+    on_device, monkeypatch, name, env, fn, dtype, backend
+):
+    _with_env(monkeypatch, env)
+    _, ref_err = _reference(monkeypatch, lambda dt, g: _seeded_inner(fn, dt, g), dtype)
+    if ref_err is not None:
+        pytest.skip(f"the pytorch backend rejects these operands too: {ref_err!r}")
+    _require_nki(monkeypatch)
+    _set_backend(monkeypatch, backend)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        with pytest.raises(NotImplementedError, match="TRNTENSOR_REQUIRE_NKI") as err:
+            fn(dtype, torch.Generator().manual_seed(0))
+    assert str(err.value).startswith("trntensor ")
+    assert on_device.to_host == [] and on_device.to_device == []
+    assert on_device.rec.calls == [] and on_device.aten_on_device == 0
+    assert _host_warnings(record) == [] and _fp64_warnings(record) == []
+
+
+_NO_KERNEL_EINSUMS = [
+    ("matmul below the size thresholds", "ij,jk->ik", [(6, 5), (5, 4)]),
+    ("elementwise", "ij,ij->ij", [(6, 5), (6, 5)]),
+    ("trace", "ii->", [(5, 5)]),
+    ("outer", "i,j->ij", [(6,), (4,)]),
+]
+
+
+@pytest.mark.parametrize("override", [False, True], ids=["", "FP64_ON_DEVICE"])
+@pytest.mark.parametrize(
+    "case,sub,shapes", _NO_KERNEL_EINSUMS, ids=[c[0] for c in _NO_KERNEL_EINSUMS]
+)
+def test_device_fp64_require_nki_einsum_without_a_kernel(
+    on_device, monkeypatch, case, sub, shapes, override
+):
+    """The device-run finding: einsum routes with no NKI kernel (here the real
+    size thresholds) computed device-resident float64 in device aten. They
+    raise, also with TRNTENSOR_FP64_ON_DEVICE=1; float32 still runs."""
+    for name in ("_MIN_NKI_FLOPS", "_MIN_NKI_FLOPS_NATIVE"):
+        monkeypatch.setattr(dispatch, name, 1 << 40)
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", override)
+    _require_nki(monkeypatch)
+    _set_backend(monkeypatch, "auto")
+    g = torch.Generator().manual_seed(1)
+    ops = [torch.randn(s, generator=g, dtype=_F64) for s in shapes]
+    with pytest.raises(NotImplementedError, match="trntensor einsum: .*float64"):
+        trntensor.einsum(sub, *ops)
+    assert on_device.to_host == []
+    out = trntensor.einsum(sub, *(o.float() for o in ops))
+    assert out.dtype == torch.float32
+
+
+def test_device_explicit_float64_dtype_require_nki_raises(on_device, monkeypatch):
+    """einsum(dtype=float64) on float32 device operands is a float64 device
+    computation too."""
+    _require_nki(monkeypatch)
+    _set_backend(monkeypatch, "auto")
+    a, b = torch.randn(6, 5), torch.randn(5, 4)
+    with pytest.raises(NotImplementedError, match="TRNTENSOR_REQUIRE_NKI"):
+        trntensor.einsum("ij,jk->ik", a, b, dtype=torch.float64)
+
+
+def test_require_nki_host_fp64_and_pytorch_backend_unchanged(guarded, monkeypatch):
+    """Host float64 on a route with no kernel keeps host torch under
+    REQUIRE_NKI; the pytorch backend ignores the variable."""
+    for name in ("_MIN_NKI_FLOPS", "_MIN_NKI_FLOPS_NATIVE"):
+        monkeypatch.setattr(dispatch, name, 1 << 40)
+    monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "neuron")  # CPU is the host
+    _require_nki(monkeypatch)
+    a, b = torch.randn(6, 5, dtype=_F64), torch.randn(6, 5, dtype=_F64)
+    _set_backend(monkeypatch, "auto")
+    torch.testing.assert_close(trntensor.einsum("ij,ij->ij", a, b), a * b)
+    monkeypatch.setattr(dispatch, "_on_neuron_device", lambda t: True)
+    _set_backend(monkeypatch, "pytorch")
+    torch.testing.assert_close(trntensor.einsum("ij,ij->ij", a, b), a * b)
+
+
+def test_stream_fp64_bound_for_the_device_require_nki_raises(meta_is_neuron, monkeypatch):
+    stream, nbasis, Bp, pw, B, eo, ev = _stream_case(_F64)
+    _require_nki(monkeypatch)
+    with pytest.raises(NotImplementedError, match="trntensor AuxStream: .*REQUIRE_NKI"):
+        stream.AuxStream([Bp], nbasis, devices=["meta"], dtype=_F64)
+    with pytest.raises(NotImplementedError, match="trntensor mp2_energy_blocked: "):
+        stream.mp2_energy_blocked(B, eo, ev, devices=["meta"])
+    assert stream.AuxStream([Bp.float()], nbasis, devices=["meta"]).devices == [
+        torch.device("meta")
+    ]

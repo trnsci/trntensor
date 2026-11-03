@@ -812,9 +812,14 @@ def _fp64_to_kernel(what: str, *tensors: torch.Tensor) -> bool:
 # there (host float64 already stays in host torch), and the results go back to
 # the operands' device in their float64 / complex128 dtype. One UserWarning per
 # op per process. ``TRNTENSOR_FP64_ON_DEVICE=1`` keeps device aten (fp32
-# precision) for callers who prefer speed. ``TRNTENSOR_REQUIRE_NKI=1`` is not
-# affected: float64 on a kernel route still raises. Explicit ``"nki"`` and
-# ``"pytorch"`` backends are not affected.
+# precision) for callers who prefer speed. Explicit ``"nki"`` and
+# ``"pytorch"`` backends are not affected. ``TRNTENSOR_REQUIRE_NKI=1`` (NKI
+# backends) raises NotImplementedError for float64 / complex128 on the neuron
+# device at every guarded entry point, with no host copy and ahead of
+# ``TRNTENSOR_FP64_ON_DEVICE`` (`_refuse_device_fp64`): float64 on a kernel
+# route raised already, and the routes without a kernel (small or non-matmul
+# ``einsum`` contractions, the decompositions, ...) ran device aten at fp32
+# precision with no error.
 _FP64_HOST_DTYPES = (torch.float64, torch.complex128)
 _fp64_host_warned: set[str] = set()
 _fp64_host_state = threading.local()  # .active: inside a guarded host call
@@ -901,10 +906,10 @@ def _fp64_device_operands(args, kwargs) -> list[torch.Tensor]:
     ]
 
 
-def _fp64_host_wanted(args, kwargs) -> list[torch.Tensor]:
+def _fp64_device_compute(args, kwargs) -> list[torch.Tensor]:
+    """The neuron-resident tensors of a call that would compute in float64 /
+    complex128 on the device (any backend; empty inside a guarded host call)."""
     if getattr(_fp64_host_state, "active", False):
-        return []
-    if not _auto_backend() or _require_nki_now() or _fp64_on_device_now():
         return []
     dt = kwargs.get("dtype")
     if dt is not None:
@@ -914,6 +919,34 @@ def _fp64_host_wanted(args, kwargs) -> list[torch.Tensor]:
         # operands are fp32 / bf16: the device would compute it at fp32 precision.
         return [t for t in _tensors_in((args, kwargs)) if _on_neuron_device(t)]
     return _fp64_device_operands(args, kwargs)
+
+
+def _fp64_host_wanted(args, kwargs) -> list[torch.Tensor]:
+    if not _auto_backend() or _require_nki_now() or _fp64_on_device_now():
+        return []
+    return _fp64_device_compute(args, kwargs)
+
+
+def _refuse_fp64_on_device(what: str, dtypes) -> None:
+    raise NotImplementedError(
+        f"trntensor {what}: no NKI kernel computes {', '.join(sorted(set(dtypes)))} on the "
+        "neuron device at float64 accuracy (device arithmetic is fp32). Unset "
+        "TRNTENSOR_REQUIRE_NKI to compute on the host at float64 accuracy, or pass float32."
+    )
+
+
+def _refuse_device_fp64(what: str, args, kwargs) -> None:
+    """Under ``TRNTENSOR_REQUIRE_NKI=1`` (NKI backends), NotImplementedError for
+    a float64 / complex128 computation on the neuron device (see above)."""
+    if not _require_nki_now() or not _use_nki():
+        return
+    found = _fp64_device_compute(args, kwargs)
+    if found:
+        dt = kwargs.get("dtype")
+        dts = [str(_resolve_compute_dtype(dt))] if dt is not None else []
+        _refuse_fp64_on_device(
+            what, dts + [str(t.dtype) for t in found if t.dtype in _FP64_HOST_DTYPES]
+        )
 
 
 def _device_is_neuron(device) -> bool:
@@ -926,12 +959,15 @@ def _fp64_host_devices(what: str, dtype: torch.dtype, devices) -> list | None:
     ``devices`` itself (``trntensor.stream``) must run on the host instead:
     float64 / complex128, a ``neuron`` device among ``devices``, and the host
     path applies (``"auto"``, no REQUIRE_NKI / FP64_ON_DEVICE, not nested).
-    Warns once per op, as :func:`_fp64_host_guard`. Otherwise None."""
+    Warns once per op, as :func:`_fp64_host_guard`. Otherwise None; under
+    ``TRNTENSOR_REQUIRE_NKI=1`` NotImplementedError, as the guard."""
     if dtype not in _FP64_HOST_DTYPES or not any(_device_is_neuron(d) for d in devices):
         return None
     if getattr(_fp64_host_state, "active", False):
         return None
-    if not _auto_backend() or _require_nki_now() or _fp64_on_device_now():
+    if _require_nki_now() and _use_nki():
+        _refuse_fp64_on_device(what, [str(dtype)])
+    if not _auto_backend() or _fp64_on_device_now():
         return None
     if what not in _fp64_host_warned:
         _fp64_host_warned.add(what)
@@ -963,6 +999,7 @@ def _fp64_host_guard(what: str, results_on_host: bool = False):
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            _refuse_device_fp64(what, args, kwargs)
             found = _fp64_host_wanted(args, kwargs)
             if not found:
                 return fn(*args, **kwargs)
