@@ -37,12 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`unpack_tril` / `pack_tril` on the neuron device at LNC=1 returned
-  wrong data once the gathered output passed 4 GiB (#97).** Affected
+  wrong data once the gathered output reached 4 GiB (#97).** Affected
   0.20.0–0.23.0: `unpack_tril`, `pack_tril`, and the packed-`eri` aten /
-  legacy routes of `ao_to_mo_transform`, which unpack with `unpack_tril`: one
-  device `index_select` along dim 0 whose output passes 2^32 bytes is
-  silently wrong at LNC=1 (THRESHOLD_PLACEHOLDER), and occasionally NaN; it is exact at LNC=2
-  and on the host. Device gathers are now split into row blocks of at most
+  legacy routes of `ao_to_mo_transform`, which unpack with `unpack_tril`: on
+  the neuron device at LNC=1, one `index_select` along dim 0 whose output
+  reaches 2^32 bytes can be silently wrong (about half the elements, at
+  times NaN) or hit the runtime's 30 s execution timeout. Measured on Trn2:
+  exact at 2^32 − 16 KiB, wrong at exactly 2^32, and 154 M mismatched
+  elements for `unpack_tril` at nbasis 736 / naux 2304 (4.99e9 bytes). It
+  is exact at LNC=2 and on the host. Device gathers are now split into row blocks of at most
   2 GiB of output and concatenated in order (exact). Host gathers are one
   `index_select` as before.
 
