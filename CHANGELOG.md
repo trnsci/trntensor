@@ -66,6 +66,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is exact at LNC=2 and on the host. Device gathers are now split into row blocks of at most
   2 GiB of output and concatenated in order (exact). Host gathers are one
   `index_select` as before.
+- **Complex `tucker_decompose` on the neuron device used `U^T`, not `U^H`
+  (#89).** Affected 0.23.0 (the release that switched the core to
+  `factors[mode].mH`, #73): `.mH` of a complex tensor is a lazy conj view,
+  and device matmul ignores the conj bit (aws-neuron/aws-neuron-sdk#1455),
+  so the core of a device-resident complex tensor was silently computed
+  with the unconjugated factors. CPU results were correct. The conjugate
+  transpose is now materialized with `resolve_conj()` before the mode
+  product, as trnsolver's `factor._mH` does; real input is unchanged (no
+  copy). The complex `cp_decompose` added in this release (#103) had the
+  same pattern (`V.mH @ V`, `T_mode @ V.conj()`) and is fixed the same way.
+  A CPU `TorchFunctionMode` test fails if any lazy conj view reaches a
+  matmul, einsum, solve or pinv in either decomposition.
 
 - **`cp_decompose` works in the input dtype, including float64 and complex
   (#103).** Affected 0.1.1–0.23.0: the random init and the Khatri-Rao buffer
