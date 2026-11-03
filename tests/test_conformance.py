@@ -729,7 +729,9 @@ def test_grad_matches_torch_einsum(sub, shapes):
     b = [o.clone().requires_grad_(True) for o in ops]
     out = tt.einsum(sub, *a, alpha=-1.5)
     w = torch.randn(out.shape, generator=gen, dtype=torch.float64)
-    (out * d(w)).sum().backward()
+    # Weight on the host: on the neuron device this float64 multiply and sum would
+    # run in device aten at fp32 precision, outside the op under test.
+    (out.to("cpu") * w).sum().backward()
     (-1.5 * torch.einsum(sub, *b) * w).sum().backward()
     for x, y in zip(a, b, strict=True):
         assert_ref(x.grad, y.grad, tol=1e-9 if _fp64_exact() else 2e-6)

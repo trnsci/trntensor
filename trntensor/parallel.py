@@ -53,6 +53,8 @@ from collections.abc import Callable
 
 import torch
 
+from .nki.dispatch import _fp64_host_guard
+
 
 class ShardedTensor:
     """A tensor logically split across ``n_shards`` along ``partition_dim``.
@@ -155,6 +157,7 @@ def scatter(tensor: torch.Tensor, dim: int, n_shards: int) -> ShardedTensor:
     return ShardedTensor(chunks, partition_dim=dim)
 
 
+@_fp64_host_guard("gather")
 def gather(st: ShardedTensor) -> torch.Tensor:
     """Reconstruct a dense tensor by concatenating shards along ``partition_dim``.
 
@@ -163,6 +166,9 @@ def gather(st: ShardedTensor) -> torch.Tensor:
 
     Returns:
         Dense tensor of full logical shape.
+
+    Under ``"auto"``, float64 / complex128 chunks on the ``neuron`` device are
+    concatenated on the host: device ``torch.cat`` rounds float64 to fp32.
     """
     return torch.cat(st.chunks, dim=st.partition_dim)
 

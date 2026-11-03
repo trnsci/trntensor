@@ -865,6 +865,33 @@ def test_device_fp64_explicit_float32_dtype_stays_on_device(on_device):
     assert out.dtype == F32 and on_device.to_host == []
 
 
+@pytest.mark.parametrize("dt", [torch.float64, "f64", "float64"])
+def test_device_explicit_float64_dtype_goes_to_host(on_device, dt):
+    """``einsum(dtype=float64)`` on float32 device operands asks for float64
+    compute, which the device would do at fp32 precision: host path."""
+    g = torch.Generator().manual_seed(1)
+    a, b = torch.randn(6, 5, generator=g), torch.randn(5, 4, generator=g)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        out = trntensor.einsum("ij,jk->ik", a, b, dtype=dt)
+    assert on_device.to_host == [F32, F32] and _host_warnings(record) == ["einsum"]
+    assert out.dtype == _F64
+    torch.testing.assert_close(out, a.double() @ b.double(), rtol=1e-12, atol=1e-12)
+
+
+def test_device_fp64_gather_concatenates_on_host(on_device):
+    """``gather`` of float64 device chunks: device ``torch.cat`` rounds float64
+    to fp32, so the chunks are concatenated on the host."""
+    g = torch.Generator().manual_seed(2)
+    z = torch.randn(7, 5, generator=g, dtype=_F64)
+    st = trntensor.scatter(z, 0, 3)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        out = trntensor.gather(st)
+    assert on_device.to_host == [_F64] * 3 and _host_warnings(record) == ["gather"]
+    assert torch.equal(out, z)
+
+
 def test_device_fp64_mixed_operands_go_to_host(on_device):
     """One float64 operand on the device is enough: the float32 operand goes
     with it, and the result is the pytorch backend's float64."""

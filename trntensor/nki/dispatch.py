@@ -906,9 +906,25 @@ def _fp64_host_wanted(args, kwargs) -> list[torch.Tensor]:
     if not _auto_backend() or _require_nki_now() or _fp64_on_device_now():
         return []
     dt = kwargs.get("dtype")
-    if dt is not None and dt not in _FP64_HOST_DTYPES and dt not in ("float64", "complex128"):
-        return []  # an explicit compute dtype (einsum's dtype=) decides instead
+    if dt is not None:
+        if _resolve_compute_dtype(dt) not in _FP64_HOST_DTYPES:
+            return []  # an explicit compute dtype (einsum's dtype=) decides instead
+        # einsum(dtype=float64) asks for a float64 computation even when the device
+        # operands are fp32 / bf16: the device would compute it at fp32 precision.
+        return [t for t in _tensors_in((args, kwargs)) if _on_neuron_device(t)]
     return _fp64_device_operands(args, kwargs)
+
+
+def _resolve_compute_dtype(dt):
+    """einsum's ``dtype=`` (a torch dtype or a name such as "f64") as a torch dtype."""
+    if isinstance(dt, torch.dtype):
+        return dt
+    from ..einsum import _resolve_dtype
+
+    try:
+        return _resolve_dtype(dt)
+    except (TypeError, ValueError, KeyError):
+        return None
 
 
 def _fp64_host_guard(what: str, results_on_host: bool = False):

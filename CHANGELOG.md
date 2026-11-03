@@ -39,7 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `neuron` device are now copied to the host, computed in host torch at
     float64 accuracy, and the result is returned on the original device in
     float64 / complex128. This covers `einsum`, `multi_einsum` (which returns
-    host tensors, as before), the chemistry calls and the CP / Tucker / TT
+    host tensors, as before), `gather` (device `torch.cat` rounds float64 to
+    fp32), `einsum(dtype=float64)` on fp32 / bf16 device operands, the
+    chemistry calls and the CP / Tucker / TT
     decompositions and reconstructions. One `UserWarning` per op per process:
     "float64 on the neuron device is computed on the host for float64
     accuracy (device arithmetic is fp32); pass float32 to stay on device".
