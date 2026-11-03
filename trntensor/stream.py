@@ -243,10 +243,14 @@ class AuxStream:
         src = self._sources[i]
         if callable(src) and not isinstance(src, torch.Tensor):
             src = src()
-        if _is_memmap(src):
-            # One sequential read into RAM. Left mapped, the kernels' row
-            # gathers (df_exchange's tril rows) fault pages in at random, which
-            # on a disk-backed store ran > 10x slower than the read itself.
+        if _is_memmap(src) and self.owner[i].type == "cpu":
+            # Host compute: one sequential read into RAM. Left mapped, the
+            # kernels' row gathers (df_exchange's tril rows) fault pages in at
+            # random, which on a disk-backed store ran > 10x slower than the
+            # read itself. A device upload reads the mapping sequentially and
+            # needs no copy. On Trn2 an extra copy capped a page-cached 1.6 GB
+            # chunk at 2.9 GB/s (one host-memcpy pass on 2 pinned CPUs),
+            # against 12-14 GB/s straight from the mapping (trnsci/trnsci#115).
             import numpy as np
 
             src = np.array(src, copy=True)
