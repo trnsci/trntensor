@@ -120,6 +120,32 @@ def test_stream_from_disk_memmaps(tmp_path):
     torch.testing.assert_close(Kc, K, rtol=1e-5, atol=1e-3)
 
 
+def test_memmap_chunk_copied_for_host_not_for_device(tmp_path, monkeypatch):
+    """A memory-mapped chunk is read into RAM for host compute (random row
+    gathers), but goes to a device straight from the mapping (no extra copy)."""
+    import trntensor.stream as ts
+
+    path = tmp_path / "B_00000.npy"
+    np.save(path, np.arange(2 * 128 * 3, dtype=np.float32).reshape(3, 256))  # nbasis 2: 3 rows
+    copies = []
+    real_array = np.array
+
+    def spy(a, *args, **kw):
+        if isinstance(a, np.memmap):
+            copies.append(1)
+        return real_array(a, *args, **kw)
+
+    monkeypatch.setattr(np, "array", spy)
+    host = ts.AuxStream([lambda: np.load(path, mmap_mode="c")], 2, resident_bytes=0.0)
+    copies.clear()
+    host._load(0)
+    assert copies == [1]
+    dev = ts.AuxStream([lambda: np.load(path, mmap_mode="c")], 2, devices=["meta"])
+    copies.clear()
+    t = dev._load(0)
+    assert copies == [] and t.device.type == "meta" and tuple(t.shape) == (3, 256)
+
+
 def test_stream_dtype_cast():
     B3, Bp, C, _ = _system()
     D, J, K = _dense_jk(B3, C)
