@@ -188,6 +188,89 @@ class TestNativeDispatch:
         )
 
 
+class TestEagerHandle:
+    """Eager calls take the cached handle; results match the custom op bit for bit."""
+
+    @pytest.fixture
+    def D(self, monkeypatch):
+        from trntensor.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        return dispatch
+
+    @pytest.mark.parametrize("use_sr", [False, True])
+    def test_matmul_handle_matches_op_and_is_cached(self, D, use_sr):
+        from trntensor.nki import _kernels
+
+        torch.manual_seed(0)
+        a, b = _dev(torch.randn(256, 128), torch.randn(128, 512))
+        op = _ops()["matmul"](a, b, use_sr=use_sr).cpu()
+        for _ in range(3):
+            out = D._native_call("matmul", [a, b], {"use_sr": use_sr})
+            assert out.device.type == "neuron"
+            assert torch.equal(out.cpu(), op)
+        assert list(D._eager_handles) == [id(_kernels.matmul_kernel)]
+
+    def _flag_on_off(self, D, monkeypatch, fn):
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        ref = fn().cpu()
+        assert D._eager_handles == {}
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", True)
+        out = fn().cpu()
+        return out, ref
+
+    def test_df_exchange_consts_pass_through(self, D, monkeypatch):
+        """`df_half_packed` takes nub/tp/tail and `df_exchange_syrk` banks by keyword."""
+        import trntensor
+        from trntensor.nki import _kernels
+
+        monkeypatch.setenv("TRNTENSOR_DF_K_TP", "256")
+        g = torch.Generator().manual_seed(7)
+        eri = torch.randn(300, 300, 600, generator=g, dtype=torch.float64) * 0.1
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C = torch.randn(300, 33, generator=g, dtype=torch.float64) / 300**0.5
+        pk, c = trntensor.pack_tril(eri).float().to("neuron"), C.float().to("neuron")
+        out, ref = self._flag_on_off(D, monkeypatch, lambda: D._nki_df_exchange(pk, c))
+        assert torch.equal(out, ref)
+        assert {id(_kernels.df_half_packed_kernel), id(_kernels.df_exchange_syrk_kernel)} <= set(
+            D._eager_handles
+        )
+
+    def test_mp2_rows_direct_op_site_uses_handle(self, D, monkeypatch):
+        from trntensor.nki import _kernels
+        from trntensor.quantum import _cpu_mp2_energy
+
+        g = torch.Generator().manual_seed(5)
+        B = torch.randn(5, 128, 256, generator=g) * 0.05
+        eo = -torch.rand(5, generator=g) - 1.0
+        ev = torch.rand(128, generator=g) + 0.5
+        args = _dev(B, eo, ev)
+        out, ref = self._flag_on_off(D, monkeypatch, lambda: D._nki_mp2_energy_rows(*args))
+        assert torch.equal(out, ref)
+        assert id(_kernels.mp2_energy_row_kernel) in D._eager_handles
+        e = float(_cpu_mp2_energy(B.double(), eo.double(), ev.double()))
+        assert abs(float(out) - e) <= 1e-5 * abs(e)
+
+    def test_flag_off_uses_op(self, D, monkeypatch):
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        torch.manual_seed(1)
+        a, b = torch.randn(128, 128), torch.randn(128, 256)
+        out = D._native_call("matmul", _dev(a, b)).cpu()
+        assert D._eager_handles == {}
+        torch.testing.assert_close(out, a @ b, atol=ATOL, rtol=RTOL)
+
+    def test_native_call_inside_compile_uses_op(self, D):
+        @torch.compile(backend="neuron", fullgraph=True)
+        def f(a, b):
+            return D._native_call("matmul", [a, b], {"use_sr": False}) * 2.0
+
+        torch.manual_seed(2)
+        a, b = torch.randn(128, 128), torch.randn(128, 256)
+        out = f(*_dev(a, b)).cpu()
+        assert D._eager_handles == {}
+        torch.testing.assert_close(out, (a @ b) * 2.0, atol=2 * ATOL, rtol=RTOL)
+
+
 class TestNativeTrn2Kernels:
     """#51: the Trn2 AO→MO and MP2 row kernels on hardware (LNC=1 and LNC=2)."""
 
@@ -331,6 +414,8 @@ class TestNativeTrn2Kernels:
         fn = ops["ao_to_mo_trn2_packed"]
         ops["ao_to_mo_trn2_packed"] = lambda *a, **k: calls.append(1) or fn(*a, **k)
         monkeypatch.setattr(dispatch, "_native_ops", ops)
+        # The spies count custom-op calls: keep launches off the eager handle.
+        monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
         prev = trntensor.get_backend()
         trntensor.set_backend("auto")
         try:
@@ -369,6 +454,8 @@ class TestNativeTrn2Kernels:
             fn = ops[name]
             ops[name] = lambda *a, _fn=fn, _n=name, **k: calls.append(_n) or _fn(*a, **k)
         monkeypatch.setattr(dispatch, "_native_ops", ops)
+        # The spies count custom-op calls: keep launches off the eager handle.
+        monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
         prev = trntensor.get_backend()
         trntensor.set_backend("auto")
         try:

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trntensor::`
+  custom-op call cost about 0.1 ms of host time before the kernel was queued,
+  against 0.016 ms for aten. Most of it went to nki's `Kernel.__call__`,
+  which rebuilds the torch handle on every call, plus the `torch.library`
+  layer. `dispatch._launch` and the `mp2_energy_row` loop now call a
+  `torch_neuronx.wrap_nki` handle built once per kernel; compile-time keyword
+  arguments (`use_sr`, `nub`, `tp`, `tail`, `banks`) pass through unchanged.
+  On trn2 (LNC=2), a 256x128x512 `matmul` launch drops from 0.143 to
+  0.036 ms of issue time (e2e 0.222 to 0.128 ms), `_nki_mp2_energy_rows` with
+  nocc=8 from 2.94 to 2.34 ms, and the `df_exchange` kernel pair's issue time
+  from 0.78 to 0.36 ms. Results are bit-identical. `torch.compile`,
+  requires-grad, int64 and tensor-subclass inputs keep the custom op.
+  `TRNTENSOR_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
+
 ### Added
 
 - **`trntensor.stream`: DF integrals streamed over the aux index**
@@ -36,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`unpack_tril` / `pack_tril` on the neuron device at LNC=1 returned
+  wrong data once the gathered output reached 4 GiB (#97).** Affected
+  0.20.0–0.23.0: `unpack_tril`, `pack_tril`, and the packed-`eri` aten /
+  legacy routes of `ao_to_mo_transform`, which unpack with `unpack_tril`: on
+  the neuron device at LNC=1, one `index_select` along dim 0 whose output
+  reaches 2^32 bytes can be silently wrong (about half the elements, at
+  times NaN) or hit the runtime's 30 s execution timeout. Measured on Trn2:
+  exact at 2^32 − 16 KiB, wrong at exactly 2^32, and 154 M mismatched
+  elements for `unpack_tril` at nbasis 736 / naux 2304 (4.99e9 bytes). It
+  is exact at LNC=2 and on the host. Device gathers are now split into row blocks of at most
+  2 GiB of output and concatenated in order (exact). Host gathers are one
+  `index_select` as before.
 - **Complex `tucker_decompose` on the neuron device used `U^T`, not `U^H`
   (#89).** Affected 0.23.0 (the release that switched the core to
   `factors[mode].mH`, #73): `.mH` of a complex tensor is a lazy conj view,
@@ -59,6 +89,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses the conjugated normal equations `(V^H V) A^T = (T_(k) conj(V))^T`.
   Weights are real (`tensor.real.dtype`). `nonneg=True` with complex input
   raises `ValueError`. Real float32 results are bit-identical.
+- **`cp_reconstruct` returns the factors' dtype on the factors' device
+  (#78).** Affected 0.1.1–0.23.0: it accumulated into a float32 host buffer
+  (`torch.zeros(shape)`), so bf16 or fp16 factors came back as float32 and
+  device factors raised a device mismatch. The buffer now has the promoted
+  dtype of `factors` and `weights` and the factors' device. float32 and
+  float64 results are unchanged.
+- **`plan_contraction` fills `ContractionPlan.estimated_flops` (#83).**
+  Affected 0.1.1–0.23.0: the documented multiply-add estimate was never set
+  and always read 0. `matmul`, `bmm` and `torch` plans now carry
+  `estimate_flops(subscripts, *operands)` (the product of all index sizes);
+  `path` plans carry the multiply-adds of the planned binary steps, which is
+  what runs and is less than the dense all-index product. Plans are cached by
+  shape, so the field is exact for the cached shapes.
 
 - **`einsum(..., out=)` now writes the result into `out` and returns it
   (#77).** Affected 0.3.0–0.23.0: `out` was only read as the `beta` addend
