@@ -94,6 +94,7 @@ def split_aux(B, max_bytes: int = DEFAULT_CHUNK_BYTES, multiple: int = 128, dtyp
     return [t[:, q0 : q0 + width].to(dtype).contiguous() for q0 in range(0, naux, width)]
 
 
+@_dispatch._fp64_host_guard("pack_density")
 def pack_density(D: torch.Tensor) -> torch.Tensor:
     """Weighted packed density ``w · D[μ, ν]`` (``ν ≤ μ``; ``w`` = 1 on the
     diagonal, 2 off it), the ``(npair,)`` vector :func:`df_coulomb` and
@@ -109,6 +110,7 @@ def pack_density(D: torch.Tensor) -> torch.Tensor:
     return D.reshape(-1).index_select(0, r[0] * n + r[1]) * w
 
 
+@_dispatch._fp64_host_guard("unpack_packed")
 def unpack_packed(jp: torch.Tensor, nbasis: int) -> torch.Tensor:
     """Symmetric ``(nbasis, nbasis)`` from a packed ``(npair,)`` vector (on
     its device; pass a host vector for large nbasis, see :func:`pack_density`)."""

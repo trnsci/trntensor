@@ -107,9 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `trntensor.stream.AuxStream(..., dtype=float64)` and
     `mp2_energy_blocked` with a `neuron` device in `devices` keep the chunks
     and the arithmetic on the host (results still default to the first
-    device given), and `pack_tril` / `unpack_tril` join the blocks of a split
-    device gather (#97) on the host for float64 / complex128, because device
-    `torch.cat` rounds float64 to fp32.
+    device given), and `pack_tril` / `unpack_tril` / `pack_density` /
+    `unpack_packed` gather float64 / complex128 on the host, because on the
+    neuron device both the gather (`index_select`, fancy indexing) and
+    `torch.cat` round float64 to fp32 (measured on Trn2, rel err ~4e-8).
 
   Affected versions: the old behaviour is 0.23.0 for the chemistry kernels
   (the silent fp32 cast) and 0.23.0 and earlier for the matmul kernels

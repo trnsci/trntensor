@@ -53,8 +53,10 @@ trnsci suite's float64 policy (#92):
   device in float64 / complex128. This covers every public compute entry
   point: `einsum`, `multi_einsum`, `mp2_energy`, `ao_to_mo_transform`,
   `df_exchange`, `df_coulomb`, the CP / Tucker / TT decompositions and
-  reconstructions, and `gather` (device `torch.cat` also rounds float64 to
-  fp32). `einsum(dtype=float64)` (or `"f64"`) on fp32 / bf16 device operands
+  reconstructions, `gather` (device `torch.cat` also rounds float64 to
+  fp32), and the gathers `pack_tril` / `unpack_tril` / `pack_density` /
+  `unpack_packed` (device `index_select` and fancy indexing round float64 to
+  fp32 too; plain copies such as `.to`, `clone` and `.contiguous` are exact). `einsum(dtype=float64)` (or `"f64"`) on fp32 / bf16 device operands
   asks for a float64 computation and takes the same host path. One `UserWarning` per op per process says: "float64 on the
   neuron device is computed on the host for float64 accuracy (device
   arithmetic is fp32); pass float32 to stay on device". `multi_einsum`

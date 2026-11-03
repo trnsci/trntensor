@@ -1018,6 +1018,61 @@ def test_device_fp64_blocked_tril_gather_concatenates_on_host(guarded, monkeypat
     assert sorted(_host_warnings(record)) == ([] if override else ["pack_tril", "unpack_tril"])
 
 
+@pytest.mark.parametrize("mode", ["auto", "override", "require"])
+def test_device_fp64_tril_gather_runs_on_host(guarded, monkeypatch, mode):
+    """Device gathers (``index_select``) round float64 to fp32 on the neuron
+    device, not only ``torch.cat``: under "auto" a float64 `pack_tril` /
+    `unpack_tril` of any size gathers on the host (one warning per op, the
+    device ``index_select`` is never called); TRNTENSOR_FP64_ON_DEVICE=1 keeps
+    the device gather; REQUIRE_NKI raises."""
+    monkeypatch.setattr(dispatch, "_device_is_neuron", lambda d: True)
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", mode == "override")
+    if mode == "require":
+        _require_nki(monkeypatch)
+    _set_backend(monkeypatch, "auto")
+    e = torch.randn(7, 7, 3, dtype=_F64)
+    e = e + e.transpose(0, 1)
+    if mode == "require":
+        with pytest.raises(NotImplementedError, match="TRNTENSOR_REQUIRE_NKI"):
+            trntensor.pack_tril(e)
+        return
+    host_selects = []
+    real_cpu = torch.Tensor.cpu
+
+    def cpu(t, *a, **k):
+        host_selects.append(t.dtype)
+        return real_cpu(t, *a, **k)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", cpu)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            full = trntensor.unpack_tril(trntensor.pack_tril(e), 7)
+    assert torch.equal(full, e)
+    if mode == "override":
+        assert host_selects == [] and _host_warnings(record) == []
+    else:
+        assert _F64 in host_selects
+        assert sorted(_host_warnings(record)) == ["pack_tril", "unpack_tril"]
+
+
+def test_device_fp64_pack_density_and_unpack_packed_on_host(on_device):
+    """`pack_density` / `unpack_packed` gather with ``index_select`` on their
+    operand's device: float64 on the neuron device takes the host path."""
+    g = torch.Generator().manual_seed(3)
+    D = torch.randn(6, 6, generator=g, dtype=_F64)
+    D = D + D.T
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        jp = trntensor.pack_density(D)
+        back = trntensor.unpack_packed(jp, 6)
+    assert on_device.to_host and sorted(_host_warnings(record)) == ["pack_density", "unpack_packed"]
+    r = torch.tril_indices(6, 6)
+    w = torch.where(r[0] == r[1], 1.0, 2.0).to(_F64)
+    assert torch.equal(jp, D[r[0], r[1]] * w)
+    assert back.shape == (6, 6) and back.dtype == _F64
+
+
 # ── TRNTENSOR_REQUIRE_NKI=1 with float64 on the neuron device ────────────────
 # Every guarded entry point raises NotImplementedError, before any host copy,
 # kernel or device aten. Routes with no kernel (an einsum below the kernel

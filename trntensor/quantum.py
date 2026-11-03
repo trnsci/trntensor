@@ -188,21 +188,23 @@ def _index_select_rows(
     src: torch.Tensor, idx: torch.Tensor, what: str = "unpack_tril"
 ) -> torch.Tensor:
     """``src.index_select(0, idx)``, in blocks of at most ``_GATHER_MAX_BYTES``
-    of output on a device (#97). Exact: the blocks are concatenated in order.
+    of output on a device (#97), concatenated in order.
 
-    Device ``torch.cat`` rounds float64 to fp32 (see ``parallel.gather``), so
-    under ``"auto"`` float64 / complex128 blocks are concatenated on the host
-    and the result goes back to ``src``'s device (one warning per op), unless
-    ``TRNTENSOR_FP64_ON_DEVICE=1``."""
+    On the neuron device both the gather (``index_select`` / fancy indexing)
+    and ``torch.cat`` round float64 to fp32 (measured on Trn2: rel err ~4e-8;
+    fp32 and narrower dtypes are exact). So under ``"auto"`` a float64 /
+    complex128 ``src`` on the neuron device is gathered on the host and the
+    result goes back to ``src``'s device (one warning per op), unless
+    ``TRNTENSOR_FP64_ON_DEVICE=1``; ``TRNTENSOR_REQUIRE_NKI=1`` raises."""
     from .nki.dispatch import _fp64_host_devices
 
+    if _fp64_host_devices(what, src.dtype, [src.device]) is not None:
+        return src.cpu().index_select(0, idx.cpu()).to(src.device)
     row_bytes = math.prod(src.shape[1:]) * src.element_size()
     if not _gather_in_blocks(src) or idx.numel() * row_bytes <= _GATHER_MAX_BYTES:
         return src.index_select(0, idx)
     step = max(1, _GATHER_MAX_BYTES // max(1, row_bytes))
     blocks = [src.index_select(0, idx[i : i + step]) for i in range(0, idx.numel(), step)]
-    if _fp64_host_devices(what, src.dtype, [src.device]) is not None:
-        return torch.cat([b.cpu() for b in blocks]).to(src.device)
     return torch.cat(blocks)
 
 
@@ -225,9 +227,12 @@ def pack_tril(eri: torch.Tensor) -> torch.Tensor:
 def unpack_tril(eri_packed: torch.Tensor, nbasis: int) -> torch.Tensor:
     """Inverse of :func:`pack_tril`: packed ``(npair, naux)`` → full ``(nbasis, nbasis, naux)``.
 
-    One ``index_select`` on the packed tensor's device (exact), split into
-    row blocks of at most 2 GiB of output on a device (#97: one gather with
-    an output over 4 GiB is silently wrong on the neuron device at LNC=1).
+    One ``index_select`` on the packed tensor's device, split into row
+    blocks of at most 2 GiB of output on a device (#97: one gather with an
+    output over 4 GiB is silently wrong on the neuron device at LNC=1). Exact
+    for fp32 and narrower; a float64 / complex128 input on the neuron device
+    is gathered on the host under ``"auto"`` (device gathers round float64 to
+    fp32), see ``_index_select_rows``.
     """
     npair, naux = eri_packed.shape
     if npair != nbasis * (nbasis + 1) // 2:
@@ -292,7 +297,8 @@ def ao_to_mo_transform(
     ``ao_to_mo_trn2_packed_kernel``, which gathers its rows in place: the
     full square never exists in device memory, and only half the bytes
     cross the host link. The aten and legacy routes unpack it with one
-    ``index_select`` (exact).
+    ``index_select`` (exact for fp32; float64 operands on the neuron device
+    already run on the host under ``"auto"``).
 
     **Host inputs (#56).** Under native ``"auto"`` with ``eri``, ``C_occ``
     and ``C_vir`` all on the host, the inputs are uploaded (``eri`` in the
