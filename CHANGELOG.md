@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`AuxStream` uploads a memory-mapped chunk to a device straight from the
+  mapping (trnsci/trnsci#115).** The sequential read into RAM, added so that
+  host row gathers stop faulting pages at random, now runs only for chunks
+  computed on the host. On Trn2, a page-cached 1.6 GB chunk went from 2.9 GB/s
+  (copy, then upload) to 12–14 GB/s (upload from the mapping). For water61 /
+  aug-cc-pVDZ (114.6 GB of B, 49.7 GB streamed per SCF iteration over 4
+  cores), the per-iteration upload wait went from 12.5 s to 4.3 s.
+
 ### Added
 
 - **`trntensor.stream`: DF integrals streamed over the aux index**
