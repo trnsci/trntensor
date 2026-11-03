@@ -125,6 +125,38 @@ class TestCPInputDtype:
         assert torch.equal(weights, w)
 
 
+class TestCPReconstructDtype:
+    """cp_reconstruct follows the factors' dtype and device (trntensor#78)."""
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float64])
+    def test_dtype_matches_fp64_reference(self, dtype):
+        gen = torch.Generator().manual_seed(78)
+        f = [torch.randn(n, 3, generator=gen, dtype=torch.float64) for n in (4, 5, 2)]
+        w = torch.rand(3, generator=gen, dtype=torch.float64)
+        ref = np.einsum("r,ir,jr,kr->ijk", w.numpy(), *[x.numpy() for x in f])
+        lo_f, lo_w = [x.to(dtype) for x in f], w.to(dtype)
+        # reference from the rounded inputs, evaluated in fp64
+        ref_lo = np.einsum(
+            "r,ir,jr,kr->ijk", lo_w.double().numpy(), *[x.double().numpy() for x in lo_f]
+        )
+        out = trntensor.cp_reconstruct(lo_f, lo_w)
+        assert out.dtype == dtype
+        tol = {torch.bfloat16: 5e-2, torch.float16: 5e-3, torch.float64: 1e-12}[dtype]
+        np.testing.assert_allclose(out.double().numpy(), ref_lo, rtol=tol, atol=tol)
+        if dtype == torch.float64:
+            np.testing.assert_allclose(out.numpy(), ref, rtol=1e-12)
+
+    def test_mixed_dtypes_promote(self):
+        f = [torch.randn(3, 2, dtype=torch.bfloat16), torch.randn(4, 2, dtype=torch.float32)]
+        out = trntensor.cp_reconstruct(f, torch.ones(2, dtype=torch.bfloat16))
+        assert out.dtype == torch.float32
+
+    def test_device_follows_factors(self):
+        f = [torch.empty(n, 2, device="meta") for n in (3, 4, 2)]
+        out = trntensor.cp_reconstruct(f, torch.empty(2, device="meta"))
+        assert out.device.type == "meta" and out.shape == (3, 4, 2)
+
+
 class TestTucker:
     def test_full_rank(self):
         """Full-rank Tucker should reconstruct exactly."""

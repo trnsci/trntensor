@@ -171,9 +171,7 @@ def xfail_decide(issue, why):
     return pytest.mark.xfail(strict=True, reason=f"trnsci/trntensor#{issue}: {why}")
 
 
-XF_CP_DTYPE = xfail_decide(78, "cp_reconstruct hard-codes a float32 CPU buffer")
 XF_SHARD = xfail_decide(78, "output-parallel sharded einsum does not co-partition operands")
-XF_FLOPS = xfail_decide(83, "ContractionPlan.estimated_flops is never filled in")
 
 
 # --------------------------------------------------------------------------- #
@@ -965,7 +963,6 @@ def test_cp_reconstruct_formula():
         assert_ref(got, torch.einsum("r,ir,jr,kr,lr->ijkl", w, *f), tol=tol, check_dtype=False)
 
 
-@XF_CP_DTYPE
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_cp_reconstruct_keeps_dtype(dtype):
     gen = torch.Generator().manual_seed(37)
@@ -1117,7 +1114,6 @@ def test_estimate_flops(sub, shapes):
     assert tt.estimate_flops(sub, *ops) == int(np.prod(list(sizes.values())))
 
 
-@XF_FLOPS
 @pytest.mark.parametrize(
     "sub,shapes", [("ij,jk->ik", [(6, 5), (5, 7)]), ("ij,jk->ki", [(6, 5), (5, 7)])]
 )

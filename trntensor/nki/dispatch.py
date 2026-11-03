@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import os
+import sys
 import warnings
 
 import numpy as np
@@ -660,19 +661,120 @@ def _get_native_ops() -> dict:
     return _native_ops
 
 
+# ── Eager call handles (native path) ─────────────────────────────────────────
+#
+# Same fix as trnblas#92. A `trntensor::` custom-op call costs ~0.10 ms of host
+# time before the kernel is queued; an aten op costs ~0.02 ms (trn2, SDK 2.33).
+# Most of the gap is per-call work that never changes for a given kernel:
+#   - nki's `Kernel.__call__` rebuilds the torch handle on every call
+#     (`inspect.signature`, a fresh `TorchNativeKernel` hashed into the
+#     registry, LNC resolution): ~0.06 ms;
+#   - the `torch.library` custom-op layer: ~0.01-0.02 ms.
+# So eager calls on plain neuron tensors build a handle once per kernel with
+# the public `torch_neuronx.wrap_nki` and call it directly (~0.02 ms). The
+# handle is gridless, so NKI resolves the LNC grid itself.
+# `**consts` (`use_sr`, `nub`, `tp`, `tail`, `banks`) pass through it by keyword,
+# unchanged, as through the op.
+# Only ops whose body is a single kernel call qualify: `_native.KERNELS`
+# names the kernel each one calls, and the handle wraps that kernel (looked
+# up when called, as the op body does; not the caller's), so it runs exactly
+# what the op body runs. Ops that are not listed keep the op.
+# Under torch.compile, for tensor subclasses (fake / functional), tensors that
+# require grad, and int64 inputs (the custom op applies the TorchNeuron int64
+# policy), the custom op is used as before.
+# `TRNTENSOR_NKI_EAGER_HANDLE=0` turns the fast path off.
+
+_EAGER_HANDLE_ENABLED: bool = os.environ.get(
+    "TRNTENSOR_NKI_EAGER_HANDLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# id(kernel) -> (kernel, handle); holding the kernel keeps its id unique.
+_eager_handles: dict[int, tuple[object, object]] = {}
+_wrap_nki: object = None  # torch_neuronx.wrap_nki, resolved on first use; False if absent
+
+
+def _eager_handle(kernel):
+    """Torch call handle for `kernel`, built once; None if unavailable."""
+    entry = _eager_handles.get(id(kernel))
+    if entry is not None:
+        return entry[1]
+    global _wrap_nki
+    if _wrap_nki is None:
+        try:
+            import torch_neuronx
+
+            _wrap_nki = getattr(torch_neuronx, "wrap_nki", False)
+        except ImportError:
+            _wrap_nki = False
+    if _wrap_nki is False or not hasattr(kernel, "func"):
+        return None  # no torch_neuronx.wrap_nki, or not an @nki.jit kernel
+    handle = _wrap_nki(kernel)
+    _eager_handles[id(kernel)] = (kernel, handle)
+    return handle
+
+
+def _eager_call_ok(tensors) -> bool:
+    """True when calling the cached handle is equivalent to the custom op."""
+    if not _EAGER_HANDLE_ENABLED or torch.compiler.is_compiling():
+        return False
+    for t in tensors:
+        if (
+            type(t) is not torch.Tensor
+            or t.device.type != _NEURON_DEVICE
+            or t.requires_grad
+            or t.dtype == torch.int64
+        ):
+            return False
+    return True
+
+
+def _native_kernel(op_name: str):
+    """`(kernel, conversions)` for the kernel the `trntensor::<op_name>` op body
+    calls (looked up now, as the body does), or None for an op that is not a
+    single kernel call. `conversions[i]` is what the body applies to
+    positional argument i (`int`, `tuple`, `float`), or None to pass it as is."""
+    native = sys.modules.get(__package__ + "._native")  # loaded by _get_native_ops
+    entry = None if native is None else native.KERNELS.get(op_name)
+    if entry is None:
+        return None
+    kernel = getattr(entry[0], entry[1], None)
+    return None if kernel is None else (kernel, entry[2] if len(entry) > 2 else ())
+
+
+def _native_call(op_name: str, args, kwargs=None):
+    """Run `trntensor::<op_name>` on `args` (tensors already on the device, then
+    the op's static arguments) and `kwargs` (static
+    keyword arguments, passed as is): through the cached handle when
+    that is equivalent (see above), else the custom op."""
+    kwargs = kwargs or {}
+    ops = _get_native_ops()
+    if _eager_call_ok([a for a in args if isinstance(a, torch.Tensor)]):
+        entry = _native_kernel(op_name)
+        handle = None if entry is None else _eager_handle(entry[0])
+        if handle is not None:
+            conv = entry[1]
+            if conv:
+                args = [
+                    conv[i](a) if i < len(conv) and conv[i] is not None else a
+                    for i, a in enumerate(args)
+                ]
+            return handle(*args, **kwargs)
+    return ops[op_name](*args, **kwargs)
+
+
 def _launch(kernel, op_name: str, *tensors: torch.Tensor, **consts) -> torch.Tensor:
     """Run one kernel launch on the Neuron device; return it on the caller's device.
 
     ``op_name`` is the ``trntensor::<op_name>`` custom op used on the native
-    path; the XLA path calls ``kernel`` directly on torch_xla tensors.
+    path (eager calls on plain tensors skip the op layer through a cached
+    handle, see ``_native_call``); the XLA path calls ``kernel`` directly on torch_xla tensors.
     ``consts`` are compile-time kernel arguments (``use_sr``), passed by
     keyword on both paths. The result comes back on the device of
     ``tensors[0]``, so device-resident operands keep the result on the device.
     """
     if _get_dispatch_path() == "native":
         orig = tensors[0].device
-        op = _get_native_ops()[op_name]
-        return _to_host(op(*(t.to(_NEURON_DEVICE) for t in tensors), **consts), orig)
+        out = _native_call(op_name, [t.to(_NEURON_DEVICE) for t in tensors], consts)
+        return _to_host(out, orig)
     xs, orig = _to_xla(*tensors)
     return kernel(*xs, **consts).to(orig)
 
@@ -1289,18 +1391,20 @@ def _nki_mp2_energy_rows(
         B = B.to(_NEURON_DEVICE)
     Bt, Bx, eo, ex, evc, evr = _mp2_row_feeds(B, eps_occ, eps_vir, dims)
     nd_pad = dims["nd_pad"]
-    op = _get_native_ops()["mp2_energy_row"]
     global _gc_may_free
     _gc_may_free = True
     acc = None
     for i in range(nocc):
-        p = op(
-            Bt[i],
-            Bx[i : i + nd_pad],
-            eo[:, i : i + 1].contiguous(),
-            ex[:, i : i + nd_pad].contiguous(),
-            evc,
-            evr,
+        p = _native_call(
+            "mp2_energy_row",
+            [
+                Bt[i],
+                Bx[i : i + nd_pad],
+                eo[:, i : i + 1].contiguous(),
+                ex[:, i : i + nd_pad].contiguous(),
+                evc,
+                evr,
+            ],
         )
         acc = p if acc is None else acc + p
     w = torch.tensor(dims["weights"], dtype=acc.dtype).to(acc.device)
