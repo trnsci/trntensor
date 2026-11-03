@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`mp2_energy`'s aten route chunks j as well as i (trnsci/trnsci#115).** It
+  chunked only the occupied index i. Once one i row of `T` (`nocc · nvir²`)
+  exceeded `_MP2_CHUNK_ELEMS`, every step held that whole row, 1.37 GB at
+  nocc 161 / nvir 1461 / naux 6064 (C40H82 / aug-cc-pVDZ), plus its temporaries.
+  On a 24 GiB Trn2 core, with only the 5.7 GB of `B` resident, the step ran out
+  of device memory. Blocks are now at most `_MP2_CHUNK_ELEMS` elements, and the
+  same case ran on one core in 222 s.
 ### Performance
 
 - **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
