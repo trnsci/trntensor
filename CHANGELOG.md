@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-11-04
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: the blocked packed AO→MO kernel (#112, #113): `ao_to_mo_transform` on packed fp32 integrals stays on the device past the old SBUF budget (n_ao 3508 at 85 ms per chunk vs 8.6 s on the host), and `auto` picks it where the resident kernel does not fit.
+
 ### Fixed
 
 - **Packed `ao_to_mo_transform` on the device past n_ao ≈ 1100–1300 (#112,
