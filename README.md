@@ -131,7 +131,7 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 
 ## Known issues in earlier releases
 
-Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Details are in the [CHANGELOG](CHANGELOG.md).
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-04 releases. Details are in the [CHANGELOG](CHANGELOG.md).
 
 | Bug | Affected | Fixed in |
 |-----|----------|----------|
@@ -142,7 +142,14 @@ Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Details
 | `einsum(precision="dd")` on float32/float64 was less accurate than `"fast"` (CPU emulation, #84) | 0.17.0–0.22.0 | 0.23.0 |
 | `multi_einsum` returned float32 results as float64 in mixed-dtype batches (#75) | 0.17.0–0.22.0 | 0.23.0 |
 | NKI chemistry kernels returned inf for float64 operands, and some kernel routes changed the result dtype (#87) | `df_*` 0.21.0–0.22.0; `ao_to_mo_transform` every release with its kernels | 0.23.0 |
-| `ao_to_mo_transform` aten route on the TorchNeuron device was wrong once `eri` exceeded 4 GiB (#97; one LNC=1 case is still open) | through 0.22.0 | 0.23.0 |
+| `ao_to_mo_transform` aten route on the TorchNeuron device was wrong once `eri` exceeded 4 GiB (#97; the LNC=1 gather case is the 0.24.0 row below) | through 0.22.0 | 0.23.0 |
+| `unpack_tril` / `pack_tril` (and the packed-`eri` aten / legacy routes of `ao_to_mo_transform`) on the neuron device at LNC=1 returned wrong data, at times NaN, once one gathered output reached 4 GiB (154 M mismatched elements at 4.99e9 bytes) (#97) | 0.20.0–0.23.0 | 0.24.0 |
+| Complex `tucker_decompose` on the neuron device used `Uᵀ`, not `Uᴴ`: device matmul ignores the lazy conj bit of `.mH` (#89) | 0.23.0 | 0.24.0 |
+| float64 on the neuron device rounded to fp32 in `gather` (device `torch.cat`) and in `pack_tril` / `unpack_tril` / `pack_density` / `unpack_packed` (device `index_select` / fancy indexing), rel. err ~4e-8 (#92) | through 0.23.0 | 0.24.0 |
+| `multi_einsum` under `"auto"` pinned shared host float64 / complex128 operands to the device, where device aten computed them at fp32 precision (#92) | through 0.23.0 | 0.24.0 |
+| Integer, bool, complex and mixed-dtype operands of `einsum` / `multi_einsum` reached the fp32/bf16/fp16 matmul kernels under `set_backend("nki")`, or under `"auto"` above the size thresholds (trnsci/trnsci#35) | through 0.23.0 | 0.24.0 |
+| `einsum(..., out=)` never wrote `out`, so the documented `einsum(..., beta=1.0, out=acc)` accumulation left `acc` unchanged (#77) | 0.3.0–0.23.0 | 0.24.0 |
+| `cp_reconstruct` returned float32 for bf16 / fp16 factors (#78) | 0.1.1–0.23.0 | 0.24.0 |
 
 ## Related Projects
 
