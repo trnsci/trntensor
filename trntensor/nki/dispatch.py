@@ -34,6 +34,9 @@ from ._kernels import (
     TILE_K,
     TILE_M,
     TILE_N,
+    ao_to_mo_blocked_nub,
+    ao_to_mo_blocked_sbuf_bytes,
+    ao_to_mo_blocked_tp,
     ao_to_mo_trn2_nub,
     ao_to_mo_trn2_tiling,
     df_group_chunks,
@@ -694,6 +697,8 @@ KERNEL_OPERAND_DTYPES: dict[str, tuple[frozenset, ...]] = {
     "ao_to_mo_transform": (_CHEM_DTYPES,) * 3,
     "ao_to_mo_trn2": (_CHEM_DTYPES,) * 3,
     "ao_to_mo_trn2_packed": (_CHEM_DTYPES, _INDEX_DTYPES, _CHEM_DTYPES, _CHEM_DTYPES),
+    # fp32 only: the blocked kernel (#112) was validated on device in fp32.
+    "ao_to_mo_trn2_packed_blocked": (_F32_DTYPES, _INDEX_DTYPES, _F32_DTYPES, _F32_DTYPES),
     # The df_* kernels run fp32 only: bf16 was never validated on device, and
     # the df_coulomb host tail mixed a bf16 B with the kernel's fp32 d.
     "df_half_packed": (_F32_DTYPES, _INDEX_DTYPES, _F32_DTYPES),
@@ -2001,6 +2006,9 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int, nbasis: int | None 
         _ao_to_mo_trn2_sbuf_bytes(nb, nocc, nvir, naux, eri.element_size(), packed)
         <= _AO_TO_MO_SBUF_BUDGET
     )
+    if not fits and packed:
+        # The blocked kernel's SBUF does not grow with n_ao (#112).
+        fits = _ao_to_mo_packed_variant(nb, nocc, nvir, naux, eri.dtype) == "blocked"
     if not fits:
         return "aten"
     if _nki_forced():
@@ -2013,6 +2021,43 @@ def _ao_to_mo_route(eri: torch.Tensor, nocc: int, nvir: int, nbasis: int | None 
     macs = nocc * nb**2 * naux
     big = macs >= (_AO_TO_MO_MIN_MACS_PADDED if nb % TILE_K else _AO_TO_MO_MIN_MACS)
     return "trn2" if big and eri.device.type == _NEURON_DEVICE else "aten"
+
+
+_AO_TO_MO_PACKED_CHOICES = ("auto", "resident", "blocked")
+
+
+def _ao_to_mo_packed_variant(
+    nbasis: int, nocc: int, nvir: int, naux: int, dtype: torch.dtype
+) -> str | None:
+    """Which packed Trn2 AO→MO kernel runs: 'resident' (``ao_to_mo_trn2_packed_kernel``),
+    'blocked' (``ao_to_mo_trn2_packed_blocked_kernel``, #112) or None (neither).
+
+    ``"auto"`` keeps the resident kernel wherever its SBUF working set fits
+    (it was measured there, #54/#80, and is up to ~2x faster at mid sizes:
+    14 against 18-27 ms at n_ao 970 / nocc 161 / naux 512) and takes the
+    blocked one beyond, from n_ao ≈ 1100-1300 at nocc ≈ n_ao/10, where
+    C_vir, the gather indices and the stage-1 eri column pass the budget.
+    The blocked kernel runs fp32 only.
+    ``TRNTENSOR_AO_TO_MO_PACKED=auto|resident|blocked`` overrides.
+    """
+    choice = os.environ.get("TRNTENSOR_AO_TO_MO_PACKED", "auto").strip().lower()
+    if choice not in _AO_TO_MO_PACKED_CHOICES:
+        raise ValueError(
+            f"TRNTENSOR_AO_TO_MO_PACKED must be one of {_AO_TO_MO_PACKED_CHOICES}; got {choice!r}"
+        )
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    resident = (
+        _ao_to_mo_trn2_sbuf_bytes(nbasis, nocc, nvir, naux, itemsize, True) <= _AO_TO_MO_SBUF_BUDGET
+    )
+    tp = ao_to_mo_blocked_tp(naux) or ao_to_mo_blocked_tp(_round_up(naux, TILE_K))
+    blocked = (
+        dtype == torch.float32
+        and ao_to_mo_blocked_sbuf_bytes(nocc, tp, _round_up(nbasis, TILE_K))
+        <= _AO_TO_MO_SBUF_BUDGET
+    )
+    if choice == "resident" or (choice == "auto" and resident):
+        return "resident"
+    return "blocked" if blocked else None
 
 
 def _ao_to_mo_pad_occ(C_occ: torch.Tensor, naux_pad: int, packed: bool) -> torch.Tensor:
@@ -2122,6 +2167,47 @@ def _tril_gather_images(nbasis: int, nbp: int, naux: int, tp: int, device=None) 
 _gather_image_cache: dict[tuple, torch.Tensor] = {}
 
 
+def _tril_gather_images_blocked(
+    nbasis: int, nbp: int, naux: int, tp: int, nub: int, device=None
+) -> torch.Tensor:
+    """Gather indices for ``ao_to_mo_trn2_packed_blocked_kernel``:
+    ``(NPC, nbp/NUB, 128, NKB·NUB)`` uint32 (#112).
+
+    The same ``(128, NUB)`` index blocks as :func:`_tril_gather_images`
+    (rows ``NPC·pair + c`` of the ``(npair·NPC, tp)`` view, read column-major
+    and written row-major), regrouped so that for chunk ``c`` and ν block
+    ``vb`` the blocks of consecutive μ tiles ``k`` are contiguous (columns
+    ``k·NUB``): one small DMA brings a whole μ block's indices. Cached per
+    shape and device (``4·NPC·nbp²`` bytes).
+    """
+    key = ("blk", nbasis, nbp, naux, tp, nub, str(device))
+    hit = _gather_image_cache.get(key)
+    if hit is not None:
+        return hit
+    npc = naux // tp
+    nkb = nbp // TILE_K
+    nvb = nbp // nub
+    if (nbasis * (nbasis + 1) // 2) * npc >= 2**31:
+        raise ValueError("packed eri too large for 32-bit gather indices")
+    rows = torch.zeros(nbp, nbp, dtype=torch.int64)
+    rows[:nbasis, :nbasis] = _tril_rows(nbasis)
+    q = torch.arange(TILE_K)[:, None]
+    m = torch.arange(nub)[None, :]
+    j = m * TILE_K + q  # (128, NUB)
+    dp, du = j // nub, j % nub
+    k = torch.arange(nkb)[None, :, None, None]
+    v0 = (torch.arange(nvb) * nub)[:, None, None, None]
+    mu = k * TILE_K + dp[None, None]  # (NVB, NKB, 128, NUB)
+    nu = v0 + du[None, None]
+    base = rows[mu, nu].permute(0, 2, 1, 3).reshape(nvb, TILE_K, nkb * nub)
+    hit = (base[None] * npc + torch.arange(npc)[:, None, None, None]).to(torch.int32)
+    hit = hit.view(torch.uint32).contiguous()
+    if device is not None:
+        hit = hit.to(device)
+    _gather_image_cache[key] = hit
+    return hit
+
+
 def _packed_tp(naux: int) -> int:
     return ao_to_mo_trn2_tiling(naux, packed=True)[0]
 
@@ -2142,6 +2228,8 @@ def _nki_ao_to_mo_trn2_packed(
     npair, naux = eri_p.shape
     nbasis, nocc = C_occ.shape
     nvir = C_vir.shape[1]
+    if _ao_to_mo_packed_variant(nbasis, nocc, nvir, naux, eri_p.dtype) == "blocked":
+        return _nki_ao_to_mo_trn2_packed_blocked(eri_p, C_occ, C_vir)
     nbp, nvp, nxp = _round_up(nbasis, TILE_K), _round_up(nvir, TILE_M), _round_up(naux, TILE_K)
     if nxp != naux:
         ep = torch.zeros(npair, nxp, dtype=eri_p.dtype, device=eri_p.device)
@@ -2155,13 +2243,62 @@ def _nki_ao_to_mo_trn2_packed(
         cv = torch.zeros(nbp, nvp, dtype=C_vir.dtype, device=C_vir.device)
         cv[:nbasis, :nvir] = C_vir
         C_vir = cv
-    tp = _packed_tp(nxp)
     dev = eri_p.device if eri_p.device.type == _NEURON_DEVICE else None
+    tp = _packed_tp(nxp)
     img = _tril_gather_images(nbasis, nbp, nxp, tp, dev)
     C_occ = _ao_to_mo_pad_occ(C_occ, nxp, packed=True)
     out = _launch(
         None,
         "ao_to_mo_trn2_packed",
+        eri_p.contiguous().view(npair * (nxp // tp), tp),
+        img,
+        C_occ.contiguous(),
+        C_vir.contiguous(),
+    )
+    if out.shape[0] != nocc:
+        out = out[:nocc]
+    return out[:, :nvir, :naux] if (nvp, nxp) != (nvir, naux) else out
+
+
+def _nki_ao_to_mo_trn2_packed_blocked(
+    eri_p: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch ``ao_to_mo_trn2_packed_blocked_kernel`` (#112).
+
+    The aux chunk width is a divisor of naux (:func:`ao_to_mo_blocked_tp`),
+    so the packed tensor goes in without a padding copy unless naux has no
+    divisor in ``[64, 512]``. nbasis and nvir pad through ``C_occ``/``C_vir``
+    and the gather indices, and an odd nocc above 128 gets a zero orbital
+    when the programs split the occupied index (odd chunk count).
+    """
+    npair, naux = eri_p.shape
+    nbasis, nocc = C_occ.shape
+    nvir = C_vir.shape[1]
+    nbp, nvp = _round_up(nbasis, TILE_K), _round_up(nvir, TILE_M)
+    tp, nxp = ao_to_mo_blocked_tp(naux), naux
+    if not tp:
+        nxp = _round_up(naux, TILE_K)
+        tp = ao_to_mo_blocked_tp(nxp)
+        ep = torch.zeros(npair, nxp, dtype=eri_p.dtype, device=eri_p.device)
+        ep[:, :naux] = eri_p
+        eri_p = ep
+    nocp = nocc + 1 if nocc > TILE_M and nocc % 2 and (nxp // tp) % 2 else nocc
+    if (nbp, nocp) != (nbasis, nocc):
+        co = torch.zeros(nbp, nocp, dtype=C_occ.dtype, device=C_occ.device)
+        co[:nbasis, :nocc] = C_occ
+        C_occ = co
+    if (nbp, nvp) != (nbasis, nvir):
+        cv = torch.zeros(nbp, nvp, dtype=C_vir.dtype, device=C_vir.device)
+        cv[:nbasis, :nvir] = C_vir
+        C_vir = cv
+    dev = eri_p.device if eri_p.device.type == _NEURON_DEVICE else None
+    nub = ao_to_mo_blocked_nub(tp, nocp)
+    img = _tril_gather_images_blocked(nbasis, nbp, nxp, tp, nub, dev)
+    out = _launch(
+        None,
+        "ao_to_mo_trn2_packed_blocked",
         eri_p.contiguous().view(npair * (nxp // tp), tp),
         img,
         C_occ.contiguous(),

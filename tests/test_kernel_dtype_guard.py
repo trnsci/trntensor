@@ -53,6 +53,7 @@ KERNEL_TAKES = {
     "ao_to_mo_transform": (_CHEM,) * 3,
     "ao_to_mo_trn2": (_CHEM,) * 3,
     "ao_to_mo_trn2_packed": (_CHEM, _IDX, _CHEM, _CHEM),
+    "ao_to_mo_trn2_packed_blocked": ({F32}, _IDX, {F32}, {F32}),
     "df_half_packed": ({F32}, _IDX, {F32}),
     "df_exchange_syrk": ({F32},) * 2,
     "df_coulomb_d": ({F32},) * 2,
@@ -80,6 +81,7 @@ _RAW_KERNELS = [
     "mp2_energy_row_kernel",
     "ao_to_mo_trn2_kernel",
     "ao_to_mo_trn2_packed_kernel",
+    "ao_to_mo_trn2_packed_blocked_kernel",
     "df_half_packed_kernel",
     "df_exchange_syrk_kernel",
     "df_coulomb_d_kernel",
@@ -274,6 +276,7 @@ def _tt(dt, g):
     return trntensor.tt_decompose(_mk((4, 5, 6), dt, g), max_rank=2)
 
 
+_BLOCKED = {"TRNTENSOR_AO_TO_MO": "trn2", "TRNTENSOR_AO_TO_MO_PACKED": "blocked"}
 CALLS = [
     ("einsum-matmul", {}, _einsum("ij,jk->ik", [(6, 5), (5, 4)])),
     ("einsum-matmul-T", {}, _einsum("ji,jk->ik", [(5, 6), (5, 4)])),
@@ -289,6 +292,7 @@ CALLS = [
     ("mp2-legacy", {"TRNTENSOR_MP2_ENERGY": "legacy"}, _mp2),
     ("ao2mo-trn2", {"TRNTENSOR_AO_TO_MO": "trn2"}, _ao2mo(False)),
     ("ao2mo-trn2-packed", {"TRNTENSOR_AO_TO_MO": "trn2"}, _ao2mo(True)),
+    ("ao2mo-trn2-packed-blocked", _BLOCKED, _ao2mo(True)),
     ("ao2mo-legacy", {"TRNTENSOR_AO_TO_MO": "legacy"}, _ao2mo(False)),
     ("df_exchange", {"TRNTENSOR_DF_EXCHANGE": "trn2"}, _dfk),
     ("df_coulomb", {"TRNTENSOR_DF_COULOMB": "trn2"}, _dfj),
@@ -301,7 +305,7 @@ CALLS = [
 def _leaves(x):
     if isinstance(x, torch.Tensor):
         return [x]
-    if isinstance(x, (list, tuple)):
+    if isinstance(x, list | tuple):
         return [t for v in x for t in _leaves(v)]
     if isinstance(x, parallel.ShardedTensor):
         return _leaves(list(x.chunks))
@@ -381,7 +385,15 @@ def test_require_nki_refuses_matmul_dtypes(guarded, monkeypatch, dtype, name):
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool, torch.complex64])
 @pytest.mark.parametrize(
     "name",
-    ["mp2-rows", "mp2-legacy", "ao2mo-trn2", "ao2mo-trn2-packed", "df_exchange", "df_coulomb"],
+    [
+        "mp2-rows",
+        "mp2-legacy",
+        "ao2mo-trn2",
+        "ao2mo-trn2-packed",
+        "ao2mo-trn2-packed-blocked",
+        "df_exchange",
+        "df_coulomb",
+    ],
 )
 def test_require_nki_refuses_chemistry_dtypes(guarded, monkeypatch, dtype, name):
     _require_nki(monkeypatch)
@@ -397,7 +409,15 @@ def test_require_nki_refuses_chemistry_dtypes(guarded, monkeypatch, dtype, name)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "name",
-    ["mp2-rows", "mp2-legacy", "ao2mo-trn2", "ao2mo-trn2-packed", "df_exchange", "df_coulomb"],
+    [
+        "mp2-rows",
+        "mp2-legacy",
+        "ao2mo-trn2",
+        "ao2mo-trn2-packed",
+        "ao2mo-trn2-packed-blocked",
+        "df_exchange",
+        "df_coulomb",
+    ],
 )
 def test_require_nki_chemistry_floats_run_the_kernel(guarded, monkeypatch, dtype, name):
     """float16 (and, on the fp32-only df_* kernels, bfloat16) chemistry operands
@@ -552,6 +572,7 @@ _MIXED_CALLS = [
     ("mp2-rows", {"TRNTENSOR_MP2_ENERGY": "rows"}, _mp2_mixed),
     ("ao2mo-trn2", {"TRNTENSOR_AO_TO_MO": "trn2"}, _ao2mo_mixed),
     ("ao2mo-trn2-packed", {"TRNTENSOR_AO_TO_MO": "trn2"}, lambda a, b: _ao2mo_mixed(a, b, True)),
+    ("ao2mo-trn2-packed-blocked", _BLOCKED, lambda a, b: _ao2mo_mixed(a, b, True)),
     ("df_exchange", {"TRNTENSOR_DF_EXCHANGE": "trn2"}, _dfk_mixed),
     ("df_coulomb", {"TRNTENSOR_DF_COULOMB": "trn2"}, _dfj_mixed),
     ("einsum-matmul", {}, _matmul_mixed),

@@ -303,7 +303,13 @@ def ao_to_mo_transform(
     ``naux == npair``). On the native path the packed tensor feeds
     ``ao_to_mo_trn2_packed_kernel``, which gathers its rows in place: the
     full square never exists in device memory, and only half the bytes
-    cross the host link. The aten and legacy routes unpack it with one
+    cross the host link. Where that kernel's SBUF working set (which grows
+    with n_ao: 979 KiB per partition at n_ao = 3508) passes the budget,
+    fp32 integrals take ``ao_to_mo_trn2_packed_blocked_kernel`` instead,
+    which streams every operand over blocks of μ/ν tiles and keeps an SBUF
+    footprint independent of n_ao (#112);
+    ``TRNTENSOR_AO_TO_MO_PACKED=auto|resident|blocked`` overrides. The
+    aten and legacy routes unpack it with one
     ``index_select`` (exact for fp32; float64 operands on the neuron device
     already run on the host under ``"auto"``).
 

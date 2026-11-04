@@ -89,6 +89,96 @@ def ao_to_mo_trn2_nub(tp: int) -> int:
     return nub
 
 
+# ── Blocked packed AO→MO (#112) ─────────────────────────────────────────────
+#
+# ``ao_to_mo_trn2_packed_kernel`` keeps C_occ, C_vir, one chunk's gather
+# indices and a whole μ column of the stage-1 eri block in SBUF, all of which
+# grow with n_ao: 979 KiB per partition at n_ao = 3508 against 176 KiB. The
+# blocked kernel streams every operand over blocks of ``KB`` μ (stage 1) or ν
+# (stage 2) tiles and keeps the partial sums in PSUM across the blocks, so its
+# SBUF footprint depends on the tile sizes only (and on nocc through one
+# C_occ block), not on n_ao.
+
+AO2MO_BLOCKED_PSUM_BANKS = 4  # PSUM accumulators live across a block loop
+AO2MO_BLOCKED_E_ELEMS = 8192  # eri block elements per partition (32 KiB fp32)
+AO2MO_BLOCKED_KB_MAX = 8
+
+
+def ao_to_mo_blocked_num(tp: int) -> int:
+    """ν per stage-1 matmul: the largest power of two ≤ 8 with ``NUM·tp ≤ 512``."""
+    num = 1
+    while num < 8 and 2 * num * tp <= TILE_N:
+        num *= 2
+    return num
+
+
+def ao_to_mo_blocked_nub(tp: int, nocc: int) -> int:
+    """ν per stage-1 gather for the blocked kernel: ``NUM·NUG``, with ``NUG``
+    the ν matmul groups per occupied block, so that the occupied blocks of one
+    pass hold at most ``AO2MO_BLOCKED_PSUM_BANKS`` accumulators (a power of
+    two, so it divides 128 and every padded nbasis)."""
+    nob = max(1, -(-nocc // TILE_M))
+    nug = 1
+    while nug * 2 * nob <= AO2MO_BLOCKED_PSUM_BANKS:
+        nug *= 2
+    return ao_to_mo_blocked_num(tp) * nug
+
+
+def ao_to_mo_blocked_kb(nub: int, tp: int, nkb: int) -> int:
+    """128-row tiles per contraction block: ``KB·NUB·tp ≤ AO2MO_BLOCKED_E_ELEMS``."""
+    return max(1, min(nkb, AO2MO_BLOCKED_KB_MAX, AO2MO_BLOCKED_E_ELEMS // (nub * tp)))
+
+
+def ao_to_mo_blocked_avb(nav: int) -> int:
+    """Virtual 128-tiles per stage-2 pass: the largest divisor of ``nav`` ≤ the bank budget."""
+    for d in range(AO2MO_BLOCKED_PSUM_BANKS, 0, -1):
+        if nav % d == 0:
+            return d
+    return 1
+
+
+def ao_to_mo_blocked_tp(naux: int) -> int:
+    """Aux chunk width for the blocked kernel, or 0 when ``naux`` needs padding.
+
+    A divisor of ``naux`` in ``[64, 512]`` (or ``naux`` itself up to 512), so
+    the packed tensor is viewed as ``(npair·NPC, TP)`` rows without a padding
+    copy (at n_ao = 3508 a 128-wide padded copy of one 87-column chunk is
+    3.1 GB). The widest wins, which keeps the traced instruction count, and
+    with it the compile time, down; among divisors of a wider naux an even
+    chunk count (the programs split the chunks at LNC=2) comes first.
+
+    Splitting a chunk of ≤ 512 in two for an even count was measured and
+    not taken (Trn2, LNC=2, kernel time / cold compile): n_ao 2522 / nocc
+    215 / naux 168 ran 54 ms / 552 s as 2 × 84 against 73 ms / 195 s;
+    1658 / 161 / 384 35 ms / 128 s as 2 × 192 against 56 ms / 128 s;
+    970 / 161 / 512 18 ms / 67 s as 2 × 256 against 27 ms / 39 s.
+    """
+    if naux <= TILE_N:
+        return naux
+    cands = [tp for tp in range(TILE_N, 63, -1) if naux % tp == 0]
+    if not cands:
+        return 0
+    even = [tp for tp in cands if (naux // tp) % 2 == 0]
+    return (even or cands)[0]
+
+
+def ao_to_mo_blocked_sbuf_bytes(nocc: int, tp: int, nb: int = 1 << 30) -> int:
+    """Upper bound of the blocked kernel's SBUF bytes per partition (fp32, before
+    the compiler's double buffering): independent of n_ao (``nb`` only caps
+    ``KB``)."""
+    nub = ao_to_mo_blocked_nub(tp, nocc)
+    kb = ao_to_mo_blocked_kb(nub, tp, max(1, nb // TILE_K))
+    num = ao_to_mo_blocked_num(tp)
+    nug = nub // num
+    obp = max(1, AO2MO_BLOCKED_PSUM_BANKS // nug)
+    pw = min(nocc, obp * TILE_M)
+    ni = max(1, min(nocc, TILE_N // tp))
+    avb = AO2MO_BLOCKED_PSUM_BANKS
+    stage1 = kb * nub + kb * nub * tp + kb * pw + obp * nub * tp
+    stage2 = kb * ni * tp + kb * avb * TILE_M + avb * ni * tp
+    return 4 * (stage1 + stage2)
+
+
 if HAS_NKI:
 
     @nki.jit
@@ -727,6 +817,169 @@ if HAS_NKI:
         TP = eri_v.shape[1]
         NUB = ao_to_mo_trn2_nub(TP)
         return _ao_to_mo_trn2_body(eri_v, img, C_occ, C_vir, NB, NPC * TP, TP, NUB)
+
+    @nki.jit
+    def ao_to_mo_trn2_packed_blocked_kernel(eri_v, img, C_occ, C_vir):
+        """:func:`ao_to_mo_trn2_packed_kernel` with SBUF independent of n_ao (#112).
+
+        ``eri_v``: the packed lower triangle viewed as ``(npair·NPC, TP)``
+        rows (row ``NPC·pair + c`` = aux chunk ``c`` of packed row ``pair``);
+        ``TP`` need not be a 128 multiple. ``img``: ``(NPC, NB/NUB, 128,
+        NKB·NUB)`` uint32 gather indices from
+        ``dispatch._tril_gather_images_blocked``: for chunk ``c`` and ν block
+        ``vb`` the ``(128, NUB)`` block at columns ``k·NUB`` gathers
+        ``eri[k·128 + p, vb·NUB + u, chunk c]`` into ``(p, u)``. ``C_occ``
+        ``(NB, NOCC)``, ``C_vir`` ``(NB, NVIR)``, NB and NVIR multiples of 128.
+
+        Same two GEMM stages as the resident kernels, but nothing of size
+        n_ao stays in SBUF:
+
+        1. per ν block of ``NUB`` and pass of occupied blocks, the μ tiles are
+           taken ``KB`` at a time: their gather indices, eri rows (one batched
+           indirect DMA per tile) and ``C_occ`` rows are loaded, and every
+           matmul accumulates into PSUM tiles that live across the μ blocks.
+           Each μ sum is the full PSUM chain, in the resident kernel's order.
+        2. per group of ``NI`` occupied orbitals and pass of ``AVB`` virtual
+           tiles, ``X`` and ``C_vir`` are streamed over ν blocks of ``KB``
+           tiles into ``AVB`` PSUM accumulators. ``X`` is re-read once per
+           pass (``NVIR / (128·AVB)`` times) from kernel scratch HBM.
+
+        The aux chunks (or, with an odd chunk count and NOCC > 128, the
+        occupied index; NOCC even) are split across the programs as before.
+        """
+        NB, NOCC = C_occ.shape
+        _, NVIR = C_vir.shape
+        NPC, NVB = img.shape[0], img.shape[1]
+        TP = eri_v.shape[1]
+        NAUX = NPC * TP
+        TILE = 128
+        NKB = NB // TILE
+        NUB = NB // NVB
+        NAV = NVIR // TILE
+        n_prog, pid, axis = _programs(NPC, NOCC if NOCC > TILE else 1)
+        if axis == 1:
+            NPC_per, c_base = NPC, 0
+            OCC_per = NOCC // n_prog
+            o_base = pid * OCC_per
+        else:
+            NPC_per = NPC // n_prog
+            c_base = pid * NPC_per
+            OCC_per, o_base = NOCC, 0
+        NUM = min(NUB, ao_to_mo_blocked_num(TP))
+        NUG = NUB // NUM
+        KB = ao_to_mo_blocked_kb(NUB, TP, NKB)
+        kblocks = ao_to_mo_trn2_groups(NKB, KB)
+        obs = ao_to_mo_trn2_occ_blocks(OCC_per)
+        OBP = max(1, AO2MO_BLOCKED_PSUM_BANKS // NUG)
+        passes = [obs[i : i + OBP] for i in range(0, len(obs), OBP)]
+        NI = max(1, min(OCC_per, TILE_N // TP))
+        NGF = OCC_per // NI
+        NIT = OCC_per - NGF * NI
+        AVB = ao_to_mo_blocked_avb(NAV)
+        AVW = AVB * TILE
+
+        B_out = nl.ndarray((NOCC, NVIR, NAUX), dtype=eri_v.dtype, buffer=nl.shared_hbm)
+        x_hbm = nl.ndarray((NOCC, NB, NAUX), dtype=eri_v.dtype, buffer=nl.shared_hbm)
+
+        def stage1(c, p_off, v0, vb, pas):
+            po0 = o_base + pas[0][0]
+            pw = pas[-1][0] + pas[-1][1] - pas[0][0]
+            accs = [
+                [nl.zeros((osz, NUM, TP), dtype=nl.float32, buffer=nl.psum) for _ in range(NUG)]
+                for _, osz in pas
+            ]
+            for k0, kbs in kblocks:
+                idx_sb = nl.ndarray((TILE, kbs * NUB), dtype=nl.uint32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=idx_sb, src=img[c, vb, 0:TILE, k0 * NUB : (k0 + kbs) * NUB])
+                e_blk = nl.ndarray((TILE, kbs, NUB, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
+                for k in nl.affine_range(kbs):
+                    nisa.dma_copy(
+                        dst=e_blk[0:TILE, k, 0:NUB, 0:TP],
+                        src=eri_v.ap(
+                            pattern=[[TP, TILE * NUB], [1, TP]],
+                            vector_offset=idx_sb[0:TILE, k * NUB : (k + 1) * NUB],
+                            indirect_dim=0,
+                        ),
+                    )
+                co_blk = nl.ndarray((TILE, kbs, pw), dtype=C_occ.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=co_blk,
+                    src=C_occ[k0 * TILE : k0 * TILE + 1, po0 : po0 + 1].ap(
+                        pattern=[[NOCC, TILE], [TILE * NOCC, kbs], [1, pw]]
+                    ),
+                )
+                for j, (b0, osz) in enumerate(pas):
+                    ob = b0 - pas[0][0]
+                    for ug in range(NUG):
+                        for k in nl.affine_range(kbs):
+                            nisa.nc_matmul(
+                                dst=accs[j][ug],
+                                stationary=co_blk[0:TILE, k, ob : ob + osz],
+                                moving=e_blk[0:TILE, k, ug * NUM : (ug + 1) * NUM, 0:TP],
+                                accumulate=True,
+                            )
+            for j, (b0, osz) in enumerate(pas):
+                x_sb = nl.ndarray((osz, NUB, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
+                for ug in range(NUG):
+                    nisa.tensor_copy(
+                        src=accs[j][ug], dst=x_sb[0:osz, ug * NUM : (ug + 1) * NUM, 0:TP]
+                    )
+                o0 = o_base + b0
+                nl.store(x_hbm[o0 : o0 + osz, v0 : v0 + NUB, p_off : p_off + TP], value=x_sb)
+
+        def stage2(p_off, i0, ni):
+            for ab in nl.affine_range(NAV // AVB):
+                a0 = ab * AVW
+                accs = [
+                    nl.zeros((TILE, ni, TP), dtype=nl.float32, buffer=nl.psum) for _ in range(AVB)
+                ]
+                for k0, kbs in kblocks:
+                    x_g = nl.ndarray((TILE, kbs, ni, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
+                    for k in nl.affine_range(kbs):
+                        r0 = (k0 + k) * TILE
+                        nisa.dma_copy(
+                            dst=x_g[0:TILE, k, 0:ni, 0:TP],
+                            src=x_hbm[i0 : i0 + 1, r0 : r0 + 1, p_off : p_off + 1].ap(
+                                pattern=[[NAUX, TILE], [NB * NAUX, ni], [1, TP]]
+                            ),
+                        )
+                    cv_blk = nl.ndarray((TILE, kbs, AVW), dtype=C_vir.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        dst=cv_blk,
+                        src=C_vir[k0 * TILE : k0 * TILE + 1, a0 : a0 + 1].ap(
+                            pattern=[[NVIR, TILE], [TILE * NVIR, kbs], [1, AVW]]
+                        ),
+                    )
+                    for j in range(AVB):
+                        for k in nl.affine_range(kbs):
+                            nisa.nc_matmul(
+                                dst=accs[j],
+                                stationary=cv_blk[0:TILE, k, j * TILE : (j + 1) * TILE],
+                                moving=x_g[0:TILE, k, 0:ni, 0:TP],
+                                accumulate=True,
+                            )
+                for j in range(AVB):
+                    b_sb = nl.ndarray((TILE, ni, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=accs[j], dst=b_sb)
+                    a1 = a0 + j * TILE
+                    nisa.dma_copy(
+                        dst=B_out[i0 : i0 + 1, a1 : a1 + 1, p_off : p_off + 1].ap(
+                            pattern=[[NAUX, TILE], [NVIR * NAUX, ni], [1, TP]]
+                        ),
+                        src=b_sb,
+                    )
+
+        for pc in nl.affine_range(NPC_per):
+            c = c_base + pc
+            p_off = c * TP
+            for vb in nl.affine_range(NVB):
+                for pas in passes:
+                    stage1(c, p_off, vb * NUB, vb, pas)
+            for g in nl.affine_range(NGF):
+                stage2(p_off, o_base + g * NI, NI)
+            if NIT:
+                stage2(p_off, o_base + NGF * NI, NIT)
+        return B_out
 
 
 # ---------------------------------------------------------------------------
