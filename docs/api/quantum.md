@@ -226,6 +226,41 @@ Kernel alone, device-resident, warm (fp32; padded `nvir` included):
   (max error ~1 against float64), while the kernel matched float64 to 2e-7;
   aten was correct at nbasis 736. Its timings there are for reference only.
 
+- **Large packed bases (#112).** The packed kernel above keeps C_occ,
+  C_vir, one chunk's gather indices and a whole μ column of eri in SBUF. That
+  outgrows the budget from n_ao ≈ 1100–1300 (979 KiB per partition at
+  n_ao 3508). From there on, fp32 packed integrals run
+  `ao_to_mo_trn2_packed_blocked_kernel`. It streams every operand over
+  blocks of up to 8 μ/ν tiles, keeps its PSUM accumulators across the
+  blocks, and has an SBUF footprint (≈ 71–78 KiB) that does not grow with
+  n_ao. Any aux chunk width up to 512 goes in without a padding copy. Where
+  both kernels fit, they agree bit for bit.
+  `TRNTENSOR_AO_TO_MO_PACKED=auto|resident|blocked` picks the kernel.
+
+  Measured on Trn2 with one core, fp32, synthetic packed chunks of the
+  trnsci#115 ladder's widths. The fp64 reference is computed on the host.
+  The host column is the aten route on 2 pinned threads, including the
+  unpack. The kernel column is the device time, synchronised, without the
+  download:
+
+  | n_ao, nocc, chunk naux | LNC | cold compile | kernel | host fp32 | max rel. error, kernel / host |
+  |---|---|---|---|---|---|
+  | 1658, 161, 384 | 2 | 128 s | 56 ms¹ | 6.1 s | 3.2e-7 / 6.6e-7 |
+  | 2522, 215, 168 | 2 | 195 s | 73 ms¹ | 7.9 s | 3.7e-7 / 6.0e-7 |
+  | 3508, 241, 87 | 2 | 162 s | 85 ms | 8.6 s | 3.9e-7 / 5.4e-7 |
+  | 3508, 241, 87 | 1 | 140 s | 94 ms | – | 3.9e-7 |
+  | 3508, 241, 48 (last chunk) | 2 | 56 s | 53 ms | 4.8 s | 4.4e-7 / 5.7e-7 |
+
+  ¹ One chunk of up to 512 columns stays one chunk, so at LNC=2 the two
+  programs split the occupied index and both gather every eri block.
+  Splitting it in two takes 1658 to 35 ms at the same compile time, but
+  2522 to 54 ms at a 552 s compile, so the wider tiling is kept.
+
+  With the NEFF cache the first call at n_ao 3508 takes 26 s. A whole
+  alkane60 / cc-pVTZ-shaped pass through `AuxStream.ao_to_mo` (97 chunks,
+  8400 aux, 207 GB uploaded from host RAM) took 43 s warm. The trnsci#115
+  run did this pass on the host in 673 s, reading the store from NVMe.
+
 - **Host inputs on native TorchNeuron (#56).** Under `"auto"`, with `eri`,
   `C_occ` and `C_vir` all on the host, the inputs are uploaded (`eri` in the
   layout given), the device route above runs, and the result is downloaded,

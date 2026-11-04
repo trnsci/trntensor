@@ -116,6 +116,19 @@ def ao_to_mo_trn2_packed(
     return _k.ao_to_mo_trn2_packed_kernel(eri_v, img, C_occ, C_vir)
 
 
+@nki_op(
+    "trntensor::ao_to_mo_trn2_packed_blocked",
+    mutates_args={},
+    fake_fn=lambda eri_v, img, C_occ, C_vir: eri_v.new_empty(
+        (C_occ.shape[1], C_vir.shape[1], img.shape[0] * eri_v.shape[1])
+    ),
+)
+def ao_to_mo_trn2_packed_blocked(
+    eri_v: torch.Tensor, img: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tensor
+) -> torch.Tensor:
+    return _k.ao_to_mo_trn2_packed_blocked_kernel(eri_v, img, C_occ, C_vir)
+
+
 def _df_half_rows(eri_v, img, tp, tail):
     tp = tp or eri_v.shape[1]
     return (img.shape[0] - 1) * tp + tail if tail else img.shape[0] * tp
@@ -182,6 +195,7 @@ KERNELS = {
     "mp2_energy_row": (_k, "mp2_energy_row_kernel"),
     "ao_to_mo_trn2": (_k, "ao_to_mo_trn2_kernel"),
     "ao_to_mo_trn2_packed": (_k, "ao_to_mo_trn2_packed_kernel"),
+    "ao_to_mo_trn2_packed_blocked": (_k, "ao_to_mo_trn2_packed_blocked_kernel"),
     "df_half_packed": (_k, "df_half_packed_kernel"),
     "df_exchange_syrk": (_k, "df_exchange_syrk_kernel"),
     "df_coulomb_d": (_k, "df_coulomb_d_kernel"),
@@ -197,6 +211,7 @@ OPS = {
     "mp2_energy_row": mp2_energy_row,
     "ao_to_mo_trn2": ao_to_mo_trn2,
     "ao_to_mo_trn2_packed": ao_to_mo_trn2_packed,
+    "ao_to_mo_trn2_packed_blocked": ao_to_mo_trn2_packed_blocked,
     "df_half_packed": df_half_packed,
     "df_exchange_syrk": df_exchange_syrk,
     "df_coulomb_d": df_coulomb_d,

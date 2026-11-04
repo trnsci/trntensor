@@ -104,6 +104,7 @@ class TestNativeDispatch:
             "mp2_energy_row",
             "ao_to_mo_trn2",
             "ao_to_mo_trn2_packed",
+            "ao_to_mo_trn2_packed_blocked",
             "df_half_packed",
             "df_exchange_syrk",
             "df_coulomb_d",
@@ -326,6 +327,46 @@ class TestNativeTrn2Kernels:
         assert torch.equal(out.cpu(), full.cpu())
         ref = torch.einsum("na,inP->iaP", C_vir, torch.einsum("mi,mnP->inP", C_occ, eri))
         torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-4)
+
+    @pytest.mark.parametrize(
+        "nbasis,nocc,nvir,naux",
+        [
+            (128, 8, 120, 128),
+            (200, 20, 180, 300),
+            (300, 200, 100, 87),  # odd chunk count: the programs split nocc
+            (256, 129, 127, 768),  # two 384-wide chunks
+            (1100, 40, 300, 96),  # 9 μ tiles: blocks of 8 + 1
+            (256, 600, 100, 128),  # five occupied blocks: two passes
+            (130, 7, 60, 1031),  # no divisor in [64, 512]: naux padded
+        ],
+    )
+    def test_ao_to_mo_trn2_packed_blocked_matches_reference(
+        self, monkeypatch, nbasis, nocc, nvir, naux
+    ):
+        """#112: the blocked packed kernel against an fp64 reference, and bit for
+        bit against the resident kernel (same per-element PSUM chains)."""
+        import trntensor
+        from trntensor.nki import dispatch
+
+        g = torch.Generator().manual_seed(nbasis + naux)
+        eri = torch.randn(nbasis, nbasis, naux, generator=g) * 0.1
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C_occ = torch.randn(nbasis, nocc, generator=g)
+        C_vir = torch.randn(nbasis, nvir, generator=g)
+        co, cv = _dev(C_occ, C_vir)
+        pk = trntensor.pack_tril(eri).to("neuron")
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO_PACKED", "blocked")
+        out = dispatch._nki_ao_to_mo_trn2_packed(pk, co, cv)
+        assert out.device.type == "neuron" and out.shape == (nocc, nvir, naux)
+        ref = torch.einsum(
+            "na,inP->iaP", C_vir.double(), torch.einsum("mi,mnP->inP", C_occ.double(), eri.double())
+        )
+        err = (out.cpu().double() - ref).abs().max() / ref.abs().max()
+        assert err < 1e-5, err
+        if naux % 128 == 0:
+            monkeypatch.setenv("TRNTENSOR_AO_TO_MO_PACKED", "resident")
+            res = dispatch._nki_ao_to_mo_trn2_packed(pk, co, cv)
+            assert torch.equal(out.cpu(), res.cpu())
 
     @pytest.mark.parametrize(
         "nbasis,nocc,naux,group,tp",

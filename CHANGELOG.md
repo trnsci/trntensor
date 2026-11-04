@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Packed `ao_to_mo_transform` on the device past n_ao ≈ 1100–1300 (#112,
+  trnsci/trnsci#115).** `ao_to_mo_trn2_packed_kernel` keeps C_occ, C_vir, one
+  chunk's gather indices and a whole μ column of eri in SBUF. At n_ao 3508
+  (alkane60 / cc-pVTZ, 87-column aux chunks) that needs 979 KiB per
+  partition against a 176 KiB budget, and at n_ao 1658 it needs 282 KiB. Both
+  cases fell back to aten, which unpacks a full square per chunk (4.3 GB at
+  3508). That first call did not finish compiling in 19 minutes. The new
+  `ao_to_mo_trn2_packed_blocked_kernel` streams every operand over blocks of
+  up to 8 μ/ν tiles, and its PSUM accumulators live across the blocks. Its
+  SBUF footprint (71–78 KiB at the measured shapes) does not depend on n_ao.
+  The aux chunk width is the chunk itself up to 512 columns, otherwise a
+  divisor in [64, 512]. So an 87-column chunk goes in without the
+  128-column padding copy (3.1 GB at n_ao 3508). Under `"auto"`, fp32 packed
+  integrals take it wherever the resident kernel does not fit, and
+  `TRNTENSOR_AO_TO_MO_PACKED=auto|resident|blocked` overrides. Measured on
+  Trn2 with one core, fp32 and synthetic packed chunks:
+  - At n_ao 3508 / nocc 241 / 87 columns the kernel takes 85 ms per chunk at
+    LNC=2 and 94 ms at LNC=1. The host fp32 route on 2 threads takes 8.6 s.
+    The cold compile takes 162 s, and 26 s with the NEFF cache.
+  - At n_ao 1658 / 161 / 384 it takes 56 ms against 6.1 s on the host, with
+    a 128 s cold compile. At 2522 / 215 / 168 it takes 73 ms against 7.9 s,
+    with a 195 s cold compile.
+  - Its maximum error against an fp64 host reference is 3.2–4.4e-7 relative
+    (3.9e-7 at 3508). The host fp32 route gets 5.4–6.6e-7.
+  - A full alkane60-shaped pass through `AuxStream.ao_to_mo` took 43 s warm
+    and 102 s including the first-call compiles (NEFF cache warm from the
+    single-chunk runs). That is 97 chunks, 8400 aux and 207 GB uploaded. The
+    96 full chunks reuse one host tensor, so no disk reads are included.
+    The trnsci#115 run did this pass on the host in 673 s, reading the store
+    from NVMe.
+  - Where the resident kernel fits, the two kernels give bit-identical
+    results, because they run the same per-element PSUM chains.
+
 ## [0.24.0] — 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

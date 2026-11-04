@@ -33,6 +33,17 @@ def _u32(*shape):
     return np.zeros(shape, dtype=np.uint32)
 
 
+def _blocked(nb, nocc, nvir, naux, rows=1000):
+    """Inputs for ``ao_to_mo_trn2_packed_blocked_kernel`` as the dispatcher pads them."""
+    from trntensor.nki._kernels import ao_to_mo_blocked_nub, ao_to_mo_blocked_tp
+
+    tp = ao_to_mo_blocked_tp(naux)
+    nub = ao_to_mo_blocked_nub(tp, nocc)
+    npc = naux // tp
+    img = _u32(npc, nb // nub, 128, nb // 128 * nub)
+    return (_r(rows * npc, tp), img, _r(nb, nocc), _r(nb, nvir)), {}
+
+
 # kernel name -> [(case label, () -> (args, kwargs))]
 KERNEL_INPUTS = {
     "matmul_kernel": [
@@ -110,6 +121,16 @@ KERNEL_INPUTS = {
                 {},
             ),
         ),
+    ],
+    # Blocked packed AO→MO (#112): (rows, TP), (NPC, NB/NUB, 128, NKB·NUB)
+    # indices, C_occ, C_vir. Row counts are cut (shapes only).
+    "ao_to_mo_trn2_packed_blocked_kernel": [
+        ("nb256_nocc32_nvir256_naux512", lambda: _blocked(256, 32, 256, 512)),
+        ("nb384_nocc200_nvir256_naux87_occsplit", lambda: _blocked(384, 200, 256, 87)),
+        ("nb1280_nocc242_nvir384_naux96_kbtail", lambda: _blocked(1280, 242, 384, 96)),
+        ("nb256_nocc129_nvir640_naux768", lambda: _blocked(256, 129, 640, 768)),
+        ("nb256_nocc600_nvir128_naux128_passes", lambda: _blocked(256, 600, 128, 128)),
+        ("nb256_nocc16_nvir128_naux48", lambda: _blocked(256, 16, 128, 48)),
     ],
     "df_half_packed_kernel": [
         # (packed (npair·NPC, TP) rows, (NPC, NVG, 128, NKB·NVC) uint32 indices, C_occ)

@@ -34,6 +34,7 @@ EXPECTED_OPS = {
     "mp2_energy_row",
     "ao_to_mo_trn2",
     "ao_to_mo_trn2_packed",
+    "ao_to_mo_trn2_packed_blocked",
     "df_half_packed",
     "df_exchange_syrk",
     "df_coulomb_d",
@@ -140,6 +141,7 @@ def native_host(monkeypatch):
         "mp2_energy_row_kernel",
         "ao_to_mo_trn2_kernel",
         "ao_to_mo_trn2_packed_kernel",
+        "ao_to_mo_trn2_packed_blocked_kernel",
         "df_half_packed_kernel",
         "df_exchange_syrk_kernel",
         "df_coulomb_d_kernel",
@@ -517,7 +519,7 @@ class TestEagerKernelTable:
             if not isinstance(node, ast.FunctionDef):
                 continue
             *pre, last = node.body
-            if not all(isinstance(n, (ast.Import, ast.ImportFrom)) for n in pre):
+            if not all(isinstance(n, ast.Import | ast.ImportFrom) for n in pre):
                 continue
             call = getattr(last, "value", None)
             if not (
@@ -735,6 +737,113 @@ class TestPublicApiOnNativePath:
             out, torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri), atol=1e-4, rtol=1e-4
         )
         assert [c[0] for c in native_host] == ["ao_to_mo_trn2_packed"]
+
+    @pytest.mark.parametrize(
+        "nbasis,naux,nocc,nvir",
+        [(40, 6, 5, 9), (130, 87, 131, 20), (200, 768, 7, 140), (60, 1031, 3, 50)],
+    )
+    def test_packed_blocked_ao_to_mo_replays_to_the_full_transform(
+        self, native_host, monkeypatch, nbasis, naux, nocc, nvir
+    ):
+        """The blocked op (#112) gets (npair·NPC, TP) rows with TP dividing naux
+        (no padding copy unless naux has no divisor in [64, 512]), NB/NUB index
+        blocks of NKB·NUB columns and padded C_occ/C_vir; replaying its gathers
+        on CPU rebuilds the square, so the result matches the full transform."""
+        from trntensor.nki._kernels import ao_to_mo_blocked_nub, ao_to_mo_blocked_tp
+
+        def blocked_op(eri_v, img, C_occ, C_vir):
+            npc, nvb, tp = img.shape[0], img.shape[1], eri_v.shape[1]
+            nbp, nocp = C_occ.shape
+            nub = nbp // nvb
+            assert img.dtype == torch.uint32 and img.shape == (npc, nvb, 128, nbp // 128 * nub)
+            assert nub == ao_to_mo_blocked_nub(tp, nocp)
+            assert nbp % 128 == 0 and C_vir.shape[1] % 128 == 0
+            if nocp > 128 and npc % 2:
+                assert nocp % 2 == 0  # the programs split the occupied index
+            idx = img.view(torch.int32).long()
+            full = torch.empty(nbp, nbp, npc * tp)
+            for c in range(npc):
+                for vb in range(nvb):
+                    for k in range(nbp // 128):
+                        blk = idx[c, vb, :, k * nub : (k + 1) * nub]
+                        rows = eri_v[blk.T.flatten()].reshape(128, nub, tp)
+                        full[
+                            k * 128 : (k + 1) * 128,
+                            vb * nub : (vb + 1) * nub,
+                            c * tp : (c + 1) * tp,
+                        ] = rows
+            return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, full)
+
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO_PACKED", "blocked")
+        _install_ops(monkeypatch, native_host, ao_to_mo_trn2_packed_blocked=blocked_op)
+        g = torch.Generator().manual_seed(nbasis)
+        eri = torch.randn(nbasis, nbasis, naux, generator=g)
+        eri = 0.5 * (eri + eri.transpose(0, 1))
+        C_occ = torch.randn(nbasis, nocc, generator=g)
+        C_vir = torch.randn(nbasis, nvir, generator=g)
+        out = trntensor.ao_to_mo_transform(trntensor.pack_tril(eri), C_occ, C_vir)
+        assert out.shape == (nocc, nvir, naux)
+        want = torch.einsum("mi,na,mnP->iaP", C_occ.double(), C_vir.double(), eri.double())
+        assert (out.double() - want).abs().max() <= 1e-5 * want.abs().max()
+        assert [c[0] for c in native_host] == ["ao_to_mo_trn2_packed_blocked"]
+        tp = ao_to_mo_blocked_tp(naux)
+        assert tp == 0 or naux % tp == 0
+
+    def test_packed_variant_choice(self, monkeypatch):
+        """'auto' keeps the resident kernel where it fits and takes the blocked
+        one beyond (n_ao 3508 needs 979 KiB resident, #112); fp32 only."""
+        f32 = torch.float32
+        assert dispatch._ao_to_mo_packed_variant(256, 32, 224, 512, f32) == "resident"
+        assert dispatch._ao_to_mo_packed_variant(3508, 241, 3267, 87, f32) == "blocked"
+        assert dispatch._ao_to_mo_packed_variant(1658, 161, 1497, 384, f32) == "blocked"
+        assert dispatch._ao_to_mo_packed_variant(3508, 241, 3267, 87, torch.bfloat16) is None
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO_PACKED", "blocked")
+        assert dispatch._ao_to_mo_packed_variant(256, 32, 224, 512, f32) == "blocked"
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO_PACKED", "resident")
+        assert dispatch._ao_to_mo_packed_variant(3508, 241, 3267, 87, f32) == "resident"
+        monkeypatch.setenv("TRNTENSOR_AO_TO_MO_PACKED", "nope")
+        with pytest.raises(ValueError, match="TRNTENSOR_AO_TO_MO_PACKED"):
+            dispatch._ao_to_mo_packed_variant(256, 32, 224, 512, f32)
+
+    def test_packed_route_takes_the_blocked_kernel_past_the_resident_budget(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "meta")
+        monkeypatch.setattr(dispatch, "_on_native_path", lambda: True)
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        n = 3508
+        big = torch.empty(n * (n + 1) // 2, 87, device="meta")
+        assert dispatch._ao_to_mo_route(big, 241, n - 241, n) == "trn2"
+        assert dispatch._ao_to_mo_route(big.to(torch.bfloat16), 241, n - 241, n) == "aten"
+
+    @pytest.mark.parametrize("nocc", [16, 161, 241, 600])
+    @pytest.mark.parametrize("naux", [48, 87, 96, 384, 512, 768, 6064])
+    def test_blocked_sbuf_does_not_grow_with_nao(self, nocc, naux):
+        from trntensor.nki._kernels import ao_to_mo_blocked_sbuf_bytes, ao_to_mo_blocked_tp
+
+        tp = ao_to_mo_blocked_tp(naux) or ao_to_mo_blocked_tp(-(-naux // 128) * 128)
+        sizes = {ao_to_mo_blocked_sbuf_bytes(nocc, tp, nb) for nb in (1024, 2048, 3584, 8192)}
+        assert len(sizes) == 1
+        assert sizes.pop() <= dispatch._AO_TO_MO_SBUF_BUDGET
+
+    @pytest.mark.parametrize(
+        "nbasis,nbp,naux,tp,nub", [(200, 256, 87, 87, 8), (256, 256, 768, 384, 2)]
+    )
+    def test_blocked_gather_images_address_the_packed_rows(self, nbasis, nbp, naux, tp, nub):
+        img = dispatch._tril_gather_images_blocked(nbasis, nbp, naux, tp, nub)
+        idx = img.view(torch.int32).long()
+        npc = naux // tp
+        rows = dispatch._tril_rows(nbasis)
+        assert idx.shape == (npc, nbp // nub, 128, nbp // 128 * nub)
+        for c in (0, npc - 1):
+            for vb in (0, nbp // nub - 1):
+                for k in range(nbp // 128):
+                    got = idx[c, vb, :, k * nub : (k + 1) * nub].T.flatten().reshape(128, nub)
+                    mu = torch.arange(k * 128, (k + 1) * 128)[:, None].expand(128, nub)
+                    nu = torch.arange(vb * nub, (vb + 1) * nub)[None, :].expand(128, nub)
+                    ok = (mu < nbasis) & (nu < nbasis)
+                    want = rows[mu.clamp(max=nbasis - 1), nu.clamp(max=nbasis - 1)] * npc + c
+                    assert torch.equal(got[ok], want[ok])
+                    assert torch.equal(got[~ok], torch.full_like(got[~ok], c))
 
     def test_packed_ao_to_mo_aten_route_unpacks(self, native_host, monkeypatch):
         monkeypatch.setenv("TRNTENSOR_AO_TO_MO", "aten")
