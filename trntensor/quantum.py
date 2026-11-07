@@ -475,12 +475,17 @@ def _ao_to_mo_contiguous_lhs(
     returns wrong values without an error (or aborts with a DMA error) once
     the right operand reaches 4 GiB (#97, aws-neuron-sdk#1448). With
     the transposes materialised (a few MB) the same products are correct.
+    A contiguous left operand is not enough once a row of
+    ``eri.reshape(nbasis, nbasis * naux)`` reaches 32 MiB
+    (``nbasis * naux >= 8,388,608`` fp32, #123): both steps go through
+    ``_neuron_matmul``, which blocks such operands by rows.
     """
     nbasis, _, naux = eri.shape
     nocc, nvir = C_occ.shape[1], C_vir.shape[1]
-    half = torch.mm(C_occ.T.contiguous(), eri.reshape(nbasis, nbasis * naux))
+    mm = _dispatch._neuron_matmul
+    half = mm(C_occ.T.contiguous(), eri.reshape(nbasis, nbasis * naux))
     half = half.reshape(nocc, nbasis, naux)
-    return torch.bmm(C_vir.T.contiguous().expand(nocc, nvir, nbasis), half)
+    return mm(C_vir.T.contiguous().expand(nocc, nvir, nbasis), half)
 
 
 # Bytes of gathered packed rows the aten df_exchange path materialises at
