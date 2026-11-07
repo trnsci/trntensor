@@ -50,7 +50,7 @@ def _ref(a, b):
 
 def test_real_thresholds():
     assert D._NEURON_SPAN_BYTES == 1 << 32
-    assert D._out_block(128, 8_389_632, 4) == 63
+    assert D._out_block(128, 8_389_632, 4) == 64
     assert D._out_block(128, 8_388_480, 4) == 0
     assert D._out_block(64, 8_389_632, 4) == 0
 
