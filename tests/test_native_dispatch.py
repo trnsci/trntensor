@@ -1303,7 +1303,7 @@ class TestNativeRoute:
         torch.testing.assert_close(
             dispatch.nki_batched_matmul(A[None], B[None]), torch.bmm(A[None], B[None])
         )
-        assert moved == [torch.matmul, torch.bmm]
+        assert moved == [dispatch._neuron_matmul, dispatch._neuron_bmm]
 
     def test_fused_quantum_kernels_off_under_auto(self, monkeypatch):
         monkeypatch.setattr(dispatch, "HAS_NKI", True)

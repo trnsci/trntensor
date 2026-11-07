@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Device matmuls with 32 MiB or longer rows were silently wrong (#123,
+  trnblas#112, aws-neuron-sdk#1457).** On the native TorchNeuron path (Trn2,
+  SDK 2.33), a device matmul returns wrong values with no error (or aborts
+  with NRT status 1203) once an operand's 128 DMA partitions span 4 GiB or
+  more, i.e. `min(rows, 128) * row_bytes >= 2**32`, and that includes a
+  contiguous left operand. Example: fp32 `(96, 128) @ (128, 8,389,632)` gave
+  rel err 0.8. Affected: the contiguous-LHS `ao_to_mo_transform` aten route
+  of #98 (0.23.0–0.25.0) when `nbasis * naux >= 8,388,608` (fp32), and
+  device `einsum` matmul / bmm plans (`nki_matmul`, `nki_batched_matmul`)
+  with such operands (0.17.0–0.25.0). These products are now cut into
+  contiguous row blocks of the long operand, each block spanning at most 2 GiB:
+  K is split (partial sums), or M / N (concatenated results). No operand is
+  copied. Splitting K changes the fp32 summation order of the affected products
+  only. Every other product is the same aten call as before (bitwise
+  unchanged). Standard DF ratios (naux about 3 × nbasis) on one core do not
+  reach it. The `_ATEN_TRANSPOSED_LHS_MAX_BYTES` comment said exactly 2**32
+  bytes was correct. That was a lucky measurement (the operand sat above an
+  identical copy), and the comment is corrected; the guard already started
+  at 2**32.
+
 ## [0.25.0] — 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
