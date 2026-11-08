@@ -1004,7 +1004,8 @@ if HAS_NKI:
 # loops unroll, so the dispatcher runs the pair over groups of aux chunks
 # (``df_group_chunks``) to bound compile time and the ``Xt`` scratch.
 
-# Bytes per partition for launch 1's buffers (of 192 KiB). 176 KiB admits
+# Bytes per partition for launch 1's buffers (of 224 KiB on Trn2, about
+# 207 KiB allocatable by NKI; 192 KiB on Trn1). 176 KiB admits
 # TP = 256, NUB = 8, NVC = 16 at n_ao = 970 (175 KiB), the fastest tiling
 # measured there (#60).
 DF_K_SBUF_BUDGET = 176 * 1024
