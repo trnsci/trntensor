@@ -1850,8 +1850,10 @@ def _nki_mp2_energy(
 # ── Native MP2 energy: per-row symmetric kernel, both cores at LNC=2 (#51) ──
 #
 # SBUF bytes per partition `mp2_energy_row_kernel` keeps live: B[i].T and
-# B[j].T (NK * NVIR each) plus the T strip block (NA * NVIR), all fp32. Trn2
-# has 192 KiB per partition; leave room for the compiler's temporaries.
+# B[j].T (NK * NVIR each) plus the T strip block (NA * NVIR), all fp32.
+# Conservative: SBUF is 192 KiB per partition on Trn1 and 224 KiB on Trn2
+# (about 207 KiB of it allocatable by NKI); leave room for the compiler's
+# temporaries.
 _MP2_ROW_SBUF_BUDGET = 144 * 1024
 
 
@@ -2147,7 +2149,8 @@ def _nki_ao_to_mo_transform(
 _AO_TO_MO_CHOICES = ("auto", "trn2", "aten", "legacy")
 # SBUF bytes per partition `ao_to_mo_trn2_kernel` keeps live (C_occ, C_vir,
 # one stage-1 eri block and X block, one stage-2 X group and B block); same
-# budget as df_exchange's launch 1 (of 192 KiB per partition). It was 144 KiB;
+# budget as df_exchange's launch 1 (of 224 KiB per partition on Trn2, about
+# 207 KiB allocatable by NKI; 192 KiB on Trn1). It was 144 KiB;
 # n_ao = 970, nocc = 161, packed naux = 4608 needs 158 KiB and compiles and
 # runs at 118 ms, where aten runs out of device memory (#80).
 _AO_TO_MO_SBUF_BUDGET = 176 * 1024
