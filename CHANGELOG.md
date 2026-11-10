@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.2] — 2026-11-10
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: integer einsum on the neuron device is exact above 2^24, and int32/int64 out= copies are exact (silent, #132)
+
 ### Fixed
 
 - **Integer einsum on the neuron device: `precision="fast"` rounded int32
