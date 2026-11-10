@@ -1093,3 +1093,88 @@ class TestBetaZeroIgnoresOut:
         got = trntensor.einsum(subscripts, *ops, alpha=alpha, beta=0.0, out=out)
         torch.testing.assert_close(got, ref)
         assert got is out  # old contents not read, result written (#77)
+
+
+class TestIntegerOnDeviceAnyPrecision:
+    """trnsci/trnsci#135: on the neuron device an integer contraction in
+    "fast" mode ran there in fp32 (int32 above 2^24 rounded), and an int32 /
+    int64 result written through ``out=`` was rounded by the device transpose
+    (aws-neuron/aws-neuron-sdk#1466). CPU stands in for the neuron device
+    (``_FP64_DEVICE_TYPES`` without "cpu")."""
+
+    @pytest.fixture
+    def as_device(self, monkeypatch):
+        E = sys.modules["trntensor.einsum"]
+        calls = []
+        real = E._host_int_einsum
+
+        def spy(subscripts, operands):
+            calls.append(subscripts)
+            return real(subscripts, operands)
+
+        monkeypatch.setattr(E, "_FP64_DEVICE_TYPES", ("cuda",))
+        monkeypatch.setattr(E, "_host_int_einsum", spy)
+        return calls
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize(
+        "subscripts,n_ops",
+        [("ij,jk->ik", 2), ("ij,jk->ki", 2), ("ji,jk->ik", 2), ("ij,jk,kl->il", 3), ("ij->ji", 1)],
+    )
+    def test_fast_integer_routes_to_host(self, as_device, dtype, subscripts, n_ops):
+        big = 2**24 + 1 if dtype == torch.int32 else 2**53 + 1
+        a = torch.tensor([[big, 2], [3, 4]], dtype=dtype)
+        eye = torch.eye(2, dtype=dtype)
+        ops = (a, eye, eye)[:n_ops]
+        got = trntensor.einsum(subscripts, *ops)
+        assert as_device == [subscripts]
+        assert got.dtype == dtype and got.is_contiguous()
+        assert torch.equal(got, torch.einsum(subscripts, *ops))
+
+    def test_bmm_integer_routes_to_host(self, as_device):
+        a = torch.tensor([[[2**24 + 1, 2]]], dtype=torch.int32)
+        b = torch.tensor([[[1], [1]]], dtype=torch.int32)
+        assert trntensor.einsum("bij,bjk->bik", a, b).item() == 2**24 + 3
+        assert as_device == ["bij,bjk->bik"]
+
+    def test_float_operands_unaffected(self, as_device):
+        a, b = torch.randn(3, 4), torch.randn(4, 2)
+        torch.testing.assert_close(trntensor.einsum("ij,jk->ik", a, b), a @ b)
+        assert as_device == []
+
+    def test_multi_einsum_integer_not_batched(self, as_device):
+        a = torch.tensor([[2**24 + 1, 2]], dtype=torch.int32)
+        b = torch.tensor([[1], [1]], dtype=torch.int32)
+        got = trntensor.multi_einsum(("ij,jk->ik", a, b), ("ij,jk->ik", a, b))
+        assert [g.item() for g in got] == [2**24 + 3, 2**24 + 3]
+        assert as_device == ["ij,jk->ik", "ij,jk->ik"]
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("out_layout", ["contiguous", "transposed"])
+    def test_out_integer_exact(self, as_device, dtype, out_layout):
+        g = torch.Generator().manual_seed(0)
+        x = torch.randint(-(2**31), 2**31 - 1, (6, 5), generator=g, dtype=torch.int32).to(dtype)
+        x = x * (2**31 + 3) if dtype == torch.int64 else x
+        out = (
+            torch.empty(5, 6, dtype=dtype)
+            if out_layout == "contiguous"
+            else torch.empty(6, 5, dtype=dtype).t()
+        )
+        assert trntensor.einsum("ij->ji", x, out=out) is out
+        assert torch.equal(out, x.t())
+
+    def test_exact_copy_uses_bit_views(self, monkeypatch):
+        E = sys.modules["trntensor.einsum"]
+        monkeypatch.setattr(E, "_FP64_DEVICE_TYPES", ("cuda",))
+        assert E._exact_bits(torch.zeros(2, dtype=torch.int32)).dtype == torch.uint32
+        assert E._exact_bits(torch.zeros(2, dtype=torch.int64)).dtype == torch.float64
+        assert E._exact_bits(torch.zeros(2)).dtype == torch.float32
+        x = torch.tensor([[2**24 + 1, -(2**31)], [2**31 - 1, 7]], dtype=torch.int32)
+        out = torch.empty(2, 2, dtype=torch.int64)
+        E._exact_copy_(out, x.t())  # a cast goes through the host
+        assert torch.equal(out, x.t().to(torch.int64))
+
+    def test_to_device_exact_is_contiguous(self):
+        E = sys.modules["trntensor.einsum"]
+        t = torch.arange(6, dtype=torch.int32).reshape(2, 3).t()
+        assert E._to_device_exact(t, torch.device("cpu")).is_contiguous()

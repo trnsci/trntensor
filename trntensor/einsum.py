@@ -205,9 +205,42 @@ def _write_out(result: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     if result.untyped_storage().data_ptr() == out.untyped_storage().data_ptr():
         if result.data_ptr() == out.data_ptr() and result.stride() == out.stride():
             return out
-        result = result.clone()
-    out.copy_(result)
+        result = _exact_bits(result).clone().view(result.dtype)
+    _exact_copy_(out, result)
     return out
+
+
+# On the TorchNeuron device every op that materializes a transposed int32 or
+# int64 layout (copy_ / clone / .contiguous() of a transposed view, an upload
+# of a transposed host view) returns int32(float32(x)), per 32-bit half for
+# int64: values above 2^24 are rounded, silently (Trn2, SDK 2.33,
+# aws-neuron/aws-neuron-sdk#1466, trnsci/trnsci#135). The same bytes viewed
+# as uint32 / float64 move exactly, so integer copies go through those views.
+_BITS_VIEW = {torch.int32: torch.uint32, torch.int64: torch.float64}
+
+
+def _exact_bits(t: torch.Tensor) -> torch.Tensor:
+    """``t`` viewed as a dtype the device moves bit-exactly (int32 -> uint32,
+    int64 -> float64); ``t`` itself on CPU/CUDA or for other dtypes."""
+    bits = _BITS_VIEW.get(t.dtype)
+    if bits is None or t.device.type in _FP64_DEVICE_TYPES:
+        return t
+    return t.view(bits)
+
+
+def _exact_copy_(out: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """``out.copy_(src)``, bit-exact for int32 / int64 on the neuron device."""
+    if src.dtype == out.dtype and src.dtype in _BITS_VIEW and src.device == out.device:
+        _exact_bits(out).copy_(_exact_bits(src))
+        return out
+    if src.dtype in _BITS_VIEW or out.dtype in _BITS_VIEW:
+        # A cast or a cross-device integer copy: cast on the host (a download
+        # of any view is exact), then move with the same-dtype bit view.
+        host = src.cpu().to(out.dtype).contiguous()
+        if out.device.type == "cpu":
+            return out.copy_(host)
+        return _exact_copy_(out, host.to(out.device))
+    return out.copy_(src)
 
 
 def _owns(result: torch.Tensor, others) -> bool:
@@ -457,6 +490,26 @@ def _host_int_einsum(subscripts: str, operands: tuple) -> torch.Tensor:
     return torch.einsum(subscripts, *(op.cpu() for op in operands))
 
 
+def _to_device_exact(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host result ``t`` on ``device``, contiguous first: an upload of a
+    transposed int32 / int64 host view is rounded through fp32 on the neuron
+    device (aws-neuron/aws-neuron-sdk#1466, trnsci/trnsci#135), and a host
+    einsum can return one (e.g. ``"ij,jk->ki"``)."""
+    return t.contiguous().to(device)
+
+
+def _integer_off_host(operands: tuple) -> bool:
+    """True for an integer / bool contraction with an operand on a device
+    without exact integer arithmetic. The neuron device computes integer
+    matmul in fp32 (int32 above 2^24 is rounded, #90) and rounds int32 /
+    int64 transposes (aws-neuron/aws-neuron-sdk#1466), so these contract on
+    the host in every precision mode."""
+    if not operands or all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
+        return False
+    promoted = functools.reduce(torch.promote_types, (op.dtype for op in operands))
+    return not (promoted.is_floating_point or promoted.is_complex)
+
+
 def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
     """Contract in true fp64 and round once to the operand dtype.
 
@@ -481,7 +534,7 @@ def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
             return torch.einsum(subscripts, *operands)
         # On the neuron device an integer contraction runs in fp32 and rounds
         # values above 2**24 (#90): contract natively on the host instead.
-        return _host_int_einsum(subscripts, operands).to(orig_device)
+        return _to_device_exact(_host_int_einsum(subscripts, operands), orig_device)
     if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
         result = torch.einsum(subscripts, *(op.to(wide) for op in operands))
         return result.to(orig_dtype)
@@ -537,6 +590,10 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
         if plan.strategy == "path" and real_float:
             return _execute_path(subscripts, operands, plan)
         return _einsum_fp64(subscripts, operands)
+    if _integer_off_host(operands):
+        # "fast" / "sr": integer contractions on the neuron device were
+        # contracted there, in fp32 (int32 above 2^24 rounded, trnsci#135).
+        return _to_device_exact(_host_int_einsum(subscripts, operands), operands[0].device)
     if plan.strategy in ("torch", "path"):
         offloaded = _offload_host_einsum(subscripts, operands, plan)
         if offloaded is not None:
@@ -715,6 +772,8 @@ def _try_batched_multi_einsum(
     meta_key = tuple((op.dtype, op.device) for op in contractions[0][1:])
     if not all(tuple((op.dtype, op.device) for op in c[1:]) == meta_key for c in contractions):
         return None
+    if _integer_off_host(contractions[0][1:]):
+        return None  # integer bmm on the device is fp32: einsum contracts on the host
 
     from .nki.dispatch import nki_batched_matmul
 
