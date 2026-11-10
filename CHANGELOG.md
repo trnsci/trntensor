@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Integer einsum on the neuron device: `precision="fast"` rounded int32
+  above 2^24, and `out=` rounded transposed int32 / int64 results** (silent,
+  #132, trnsci/trnsci#135, aws-neuron/aws-neuron-sdk#1466). Integer and bool
+  contractions with an operand on a device without exact integer arithmetic
+  now contract on the host in every precision mode (the #90 route, which
+  covered `"kahan"` only), and the result is made contiguous before it is
+  uploaded (an upload of a transposed int32 host view is rounded too).
+  `out=` copies int32 through `uint32` views and int64 through `float64`
+  views, which the device moves bit-exactly. On Trn2, `einsum("ij->ji", x,
+  out=buf)` on an int32 (64, 96) tensor had 5928 of 6144 entries wrong, and
+  `einsum("ij,jk->ik")` of `[[2^24 + 1, 2], [3, 4]]` with I gave 16777216.
+
 ## [0.25.1] — 2026-11-07
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
