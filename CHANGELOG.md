@@ -26,6 +26,18 @@ Headline: integer einsum on the neuron device is exact above 2^24, and int32/int
   views, which the device moves bit-exactly. On Trn2, `einsum("ij->ji", x,
   out=buf)` on an int32 (64, 96) tensor had 5928 of 6144 entries wrong, and
   `einsum("ij,jk->ik")` of `[[2^24 + 1, 2], [3, 4]]` with I gave 16777216.
+### Changed
+
+- **Device conformance runs are signal-only (trnsci/trnsci#35).** Under
+  `--backend nki --conformance-device neuron`, `tests/test_conformance.py`
+  marks the known platform failures `xfail(strict=False)` by category at run
+  time (`DEVICE_KNOWN`, the trnsolver#146 pattern): complex SVD / solve on
+  device (#130, 9 cases) and device float64 at fp32 precision (#92, 1 case).
+  A case that starts passing shows as XPASS. CPU CI and `auto` / `pytorch`
+  runs are unchanged. A device run prints passed, xfailed and XPASS by
+  category and the NEW failures; `--conformance-json PATH` writes it as
+  JSON, and `scripts/conformance_expect.py` merges chunked runs (exit 1 on
+  NEW failures). Test: `tests/test_device_known.py`.
 
 ## [0.25.1] — 2026-11-07
 

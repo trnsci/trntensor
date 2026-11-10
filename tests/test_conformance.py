@@ -71,6 +71,59 @@ def _conformance_backend(pytestconfig):
 
 
 # --------------------------------------------------------------------------- #
+# device-known categories (trnsci/trnsci#35)                                   #
+# --------------------------------------------------------------------------- #
+# A device conformance run (--backend nki --conformance-device neuron) has a
+# known set of platform failures. Each category has one tracking issue, and
+# the matching cases are marked xfail(strict=False) at run time, on such runs
+# only (the pattern from trnsci/trnsolver#146). A new device failure is then
+# the only red, and a known case that starts passing shows as XPASS, a signal
+# rather than a failure. CPU CI (and auto / pytorch runs) still run these
+# cases and must pass them. The summary at the end of a device run, and
+# scripts/conformance_expect.py, count them by category.
+DEVICE_KNOWN = {
+    "complex-linalg": (
+        "trnsci/trntensor#130",
+        "complex aten::_linalg_svd / _linalg_solve_ex are unsupported on the neuron device",
+    ),
+    "device-fp64": (
+        "trnsci/trntensor#92",
+        "device float64 under explicit nki computes at fp32 precision (suite fp64 policy)",
+    ),
+}
+
+# Tests whose complex-dtype cases need a complex SVD or solve on device.
+_COMPLEX_LINALG_TESTS = {"test_tucker", "test_tt_svd_error_bound", "test_cp_decompose_non_fp32"}
+# Tests that check a float64 case at a float64 tolerance without a dtype parameter.
+_FP64_TOLERANCE_TESTS = {"test_cp_reconstruct_formula"}
+
+
+def _device_known_category(node):
+    """The DEVICE_KNOWN category of a collected conformance case, or None."""
+    name = getattr(node, "originalname", None) or node.name.split("[")[0]
+    callspec = getattr(node, "callspec", None)
+    params = callspec.params if callspec is not None else {}
+    dtype = params.get("dtype")
+    if name in _COMPLEX_LINALG_TESTS and isinstance(dtype, torch.dtype) and dtype.is_complex:
+        return "complex-linalg"
+    if name in _FP64_TOLERANCE_TESTS:
+        return "device-fp64"
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _device_known_xfail(request, _conformance_backend):
+    if BACKEND != "nki" or DEV.type == "cpu":
+        return
+    cat = _device_known_category(request.node)
+    if cat is not None:
+        issue, what = DEVICE_KNOWN[cat]
+        request.applymarker(
+            pytest.mark.xfail(strict=False, reason=f"[device-known:{cat}] {issue}: {what}")
+        )
+
+
+# --------------------------------------------------------------------------- #
 # helpers                                                                      #
 # --------------------------------------------------------------------------- #
 
