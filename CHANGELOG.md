@@ -32,7 +32,7 @@ Headline: integer einsum on the neuron device is exact above 2^24, and int32/int
   `--backend nki --conformance-device neuron`, `tests/test_conformance.py`
   marks the known platform failures `xfail(strict=False)` by category at run
   time (`DEVICE_KNOWN`, the trnsolver#146 pattern): complex SVD / solve on
-  device (#130, 9 cases) and device float64 at fp32 precision (#92, 1 case).
+  device (#130, 9 cases) and device float64 at fp32 precision (#136, 1 case).
   A case that starts passing shows as XPASS. CPU CI and `auto` / `pytorch`
   runs are unchanged. A device run prints passed, xfailed and XPASS by
   category and the NEW failures; `--conformance-json PATH` writes it as

@@ -87,7 +87,7 @@ DEVICE_KNOWN = {
         "complex aten::_linalg_svd / _linalg_solve_ex are unsupported on the neuron device",
     ),
     "device-fp64": (
-        "trnsci/trntensor#92",
+        "trnsci/trntensor#136",
         "device float64 under explicit nki computes at fp32 precision (suite fp64 policy)",
     ),
 }
