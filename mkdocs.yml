@@ -26,6 +26,7 @@ nav:
       - Planning: api/plan.md
       - Decompositions: api/decompose.md
       - Quantum primitives: api/quantum.md
+      - Streaming DF integrals: api/stream.md
       - NKI dispatch: api/nki.md
   - Architecture: architecture.md
   - Benchmarks: benchmarks.md

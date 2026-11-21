@@ -19,8 +19,12 @@ which is where cuTENSOR beats cuBLAS for tensor workloads.
 
 from __future__ import annotations
 
+import functools
+import math
+
 import torch
 
+from .nki.dispatch import _fp64_host_guard
 from .plan import ContractionPlan, _parse_subscripts, plan_contraction
 
 # Mapping of user-friendly dtype strings to torch.dtype
@@ -48,6 +52,7 @@ def _resolve_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
         raise ValueError(f"unknown dtype {dtype!r}; valid strings: {sorted(_DTYPE_MAP)}") from None
 
 
+@_fp64_host_guard("einsum")
 def einsum(
     subscripts: str,
     *operands: torch.Tensor,
@@ -56,6 +61,7 @@ def einsum(
     out: torch.Tensor | None = None,
     dtype: str | torch.dtype | None = None,
     precision: str = "fast",
+    target_forward_error: float | None = None,
 ) -> torch.Tensor:
     """Einstein summation with contraction planning.
 
@@ -66,14 +72,38 @@ def einsum(
         *operands: Input tensors.
         alpha: Scalar multiplier applied to the contraction result (default 1.0).
         beta: Scalar multiplier applied to ``out`` before accumulation (default 0.0).
-        out: Optional accumulation tensor. When provided the return value is
-            ``alpha * contract(operands) + beta * out``. Must have the same
-            shape as the contraction result.
+        out: Optional output tensor, as in ``torch.einsum`` and cuTENSOR.
+            When provided, ``alpha * contract(operands) + beta * out`` is
+            written into ``out`` and ``out`` is returned. Must have the same
+            shape as the contraction result, and the result dtype must be
+            castable to ``out.dtype`` (``torch.can_cast``). With ``beta == 0``
+            (the default) the old contents of ``out`` are not read, as in BLAS
+            and cuTENSOR, so NaN or inf in it does not propagate. Like
+            ``torch.einsum(out=)``, it raises ``RuntimeError`` when grad mode
+            is on and an operand or ``out`` requires grad. ``out`` may alias
+            an operand: the result is formed before ``out`` is written.
         dtype: Optional compute dtype. When set, all operands are cast to this
             dtype before contracting and the result is returned in that dtype.
             Accepts ``torch.dtype`` instances or strings: ``"bf16"``,
             ``"bfloat16"``, ``"fp16"``, ``"float16"``, ``"f32"``, ``"float32"``.
             Matches Neuron SDK autocast recommendations for Trainium.
+        target_forward_error: Optional relative forward error bound. When set,
+            trntensor selects the cheapest precision mode whose theoretical
+            error bound satisfies the target: ``"fast"`` → ``"sr"`` → ``"dd"``
+            → ``"kahan"``. Cannot be combined with an explicit ``precision=``
+            argument. See :func:`~trntensor.select_precision_for_error` for
+            the exact error bounds used. The result is returned in the operand
+            dtype, whose unit roundoff is a floor no mode can beat (bf16
+            ≈ 3.9e-3, fp32 ≈ 6.0e-8); a target below it emits a one-time
+            ``RuntimeWarning`` and runs ``"kahan"``.
+
+    Note:
+        On Trainium (NKI 0.7+) stochastic rounding — ``precision="sr"``,
+        or ``"sr"`` chosen by ``target_forward_error`` — is a process-wide
+        Neuron Runtime setting. Set ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1``
+        before the process starts. Without it, trntensor emits a one-time
+        ``RuntimeWarning`` and the result is round-to-nearest. With it, every
+        downcast in the process rounds stochastically, including ``"fast"``.
 
     Examples:
         # Matrix multiply
@@ -82,38 +112,492 @@ def einsum(
         # Force bf16 compute (e.g. to hit NKI bf16 matmul kernel)
         einsum("ij,jk->ik", A, B, dtype="bf16")
 
-        # Scaled GEMM: 2*A@B + 0.5*C  (cuTENSOR-style alpha/beta)
+        # Scaled GEMM, in place: C = 2*A@B + 0.5*C  (cuTENSOR-style alpha/beta)
         einsum("ij,jk->ik", A, B, alpha=2.0, beta=0.5, out=C)
+
+        # In-place accumulation: acc += A@B
+        einsum("ij,jk->ik", A, B, beta=1.0, out=acc)
 
         # DF-MP2 energy contraction
         einsum("iap,jbp->ijab", B, B)
 
         # High-precision accumulation (fp64 internally, result in original dtype)
         einsum("ij,jk->ik", A, B, precision="kahan")
+
+        # Stochastic rounding: correctness requirement for BF16 K ≥ ~300
+        einsum("ij,jk->ik", A, B, precision="sr")
+
+        # Automatic precision selection: trntensor picks the cheapest mode
+        einsum("ij,jk->ik", A, B, target_forward_error=1e-4)
     """
+    if target_forward_error is not None:
+        if precision != "fast":
+            raise ValueError(
+                "Cannot specify both 'precision' and 'target_forward_error'. Use one or the other."
+            )
+        from .plan import _parse_subscripts, select_precision_for_error
+
+        _input_str, _output_str = _parse_subscripts(subscripts)
+        _size_map: dict[str, int] = {}
+        for _term, _op in zip(_input_str.split(","), operands, strict=False):
+            for _c, _s in zip(_term, _op.shape, strict=False):
+                _size_map[_c] = int(_s)
+        _contracted = {c for c in _size_map if c not in _output_str}
+        K = 1
+        for c in _contracted:
+            K *= _size_map[c]
+        eff_dtype = _resolve_dtype(dtype) or (operands[0].dtype if operands else torch.float32)
+        precision = select_precision_for_error(eff_dtype, K, target_forward_error)
+    # Early detection: ShardedTensor operands route to the sharded dispatch path.
+    from .parallel import ShardedTensor
+
+    if any(isinstance(op, ShardedTensor) for op in operands):
+        if out is not None:
+            raise NotImplementedError(
+                "The 'out' accumulation argument is not supported with ShardedTensor operands."
+            )
+        return _execute_sharded(subscripts, operands, alpha=alpha, dtype=dtype, precision=precision)
+
+    if (
+        out is not None
+        and torch.is_grad_enabled()
+        and any(isinstance(t, torch.Tensor) and t.requires_grad for t in (*operands, out))
+    ):
+        raise RuntimeError(
+            "einsum(): functions with out=... arguments don't support automatic "
+            "differentiation, but one of the arguments requires grad."
+        )
     target = _resolve_dtype(dtype)
     if target is not None:
         operands = tuple(op.to(target) for op in operands)
     plan = plan_contraction(subscripts, *operands, precision=precision)
     result = _execute_contraction(subscripts, operands, plan)
+    if out is None:
+        return result if alpha == 1.0 else _scale_add(result, alpha, beta, None, operands)
+    # BLAS / cuTENSOR / trnblas convention: with beta == 0 ``out`` is not
+    # read, so NaN or inf in it (e.g. a torch.empty buffer) cannot leak
+    # into the result through 0 * NaN.
+    addend = None if beta == 0.0 else out
+    if alpha != 1.0 or addend is not None:
+        result = _scale_add(result, alpha, beta, addend, operands)
+    return _write_out(result, out)
+
+
+def _write_out(result: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Write ``result`` into ``out`` and return ``out`` (trntensor#77).
+
+    Same checks as ``torch.einsum(out=)``: the result must fit ``out``'s shape
+    and its dtype must be castable to ``out``'s. ``result`` is fully formed
+    before ``out`` is touched, and is cloned first when it shares storage with
+    ``out`` (``out`` aliasing an operand of a view-returning contraction such
+    as ``"ij->ji"``), so aliasing cannot corrupt the result.
+    """
+    if tuple(result.shape) != tuple(out.shape):
+        raise ValueError(
+            f"einsum(): out has shape {tuple(out.shape)} but the result has shape "
+            f"{tuple(result.shape)}"
+        )
+    if not torch.can_cast(result.dtype, out.dtype):
+        raise RuntimeError(
+            f"einsum(): result type {result.dtype} can't be cast to the desired "
+            f"output type {out.dtype}"
+        )
+    if result.untyped_storage().data_ptr() == out.untyped_storage().data_ptr():
+        if result.data_ptr() == out.data_ptr() and result.stride() == out.stride():
+            return out
+        result = _exact_bits(result).clone().view(result.dtype)
+    _exact_copy_(out, result)
+    return out
+
+
+# On the TorchNeuron device every op that materializes a transposed int32 or
+# int64 layout (copy_ / clone / .contiguous() of a transposed view, an upload
+# of a transposed host view) returns int32(float32(x)), per 32-bit half for
+# int64: values above 2^24 are rounded, silently (Trn2, SDK 2.33,
+# aws-neuron/aws-neuron-sdk#1466, trnsci/trnsci#135). The same bytes viewed
+# as uint32 / float64 move exactly, so integer copies go through those views.
+_BITS_VIEW = {torch.int32: torch.uint32, torch.int64: torch.float64}
+
+
+def _exact_bits(t: torch.Tensor) -> torch.Tensor:
+    """``t`` viewed as a dtype the device moves bit-exactly (int32 -> uint32,
+    int64 -> float64); ``t`` itself on CPU/CUDA or for other dtypes."""
+    bits = _BITS_VIEW.get(t.dtype)
+    if bits is None or t.device.type in _FP64_DEVICE_TYPES:
+        return t
+    return t.view(bits)
+
+
+def _exact_copy_(out: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """``out.copy_(src)``, bit-exact for int32 / int64 on the neuron device."""
+    if src.dtype == out.dtype and src.dtype in _BITS_VIEW and src.device == out.device:
+        _exact_bits(out).copy_(_exact_bits(src))
+        return out
+    if src.dtype in _BITS_VIEW or out.dtype in _BITS_VIEW:
+        # A cast or a cross-device integer copy: cast on the host (a download
+        # of any view is exact), then move with the same-dtype bit view.
+        host = src.cpu().to(out.dtype).contiguous()
+        if out.device.type == "cpu":
+            return out.copy_(host)
+        return _exact_copy_(out, host.to(out.device))
+    return out.copy_(src)
+
+
+def _owns(result: torch.Tensor, others) -> bool:
+    """True when ``result`` may be overwritten: no autograd history to keep and
+    no storage shared with an operand or ``out`` (``torch.einsum`` can return a
+    view of its input, e.g. ``"ij->ji"``)."""
+    if result.requires_grad:
+        return False
+    ptr = result.untyped_storage().data_ptr()
+    return all(t.untyped_storage().data_ptr() != ptr for t in others if isinstance(t, torch.Tensor))
+
+
+def _scale_add(result, alpha, beta, out, operands):
+    """``alpha * result + beta * out``, in place when ``result`` is a fresh tensor.
+
+    Same float ops in the same order as ``result.mul(alpha).add(out, alpha=beta)``,
+    so the same bits. Out of place each step allocated and page-faulted a fresh
+    result-sized host tensor, which cost more than the contraction's download:
+    on Trn2, 4096³ host einsum took 32 ms bare and 68 ms with
+    ``alpha=2, beta=1, out=C`` (trnblas#61 found the same in its epilogues).
+    """
+    inplace = _owns(result, (*operands, out)) and torch.result_type(result, alpha) == result.dtype
+    if inplace and out is not None:
+        inplace = (
+            torch.broadcast_shapes(result.shape, out.shape) == result.shape
+            and torch.result_type(result, out) == result.dtype
+            and out.device == result.device
+        )
+    if not inplace:
+        if alpha != 1.0:
+            result = result.mul(alpha)
+        return result if out is None else result.add(out, alpha=beta)
     if alpha != 1.0:
-        result = result.mul(alpha)
-    if out is not None:
-        result = result.add(out, alpha=beta)
-    return result
+        result.mul_(alpha)
+    return result if out is None else result.add_(out, alpha=beta)
+
+
+def _execute_sharded(
+    subscripts: str,
+    operands: tuple,
+    alpha: float = 1.0,
+    dtype: str | torch.dtype | None = None,
+    precision: str = "fast",
+):
+    """Dispatch sharded tensor contractions (output-parallel and reduce-parallel).
+
+    Classifies each :class:`~trntensor.parallel.ShardedTensor` operand as either:
+
+    - **Output-parallel**: the partition dimension maps to an output index.
+      No cross-shard communication required — each shard is contracted
+      independently and results are assembled into a ``ShardedTensor``.
+
+    - **Reduce-parallel**: the partition dimension is a contraction index
+      (not in the output). Each shard produces a partial result of the full
+      output shape; the shards must be summed (all-reduced).
+
+      The sum goes through :func:`~trntensor.parallel.reduce_partials`. In a
+      single process it is :func:`~trntensor.parallel._mock_allreduce` over
+      every shard's partial. Under a multi-rank ``torch.distributed`` group
+      with ``world_size == n_shards``, rank ``r`` computes only shard ``r``'s
+      partial and the partials are combined by a real all-reduce
+      (``torch.distributed`` or ``nki.collectives``). See
+      :func:`~trntensor.parallel.allreduce_backend`.
+
+    Mixed output-parallel + reduce-parallel operands run as a nested loop:
+    for each output shard, the reduce-parallel partials are all-reduced.
+    """
+    from .parallel import ShardedTensor, reduce_partials, shard_boundaries
+    from .plan import _parse_subscripts
+
+    input_str, output_str = _parse_subscripts(subscripts)
+    input_terms = input_str.split(",")
+
+    if len(operands) != len(input_terms):
+        raise ValueError(
+            f"Subscript has {len(input_terms)} operand terms but {len(operands)} operands given."
+        )
+
+    # Classify each ShardedTensor operand as output-parallel or reduce-parallel.
+    output_parallel: dict[int, tuple[int, ShardedTensor]] = {}  # op_idx → (out_dim, shard_op)
+    reduce_parallel: dict[int, tuple[str, ShardedTensor]] = {}  # op_idx → (shard_char, shard_op)
+
+    for op_idx, op in enumerate(operands):
+        if not isinstance(op, ShardedTensor):
+            continue
+        shard_char = input_terms[op_idx][op.partition_dim]
+        if shard_char in output_str:
+            out_dim = list(output_str).index(shard_char)
+            output_parallel[op_idx] = (out_dim, op)
+        else:
+            reduce_parallel[op_idx] = (shard_char, op)
+
+    # Reduce-parallel metadata — needed by both the mixed and pure reduce paths.
+    rp_chars = {v[0] for v in reduce_parallel.values()}
+    rp_n_shards_set = {v[1].n_shards for v in reduce_parallel.values()}
+
+    # ------------------------------------------------------------------ #
+    # Mixed output-parallel + reduce-parallel path                         #
+    # ------------------------------------------------------------------ #
+    if output_parallel and reduce_parallel:
+        # Validate output-parallel side (same constraint as pure output-parallel)
+        if len(output_parallel) > 1:
+            out_dims = {v[0] for v in output_parallel.values()}
+            n_shards_set = {v[1].n_shards for v in output_parallel.values()}
+            if len(out_dims) > 1 or len(n_shards_set) > 1:
+                raise NotImplementedError(
+                    "Multiple ShardedTensor operands in a mixed einsum must all be "
+                    "partitioned along the same output dimension with the same n_shards. "
+                    "Heterogeneous multi-operand sharding is not yet supported."
+                )
+        # Validate reduce-parallel side (same constraint as pure reduce-parallel)
+        if len(rp_chars) > 1 or len(rp_n_shards_set) > 1:
+            raise NotImplementedError(
+                "Multiple reduce-parallel ShardedTensor operands in a mixed einsum must "
+                "all be partitioned along the same contracted dimension with the same "
+                "n_shards."
+            )
+        # Nested outer-output × inner-reduce dispatch
+        first_out_idx = next(iter(output_parallel))
+        out_dim, ref_out_shard = output_parallel[first_out_idx]
+        out_n_shards = ref_out_shard.n_shards
+        shard_char = next(iter(rp_chars))
+        ref_rp = next(iter(reduce_parallel.values()))[1]
+        rp_n = ref_rp.n_shards
+        bounds = shard_boundaries(ref_rp)
+
+        def mixed_partial(out_s: int, rp_t: int) -> torch.Tensor:
+            start, end = bounds[rp_t]
+            dense_ops = []
+            for op_idx, op in enumerate(operands):
+                if op_idx in output_parallel:
+                    chunk = output_parallel[op_idx][1].chunks[out_s]
+                    if shard_char in input_terms[op_idx]:
+                        dim_in_chunk = input_terms[op_idx].index(shard_char)
+                        slices = [slice(None)] * chunk.ndim
+                        slices[dim_in_chunk] = slice(start, end)
+                        dense_ops.append(chunk[tuple(slices)])
+                    else:
+                        dense_ops.append(chunk)
+                elif op_idx in reduce_parallel:
+                    dense_ops.append(reduce_parallel[op_idx][1].chunks[rp_t])
+                elif not isinstance(op, ShardedTensor) and shard_char in input_terms[op_idx]:
+                    dim_in_op = input_terms[op_idx].index(shard_char)
+                    slices = [slice(None)] * op.ndim
+                    slices[dim_in_op] = slice(start, end)
+                    dense_ops.append(op[tuple(slices)])
+                else:
+                    dense_ops.append(op)
+            return einsum(subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision)
+
+        output_chunks = [
+            reduce_partials(lambda t, s=out_s: mixed_partial(s, t), rp_n)
+            for out_s in range(out_n_shards)
+        ]
+
+        return ShardedTensor(output_chunks, partition_dim=out_dim)
+
+    # ------------------------------------------------------------------ #
+    # Output-parallel path                                                 #
+    # ------------------------------------------------------------------ #
+    if output_parallel:
+        if len(output_parallel) > 1:
+            # Multiple sharded operands must share the same output dim and n_shards.
+            out_dims = {v[0] for v in output_parallel.values()}
+            n_shards_set = {v[1].n_shards for v in output_parallel.values()}
+            if len(out_dims) > 1 or len(n_shards_set) > 1:
+                raise NotImplementedError(
+                    "Multiple ShardedTensor operands must all be partitioned along "
+                    "the same output dimension with the same n_shards. "
+                    "Heterogeneous multi-operand sharding is not yet supported."
+                )
+
+        first_op_idx = next(iter(output_parallel))
+        out_dim, ref_shard = output_parallel[first_op_idx]
+        n_shards = ref_shard.n_shards
+
+        results = []
+        for shard_idx in range(n_shards):
+            dense_ops = tuple(
+                (output_parallel[i][1].chunks[shard_idx] if i in output_parallel else op)
+                for i, op in enumerate(operands)
+            )
+            result_chunk = einsum(
+                subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision
+            )
+            results.append(result_chunk)
+
+        return ShardedTensor(results, partition_dim=out_dim)
+
+    # ------------------------------------------------------------------ #
+    # Pure reduce-parallel path                                            #
+    # ------------------------------------------------------------------ #
+    # rp_chars and rp_n_shards_set already computed above.
+
+    if len(rp_chars) > 1 or len(rp_n_shards_set) > 1:
+        raise NotImplementedError(
+            "Multiple reduce-parallel ShardedTensor operands must all be partitioned "
+            "along the same contracted dimension with the same n_shards."
+        )
+
+    shard_char = next(iter(rp_chars))
+    ref_shard = next(iter(reduce_parallel.values()))[1]
+    n_shards = ref_shard.n_shards
+    bounds = shard_boundaries(ref_shard)
+
+    # Dispatch per shard, co-partitioning plain operands that share shard_char.
+    def partial(shard_idx: int) -> torch.Tensor:
+        start, end = bounds[shard_idx]
+        dense_ops = []
+        for op_idx, op in enumerate(operands):
+            if op_idx in reduce_parallel:
+                dense_ops.append(op.chunks[shard_idx])
+            elif not isinstance(op, ShardedTensor) and shard_char in input_terms[op_idx]:
+                dim_in_op = input_terms[op_idx].index(shard_char)
+                slices = [slice(None)] * op.ndim
+                slices[dim_in_op] = slice(start, end)
+                dense_ops.append(op[tuple(slices)])
+            else:
+                dense_ops.append(op)
+        return einsum(subscripts, *dense_ops, alpha=alpha, dtype=dtype, precision=precision)
+
+    return reduce_partials(partial, n_shards)
+
+
+# Device types whose kernels compute genuine IEEE fp64. Anything else (the
+# TorchNeuron "neuron" device, XLA, MPS) has no fp64 datapath — Trainium
+# engines top out at fp32 — so a float64 contraction there is not a true
+# fp64 accumulation. On Trn2 (SDK 2.33) precision="kahan" on device operands
+# measured ~1.4 ulp of fp32 componentwise error, which an fp64 accumulation
+# followed by one rounding cannot produce (it is bounded by 1 ulp + K·2⁻⁵³).
+_FP64_DEVICE_TYPES = ("cpu", "cuda")
+
+
+def _wide_dtype(dtype: torch.dtype) -> torch.dtype | None:
+    """Accumulation dtype for ``precision="kahan"``: complex128 for complex
+    operands, float64 for real floating point, None (contract natively, which
+    is exact) for integer and bool operands."""
+    if dtype.is_complex:
+        return torch.complex128
+    if dtype.is_floating_point:
+        return torch.float64
+    return None
+
+
+def _host_int_einsum(subscripts: str, operands: tuple) -> torch.Tensor:
+    """Integer contraction on the host, natively (exact)."""
+    return torch.einsum(subscripts, *(op.cpu() for op in operands))
+
+
+def _to_device_exact(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host result ``t`` on ``device``, contiguous first: an upload of a
+    transposed int32 / int64 host view is rounded through fp32 on the neuron
+    device (aws-neuron/aws-neuron-sdk#1466, trnsci/trnsci#135), and a host
+    einsum can return one (e.g. ``"ij,jk->ki"``)."""
+    return t.contiguous().to(device)
+
+
+def _integer_off_host(operands: tuple) -> bool:
+    """True for an integer / bool contraction with an operand on a device
+    without exact integer arithmetic. The neuron device computes integer
+    matmul in fp32 (int32 above 2^24 is rounded, #90) and rounds int32 /
+    int64 transposes (aws-neuron/aws-neuron-sdk#1466), so these contract on
+    the host in every precision mode."""
+    if not operands or all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
+        return False
+    promoted = functools.reduce(torch.promote_types, (op.dtype for op in operands))
+    return not (promoted.is_floating_point or promoted.is_complex)
+
+
+def _einsum_fp64(subscripts: str, operands: tuple) -> torch.Tensor:
+    """Contract in true fp64 and round once to the operand dtype.
+
+    Complex operands accumulate in complex128 (casting them to float64 would
+    drop the imaginary part). Integer operands contract natively: integer
+    accumulation is already exact, while a float64 detour rounds values
+    above 2**53. Off CPU/CUDA (the neuron device computes integer matmul in
+    fp32) they contract natively on the host.
+
+    Operands on a device without native fp64 are contracted on the host and
+    the result is moved back, so the only rounding beyond the fp64
+    accumulation is the final cast to the operand dtype (``u_out``).
+    """
+    orig_dtype = operands[0].dtype if operands else torch.float32
+    orig_device = operands[0].device if operands else torch.device("cpu")
+    promoted = functools.reduce(torch.promote_types, (op.dtype for op in operands), orig_dtype)
+    if promoted.is_complex and not orig_dtype.is_complex:
+        orig_dtype = promoted  # never round a complex result to a real dtype
+    wide = _wide_dtype(promoted)
+    if wide is None:
+        if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
+            return torch.einsum(subscripts, *operands)
+        # On the neuron device an integer contraction runs in fp32 and rounds
+        # values above 2**24 (#90): contract natively on the host instead.
+        return _to_device_exact(_host_int_einsum(subscripts, operands), orig_device)
+    if all(op.device.type in _FP64_DEVICE_TYPES for op in operands):
+        result = torch.einsum(subscripts, *(op.to(wide) for op in operands))
+        return result.to(orig_dtype)
+    host = (op.to(device="cpu", dtype=wide) for op in operands)
+    result = torch.einsum(subscripts, *host).to(orig_dtype)
+    return result.to(orig_device)
 
 
 def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
     """Execute contraction according to plan."""
     if plan.precision == "kahan":
-        orig_dtype = operands[0].dtype if operands else torch.float32
-        result = torch.einsum(subscripts, *(op.to(torch.float64) for op in operands))
-        return result.to(orig_dtype)
+        return _einsum_fp64(subscripts, operands)
     elif plan.precision == "dd":
-        raise NotImplementedError(
-            "precision='dd' requires trnblas Phase 2 double-double GEMM kernels; "
-            "use precision='kahan' (fp64 accumulation) as an alternative."
-        )
+        from .nki.dispatch import HAS_NKI, _ozaki_matmul_cpu
+
+        if HAS_NKI:
+            raise NotImplementedError(
+                "precision='dd' on Trainium requires trnblas Phase 2 double-double "
+                "GEMM kernels (trnblas#22). Use precision='kahan' (fp64 accumulation) "
+                "as an alternative."
+            )
+        dts = {op.dtype for op in operands}
+        if dts == {torch.float32}:
+            # fp32 x fp32 products are exact in fp64, so fp64 accumulation
+            # (K * 2**-53) already beats the dd bound K * u_fp32**2 (#84).
+            return _einsum_fp64(subscripts, operands)
+        if dts == {torch.float64}:
+            # Double-word accumulation of exact products (#84); the generic
+            # "torch" strategy has no dd kernel and accumulates in fp64.
+            from .nki.dispatch import _dd_matmul_fp64_cpu
+
+            if plan.strategy == "matmul":
+                A, B = operands
+                a = A.T if plan.transA else A
+                b = B.T if plan.transB else B
+                return _dd_matmul_fp64_cpu(a, b)
+            if plan.strategy == "bmm":
+                return _dd_matmul_fp64_cpu(*operands)
+            if plan.strategy == "path":
+                return _execute_path(subscripts, operands, plan)
+            return _einsum_fp64(subscripts, operands)
+        # bf16/fp16 (and mixed real dtypes): Ozaki-2 for matmul; recurse for
+        # path (binary steps get Ozaki); kahan fallback for bmm and torch
+        # strategies. The Ozaki split is defined for real floating point;
+        # complex and integer operands take the exact kahan path instead (#69).
+        real_float = all(op.dtype.is_floating_point for op in operands)
+        if plan.strategy == "matmul" and real_float:
+            A, B = operands
+            a = A.T if plan.transA else A
+            b = B.T if plan.transB else B
+            result = _ozaki_matmul_cpu(a.float(), b.float(), k=2)
+            return result.to(A.dtype)
+        if plan.strategy == "path" and real_float:
+            return _execute_path(subscripts, operands, plan)
+        return _einsum_fp64(subscripts, operands)
+    if _integer_off_host(operands):
+        # "fast" / "sr": integer contractions on the neuron device were
+        # contracted there, in fp32 (int32 above 2^24 rounded, trnsci#135).
+        return _to_device_exact(_host_int_einsum(subscripts, operands), operands[0].device)
+    if plan.strategy in ("torch", "path"):
+        offloaded = _offload_host_einsum(subscripts, operands, plan)
+        if offloaded is not None:
+            return offloaded
     if plan.strategy == "torch":
         return torch.einsum(subscripts, *operands)
     elif plan.strategy == "bmm":
@@ -124,6 +608,52 @@ def _execute_contraction(subscripts: str, operands: tuple, plan: ContractionPlan
         return _execute_path(subscripts, operands, plan)
     else:
         return torch.einsum(subscripts, *operands)
+
+
+def _offload_host_einsum(subscripts: str, operands: tuple, plan: ContractionPlan):
+    """Host operands of a "torch" or "path" plan, run on the ``neuron`` device (#56).
+
+    Native path, ``"auto"`` backend, ``precision="fast"``, 2+ operands. The
+    operands are uploaded once when the contraction work (for a path, the
+    sum of its binary steps) reaches ``_EINSUM_HOST_OFFLOAD_MACS`` (matmul's
+    crossover, scaled by host threads) and ``_EINSUM_HOST_MIN_INTENSITY``
+    multiply-adds per byte moved. The plan then runs on the device (a path
+    keeps its intermediates there), and the result comes back through the
+    caching host allocator. Returns None to stay on the host.
+    ``TRNTENSOR_HOST_ROUTE=host|device`` replaces the size test.
+    """
+    if len(operands) < 2 or plan.precision != "fast" or "." in subscripts:
+        return None
+    from .nki import dispatch as d
+
+    if not (d.HAS_NKI and d._on_native_path()):
+        return None
+    input_str, output_str = _parse_subscripts(subscripts)
+    terms = input_str.split(",")
+    size: dict[str, int] = {}
+    for term, op in zip(terms, operands, strict=False):
+        for c, n in zip(term, op.shape, strict=False):
+            size[c] = int(n)
+    if plan.strategy == "path":
+        from .plan import _path_macs
+
+        work = _path_macs(terms, output_str, size, plan.contraction_path)
+    else:
+        work = math.prod(size.values())
+    moved = sum(op.numel() * op.element_size() for op in operands)
+    moved += math.prod(size[c] for c in output_str) * operands[0].element_size()
+    floor = d._EINSUM_HOST_MIN_INTENSITY * moved
+    if not d._offload_host(work, d._EINSUM_HOST_OFFLOAD_MACS, *operands, floor=floor):
+        return None
+    try:
+        result = _execute_contraction(
+            subscripts, tuple(op.to(d._NEURON_DEVICE) for op in operands), plan
+        )
+    except Exception:
+        if d._REQUIRE_NKI:
+            raise
+        return None
+    return d._to_host(result, operands[0].device)
 
 
 def _execute_matmul(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
@@ -137,7 +667,7 @@ def _execute_matmul(subscripts: str, operands: tuple, plan: ContractionPlan) -> 
     A, B = operands
     a = A.T if plan.transA else A
     b = B.T if plan.transB else B
-    return nki_matmul(a, b)
+    return nki_matmul(a, b, use_sr=(plan.precision == "sr"))
 
 
 def _execute_bmm(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
@@ -145,7 +675,7 @@ def _execute_bmm(subscripts: str, operands: tuple, plan: ContractionPlan) -> tor
     from .nki.dispatch import nki_batched_matmul
 
     A, B = operands
-    return nki_batched_matmul(A, B)
+    return nki_batched_matmul(A, B, use_sr=(plan.precision == "sr"))
 
 
 def _execute_path(subscripts: str, operands: tuple, plan: ContractionPlan) -> torch.Tensor:
@@ -184,8 +714,19 @@ def _execute_path(subscripts: str, operands: tuple, plan: ContractionPlan) -> to
                     inter_parts.append(c)
             inter_str = "".join(inter_parts)
 
-        sub = f"{inputs[i]},{inputs[j]}->{inter_str}"
-        result = torch.einsum(sub, ops[i], ops[j])
+        # Normalize operand order: _plan_binary expects A's free dims to appear
+        # before B's free dims in the output (standard matmul orientation).
+        # When the greedy path leaves operands in the wrong order (e.g.
+        # "kl,ik->il" where i comes from the second operand), swap them so the
+        # binary subscript is in canonical form.
+        step_contracted = (set(inputs[i]) | set(inputs[j])) - set(inter_str)
+        free_i = set(inputs[i]) - step_contracted
+        if inter_str and inter_str[0] not in free_i:
+            sub = f"{inputs[j]},{inputs[i]}->{inter_str}"
+            result = einsum(sub, ops[j], ops[i], precision=plan.precision)
+        else:
+            sub = f"{inputs[i]},{inputs[j]}->{inter_str}"
+            result = einsum(sub, ops[i], ops[j], precision=plan.precision)
 
         ops = [op for k, op in enumerate(ops) if k not in (i, j)] + [result]
         inputs = [inp for k, inp in enumerate(inputs) if k not in (i, j)] + [inter_str]
@@ -193,22 +734,107 @@ def _execute_path(subscripts: str, operands: tuple, plan: ContractionPlan) -> to
     return ops[0]
 
 
-def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
+def _try_batched_multi_einsum(
+    contractions: list, precision: str = "fast"
+) -> list[torch.Tensor] | None:
+    """Batch homogeneous 2D matmul contractions into a single dispatch.
+
+    Returns a result list when all contractions share the same subscript,
+    are 2-operand, resolve to strategy ``"matmul"``, and have identical
+    operand shapes. Returns ``None`` otherwise (caller falls through to
+    the per-contraction loop).
+
+    Amortizes the fixed per-launch dispatch latency (~0.67 ms on the XLA
+    path, ~0.2 ms native) across N contractions:
+    instead of N individual ``nki_matmul`` calls each paying that overhead,
+    the stack is dispatched once via ``nki_batched_matmul``.
+
+    Only optimizes ``"fast"`` and ``"sr"`` precision; ``"kahan"`` and ``"dd"``
+    fall through to the per-contraction loop which handles them correctly.
+    """
+    if precision not in ("fast", "sr"):
+        return None
+    if len(contractions) < 2:
+        return None
+    subscripts = contractions[0][0]
+    if not all(c[0] == subscripts for c in contractions):
+        return None
+    if not all(len(c) == 3 for c in contractions):
+        return None
+    plan = plan_contraction(subscripts, contractions[0][1], contractions[0][2])
+    if plan.strategy != "matmul":
+        return None
+    shape_key = (contractions[0][1].shape, contractions[0][2].shape)
+    if not all((c[1].shape, c[2].shape) == shape_key for c in contractions):
+        return None
+    # torch.stack would promote a mixed batch (float32 results came back
+    # float64) or fail on mixed devices: each result must match einsum's.
+    meta_key = tuple((op.dtype, op.device) for op in contractions[0][1:])
+    if not all(tuple((op.dtype, op.device) for op in c[1:]) == meta_key for c in contractions):
+        return None
+    if _integer_off_host(contractions[0][1:]):
+        return None  # integer bmm on the device is fp32: einsum contracts on the host
+
+    from .nki.dispatch import nki_batched_matmul
+
+    A_stack = torch.stack([c[1].T if plan.transA else c[1] for c in contractions])
+    B_stack = torch.stack([c[2].T if plan.transB else c[2] for c in contractions])
+    out_stack = nki_batched_matmul(A_stack, B_stack, use_sr=(precision == "sr"))
+    from .nki.dispatch import _from_device, _is_device_tensor
+
+    if _is_device_tensor(out_stack):
+        out_stack = _from_device(out_stack)
+    return [out_stack[i] for i in range(len(contractions))]
+
+
+@_fp64_host_guard("multi_einsum", results_on_host=True)
+def multi_einsum(
+    *contractions: tuple,
+    precision: str = "fast",
+    target_forward_error: float | None = None,
+) -> list[torch.Tensor]:
     """Execute multiple contractions, fusing where possible.
 
     Each contraction is (subscripts, *operands).
     Returns list of results.
 
     Shared operands (same tensor object appearing in more than one
-    contraction) are pre-pinned to XLA once when NKI is available,
-    avoiding repeated host→device transfers.
+    contraction) are pre-pinned to the Neuron device once when NKI is
+    available (``neuron`` on TorchNeuron, XLA on Trn1), avoiding repeated
+    host→device transfers. Device-resident results are returned on CPU.
+
+    When all contractions are homogeneous — same subscript, same operand
+    shapes, 2-operand matmul — they are stacked and dispatched as a single
+    ``nki_batched_matmul`` call, amortizing the fixed XLA dispatch overhead
+    across the batch. Heterogeneous contractions fall through to the
+    per-contraction loop.
+
+    Args:
+        *contractions: Each element is ``(subscripts, *operands)``.
+        precision: Accumulation precision applied to every contraction.
+            ``"fast"`` (default), ``"kahan"``, ``"sr"``, or ``"dd"``.
+            Homogeneous batching is only attempted for ``"fast"`` and
+            ``"sr"``; other modes fall through to the per-contraction loop.
+            On Trainium, ``"sr"`` requires ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1``
+            at process start (see :func:`einsum`).
+        target_forward_error: Optional relative forward error bound. When set,
+            trntensor selects the cheapest precision mode per contraction.
+            For homogeneous batching the mode is resolved from the first
+            contraction's K and dtype (all share the same shape). For the
+            per-contraction fallback each call resolves independently.
+            Cannot be combined with an explicit ``precision=`` argument.
 
     Useful for DF-MP2 where many independent contractions share operands:
         results = multi_einsum(
             ("iap,jbp->ijab", B, B),
             ("ibp,jap->ijab", B, B),  # Exchange term
+            precision="sr",
         )
     """
+    if target_forward_error is not None and precision != "fast":
+        raise ValueError(
+            "Cannot specify both 'precision' and 'target_forward_error'. Use one or the other."
+        )
     from .nki.dispatch import HAS_NKI, _use_nki
 
     # Count appearances of each tensor object across all contractions
@@ -221,21 +847,73 @@ def multi_einsum(*contractions: tuple) -> list[torch.Tensor]:
             id_count[tid] = id_count.get(tid, 0) + 1
     shared_ids = {tid for tid, n in id_count.items() if n > 1}
 
-    # Pre-pin shared tensors to XLA once (only when NKI dispatch is active)
-    xla_map: dict[int, torch.Tensor] = {}
-    if HAS_NKI and _use_nki() and shared_ids:
-        from .nki.dispatch import to_xla
+    # Pre-pin shared tensors to the device once (only when NKI dispatch is
+    # active). Path-aware: "neuron" on TorchNeuron, XLA on the XLA lineage.
+    # Every operand of a contraction that uses a pinned tensor is pinned too:
+    # a contraction must not mix host and device operands (aten raises
+    # "input tensor is on cpu device, expected neuron" on the native path).
+    # Host float64 / complex128 is computed in host torch (the fp64 policy,
+    # #92): a batch with any such contraction is not pinned, since pinning it
+    # would compute it in device aten at fp32 precision.
+    from .nki.dispatch import _fp64_stays_on_host
 
-        xla_map = {tid: to_xla(id_to_tensor[tid]) for tid in shared_ids}
+    pinned_map: dict[int, torch.Tensor] = {}
+    if (
+        HAS_NKI
+        and _use_nki()
+        and shared_ids
+        and not any(_fp64_stays_on_host(*c[1:]) for c in contractions)
+    ):
+        from .nki.dispatch import _to_device
 
+        pin_ids = set(shared_ids)
+        for c in contractions:
+            ids = [id(op) for op in c[1:]]
+            if any(tid in shared_ids for tid in ids):
+                pin_ids.update(ids)
+        pinned_map = {tid: _to_device(id_to_tensor[tid]) for tid in pin_ids}
+
+    # Build substituted contraction list with pre-pinned operands applied
+    subst = [(c[0], *(pinned_map.get(id(op), op) for op in c[1:])) for c in contractions]
+
+    # Pre-resolve target_forward_error → precision for the homogeneous batching
+    # path (_try_batched_multi_einsum accepts only precision=). All contractions
+    # in a homogeneous batch share the same subscript and operand shapes, so K
+    # is computed once from the first contraction.
+    batched_precision = precision
+    if target_forward_error is not None and subst:
+        from .plan import _parse_subscripts, select_precision_for_error
+
+        _c0 = subst[0]
+        _input_str, _output_str = _parse_subscripts(_c0[0])
+        _size_map: dict[str, int] = {}
+        for _term, _op in zip(_input_str.split(","), _c0[1:], strict=False):
+            for _ch, _sz in zip(_term, _op.shape, strict=False):
+                _size_map[_ch] = int(_sz)
+        _K = 1
+        for _ch in {_ch for _ch in _size_map if _ch not in _output_str}:
+            _K *= _size_map[_ch]
+        _dtype = _c0[1].dtype if len(_c0) > 1 else torch.float32
+        batched_precision = select_precision_for_error(_dtype, _K, target_forward_error)
+
+    # Try homogeneous batching: N same-shape matmuls → one batched dispatch
+    batched = _try_batched_multi_einsum(subst, precision=batched_precision)
+    if batched is not None:
+        return batched
+
+    # Fallback: per-contraction loop — pass target_forward_error so each call
+    # resolves its own K independently (optimal for heterogeneous contractions).
     results = []
-    for c in contractions:
+    for c in subst:
         subscripts = c[0]
-        ops = tuple(xla_map.get(id(op), op) for op in c[1:])
-        result = einsum(subscripts, *ops)
-        if hasattr(result, "device") and result.device.type == "xla":
-            from .nki.dispatch import from_xla
+        ops = c[1:]
+        result = einsum(
+            subscripts, *ops, precision=precision, target_forward_error=target_forward_error
+        )
+        if hasattr(result, "device"):
+            from .nki.dispatch import _from_device, _is_device_tensor
 
-            result = from_xla(result)
+            if _is_device_tensor(result):
+                result = _from_device(result)
         results.append(result)
     return results

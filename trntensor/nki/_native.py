@@ -1,0 +1,219 @@
+"""
+Native TorchNeuron registration of the trntensor NKI kernels.
+
+On the TorchNeuron lineage (Neuron SDK 2.33+, torch-neuronx 2.14,
+PyTorch 2.14, Trn2/Trn3), Trainium is a native PyTorch `neuron` device
+and an `@nki.jit` kernel is exposed to PyTorch as a custom operator via
+`torch_neuronx.nki_op`. Each wrapper below calls an existing kernel from
+`_kernels.py` unchanged; the op schema is inferred from the annotations.
+
+Importing this module registers the ops, so `dispatch.py` imports it only
+after selecting the native path. CPU-only installs and the Trn1 / XLA
+lineage (whose `torch_neuronx` has no `nki_op`) never load it.
+
+This module deliberately does not use `from __future__ import annotations`:
+`nki_op` builds the op schema from the live annotation objects.
+
+The kernels are looked up on `_kernels` at call time rather than imported
+by name, so registration itself does not trace or compile anything; the
+first call per input shape (and per `use_sr`) does.
+
+The reduce-parallel all-reduce kernel (`collectives.py`) is not registered
+here: its `ReplicaGroup` argument is a compile-time constant that a custom
+op schema cannot carry, so it keeps its own `torch_neuronx.wrap_nki` launch,
+which is already native-only.
+"""
+
+import torch
+from torch_neuronx import nki_op
+
+from . import _kernels as _k
+
+# Fake (meta) implementations: output shape/dtype only, no kernel trace.
+# Used by torch.compile tracing and for meta-device inputs.
+
+
+@nki_op(
+    "trntensor::matmul",
+    mutates_args={},
+    fake_fn=lambda a, b, use_sr=False: a.new_empty((a.shape[0], b.shape[1])),
+)
+def matmul(a: torch.Tensor, b: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
+    return _k.matmul_kernel(a, b, use_sr=use_sr)
+
+
+@nki_op(
+    "trntensor::batched_matmul",
+    mutates_args={},
+    fake_fn=lambda a, b, use_sr=False: a.new_empty((a.shape[0], a.shape[1], b.shape[2])),
+)
+def batched_matmul(a: torch.Tensor, b: torch.Tensor, use_sr: bool = False) -> torch.Tensor:
+    return _k.batched_matmul_kernel(a, b, use_sr=use_sr)
+
+
+@nki_op(
+    "trntensor::mp2_energy",
+    mutates_args={},
+    fake_fn=lambda B_T, eps_occ_b, eps_vir, eps_vir_b: B_T.new_empty(
+        (B_T.shape[0], B_T.shape[0]), dtype=torch.float32
+    ),
+)
+def mp2_energy(
+    B_T: torch.Tensor,
+    eps_occ_b: torch.Tensor,
+    eps_vir: torch.Tensor,
+    eps_vir_b: torch.Tensor,
+) -> torch.Tensor:
+    return _k.mp2_energy_kernel(B_T, eps_occ_b, eps_vir, eps_vir_b)
+
+
+@nki_op(
+    "trntensor::ao_to_mo_transform",
+    mutates_args={},
+    fake_fn=lambda eri, C_occ, C_vir: eri.new_empty((C_occ.shape[1], C_vir.shape[1], eri.shape[2])),
+)
+def ao_to_mo_transform(eri: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tensor) -> torch.Tensor:
+    return _k.ao_to_mo_transform_kernel(eri, C_occ, C_vir)
+
+
+@nki_op(
+    "trntensor::mp2_energy_row",
+    mutates_args={},
+    fake_fn=lambda bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row: bt_i.new_empty(
+        (128, Bw.shape[0]), dtype=torch.float32
+    ),
+)
+def mp2_energy_row(
+    bt_i: torch.Tensor,
+    Bw: torch.Tensor,
+    eps_occ_i: torch.Tensor,
+    eps_occ_w: torch.Tensor,
+    eps_vir_col: torch.Tensor,
+    eps_vir_row: torch.Tensor,
+) -> torch.Tensor:
+    return _k.mp2_energy_row_kernel(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row)
+
+
+@nki_op(
+    "trntensor::ao_to_mo_trn2",
+    mutates_args={},
+    fake_fn=lambda eri, C_occ, C_vir: eri.new_empty((C_occ.shape[1], C_vir.shape[1], eri.shape[2])),
+)
+def ao_to_mo_trn2(eri: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tensor) -> torch.Tensor:
+    return _k.ao_to_mo_trn2_kernel(eri, C_occ, C_vir)
+
+
+@nki_op(
+    "trntensor::ao_to_mo_trn2_packed",
+    mutates_args={},
+    fake_fn=lambda eri_v, img, C_occ, C_vir: eri_v.new_empty(
+        (C_occ.shape[1], C_vir.shape[1], img.shape[0] * eri_v.shape[1])
+    ),
+)
+def ao_to_mo_trn2_packed(
+    eri_v: torch.Tensor, img: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tensor
+) -> torch.Tensor:
+    return _k.ao_to_mo_trn2_packed_kernel(eri_v, img, C_occ, C_vir)
+
+
+@nki_op(
+    "trntensor::ao_to_mo_trn2_packed_blocked",
+    mutates_args={},
+    fake_fn=lambda eri_v, img, C_occ, C_vir: eri_v.new_empty(
+        (C_occ.shape[1], C_vir.shape[1], img.shape[0] * eri_v.shape[1])
+    ),
+)
+def ao_to_mo_trn2_packed_blocked(
+    eri_v: torch.Tensor, img: torch.Tensor, C_occ: torch.Tensor, C_vir: torch.Tensor
+) -> torch.Tensor:
+    return _k.ao_to_mo_trn2_packed_blocked_kernel(eri_v, img, C_occ, C_vir)
+
+
+def _df_half_rows(eri_v, img, tp, tail):
+    tp = tp or eri_v.shape[1]
+    return (img.shape[0] - 1) * tp + tail if tail else img.shape[0] * tp
+
+
+@nki_op(
+    "trntensor::df_half_packed",
+    mutates_args={},
+    fake_fn=lambda eri_v, img, C_occ, nub=8, tp=0, tail=0: eri_v.new_empty(
+        (
+            _df_half_rows(eri_v, img, tp, tail),
+            img.shape[1],
+            C_occ.shape[1],
+            C_occ.shape[0] // img.shape[1],
+        ),
+        dtype=torch.float32,  # the kernel's Xt is fp32 whatever eri_v's dtype
+    ),
+)
+def df_half_packed(
+    eri_v: torch.Tensor,
+    img: torch.Tensor,
+    C_occ: torch.Tensor,
+    nub: int = 8,
+    tp: int = 0,
+    tail: int = 0,
+) -> torch.Tensor:
+    return _k.df_half_packed_kernel(eri_v, img, C_occ, nub=nub, tp=tp, tail=tail)
+
+
+@nki_op(
+    "trntensor::df_exchange_syrk",
+    mutates_args={},
+    fake_fn=lambda xt, kin, banks=6: kin.new_empty(kin.shape),
+)
+def df_exchange_syrk(xt: torch.Tensor, kin: torch.Tensor, banks: int = 6) -> torch.Tensor:
+    return _k.df_exchange_syrk_kernel(xt, kin, banks=banks)
+
+
+@nki_op(
+    "trntensor::df_coulomb_d",
+    mutates_args={},
+    fake_fn=lambda B, pw: B.new_empty((2, 1, B.shape[1]), dtype=torch.float32),
+)
+def df_coulomb_d(B: torch.Tensor, pw: torch.Tensor) -> torch.Tensor:
+    return _k.df_coulomb_d_kernel(B, pw)
+
+
+@nki_op(
+    "trntensor::df_coulomb_j",
+    mutates_args={},
+    fake_fn=lambda B, d_b: B.new_empty((128, (B.shape[0] // 256) * 2), dtype=torch.float32),
+)
+def df_coulomb_j(B: torch.Tensor, d_b: torch.Tensor) -> torch.Tensor:
+    return _k.df_coulomb_j_kernel(B, d_b)
+
+
+# The kernel each single-kernel op's body calls, as (module, attribute), for
+# the eager handle in `dispatch._native_call`; resolved there at call time.
+KERNELS = {
+    "matmul": (_k, "matmul_kernel"),
+    "batched_matmul": (_k, "batched_matmul_kernel"),
+    "mp2_energy": (_k, "mp2_energy_kernel"),
+    "ao_to_mo_transform": (_k, "ao_to_mo_transform_kernel"),
+    "mp2_energy_row": (_k, "mp2_energy_row_kernel"),
+    "ao_to_mo_trn2": (_k, "ao_to_mo_trn2_kernel"),
+    "ao_to_mo_trn2_packed": (_k, "ao_to_mo_trn2_packed_kernel"),
+    "ao_to_mo_trn2_packed_blocked": (_k, "ao_to_mo_trn2_packed_blocked_kernel"),
+    "df_half_packed": (_k, "df_half_packed_kernel"),
+    "df_exchange_syrk": (_k, "df_exchange_syrk_kernel"),
+    "df_coulomb_d": (_k, "df_coulomb_d_kernel"),
+    "df_coulomb_j": (_k, "df_coulomb_j_kernel"),
+}
+
+# Keyed by the short op name used in `dispatch._launch`.
+OPS = {
+    "matmul": matmul,
+    "batched_matmul": batched_matmul,
+    "mp2_energy": mp2_energy,
+    "ao_to_mo_transform": ao_to_mo_transform,
+    "mp2_energy_row": mp2_energy_row,
+    "ao_to_mo_trn2": ao_to_mo_trn2,
+    "ao_to_mo_trn2_packed": ao_to_mo_trn2_packed,
+    "ao_to_mo_trn2_packed_blocked": ao_to_mo_trn2_packed_blocked,
+    "df_half_packed": df_half_packed,
+    "df_exchange_syrk": df_exchange_syrk,
+    "df_coulomb_d": df_coulomb_d,
+    "df_coulomb_j": df_coulomb_j,
+}

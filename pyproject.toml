@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=77.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "trntensor"
-version = "0.4.0"
+version = "0.25.2"
 description = "Tensor contractions for AWS Trainium via NKI"
 readme = "README.md"
 license = "Apache-2.0"
@@ -25,11 +25,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+neuron = [
+    # PyTorch/XLA lineage (Trn1, and Trn2 on PyTorch 2.9). NKI 0.3.0 Stable
+    # (Neuron SDK 2.29) promotes `nki.*` as the canonical namespace. Ships with
+    # the Deep Learning AMI Neuron or via https://pip.repos.neuron.amazonaws.com.
+    "nki>=0.3.0",
+    "torch-neuronx>=2.9",
+]
+torchneuron = [
+    # TorchNeuron / native PyTorch (Neuron SDK 2.33+, Trn2/Trn3; torch-neuronx
+    # 2.14 itself requires Python >= 3.12). Install with
+    # --extra-index-url https://pip.repos.neuron.amazonaws.com. The nki floor
+    # also keeps pip off the unrelated `nki` 0.0.1 on public PyPI.
+    "torch>=2.14",
+    "torch-neuronx>=2.14",
+    "nki>=0.6",
+]
 dev = [
-    "pytest>=7.0",
+    "pytest>=7.0,<9",  # pytest-benchmark 5.3 breaks on pytest 9 (Function._nodeid)
     "pytest-benchmark>=4.0",
     "pytest-cov>=4.0",
-    "ruff>=0.6",
+    "ruff==0.17.3",
     "pre-commit>=3.7",
     "scipy>=1.11",
     "mkdocs>=1.5",
@@ -47,11 +63,13 @@ include = ["trntensor*"]
 
 # Neuron SDK note: on-hardware runs use the AWS Deep Learning AMI's
 # pre-built venv at /opt/aws_neuronx_venv_pytorch_*, which bundles
-# neuronxcc and the NKI runtime. There is no pip-install step for Neuron —
-# the DLAMI's terraform `most_recent = true` pulls the current image and
-# its venv tracks the current SDK (2.29 as of 2026-04-09, with NKI 0.3.0
-# Stable and the CPU simulator). trntensor does not declare neuronxcc in
-# its dep set; CPU-only installs resolve cleanly from PyPI.
+# the NKI runtime. The DLAMI's terraform `most_recent = true` pulls the
+# current image and its venv tracks the current SDK. Outside the DLAMI, use
+# the `[torchneuron]` (Trn2/Trn3, native) or `[neuron]` (Trn1, PyTorch/XLA)
+# extra with the Neuron pip repo. Both lineages publish a package named
+# `torch-neuronx`, so pip markers cannot pick between them; choose the extra
+# that matches the instance. The base dependency set stays CPU-only and
+# resolves cleanly from PyPI.
 
 [tool.ruff]
 # Match the rest of the trnsci suite. Line length 100 is a compromise
@@ -84,6 +102,9 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.pytest.ini_options]
-markers = ["neuron: requires Neuron hardware"]
+markers = [
+    "neuron: requires Neuron hardware",
+    "neuron_sr: stochastic-rounding hardware test; needs NEURON_RT_STOCHASTIC_ROUNDING_EN=1 at process start",
+]
 testpaths = ["tests"]
 python_files = ["test_*.py", "bench_*.py"]

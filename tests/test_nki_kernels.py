@@ -14,6 +14,20 @@ pytestmark = pytest.mark.neuron
 ATOL = 1e-3
 RTOL = 1e-4
 
+_THRESHOLDS = (
+    "_MIN_NKI_FLOPS",
+    "_MIN_NKI_FLOPS_PINNED",
+    "_MIN_NKI_FLOPS_NATIVE",
+    "_MIN_NKI_FLOPS_NATIVE_PINNED",
+)
+
+
+def _device_type() -> str:
+    """Device type operands are pinned to on the active dispatch path."""
+    from trntensor.nki import dispatch
+
+    return "neuron" if dispatch._get_dispatch_path() == "native" else "xla"
+
 
 @pytest.fixture
 def nki_backend(monkeypatch):
@@ -25,7 +39,9 @@ def nki_backend(monkeypatch):
     import trntensor
     from trntensor.nki import dispatch
 
-    monkeypatch.setattr(dispatch, "_MIN_NKI_FLOPS", 0)
+    # Every threshold, so this holds on both the native and the XLA path.
+    for name in _THRESHOLDS:
+        monkeypatch.setattr(dispatch, name, 0)
     prev = trntensor.get_backend()
     trntensor.set_backend("nki")
     yield
@@ -257,46 +273,62 @@ class TestAoToMoTransformKTiling:
         e_ref = _cpu_mp2_energy(B_ref, eps_occ, eps_vir)
         torch.testing.assert_close(e, e_ref, atol=1e-3, rtol=1e-4)
 
-    def test_oversize_raises(self, nki_backend):
-        """nvir > 128 or naux > 128 should raise until K/M tiling lands."""
-        import pytest
-
+    def test_mp2_nvir_over_128_tiles(self, nki_backend):
+        """nvir > 128 used to raise; the M-tiled MP2 kernel now pads 200 → 256
+        and runs two m/n tiles per side."""
         import trntensor
+        from trntensor.quantum import _cpu_mp2_energy
 
-        B = torch.randn(2, 200, 50)
-        with pytest.raises(NotImplementedError, match="nvir.*≤.*128"):
-            trntensor.mp2_energy(B, torch.randn(2), torch.randn(200))
+        B = torch.randn(2, 200, 50) * 0.1
+        eps_occ = -torch.sort(torch.rand(2))[0] - 0.5
+        eps_vir = torch.sort(torch.rand(200))[0] + 0.1
+        e = trntensor.mp2_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(e, _cpu_mp2_energy(B, eps_occ, eps_vir), atol=1e-3, rtol=1e-4)
 
 
 class TestXlaResidency:
     """Expose Trainium's data-locality architecture at the user level.
 
-    ``to_xla`` / ``from_xla`` let callers pre-pin operands so repeated
-    trntensor calls skip the host↔device transfer that otherwise
-    dominates dispatch overhead.
+    ``to_device`` / ``from_device`` (and the older ``to_xla`` / ``from_xla``)
+    let callers pre-pin operands so repeated trntensor calls skip the
+    host↔device transfer that otherwise dominates dispatch overhead. The
+    device is ``neuron`` on the native TorchNeuron path and ``xla`` on the
+    PyTorch/XLA path.
     """
 
     def test_matmul_stays_on_xla(self, nki_backend):
-        """With operands on XLA, the result is also on XLA — caller
-        decides when to pull back."""
+        """With operands on the device, the result stays on the device —
+        caller decides when to pull back. Path-aware: on TorchNeuron
+        ``to_xla`` places on ``neuron``; on Trn1 it is the XLA device."""
         import trntensor
-        from trntensor.nki import dispatch
 
-        prev = dispatch._MIN_NKI_FLOPS
-        dispatch._MIN_NKI_FLOPS = 0
-        try:
-            torch.manual_seed(0)
-            A = trntensor.to_xla(torch.randn(128, 128))
-            B = trntensor.to_xla(torch.randn(128, 256))
-            out = trntensor.einsum("ij,jk->ik", A, B)
-            assert out.device.type == "xla", f"expected xla, got {out.device}"
+        expected = _device_type()
+        torch.manual_seed(0)
+        A = trntensor.to_xla(torch.randn(128, 128))
+        B = trntensor.to_xla(torch.randn(128, 256))
+        assert A.device.type == expected, f"expected {expected}, got {A.device}"
+        out = trntensor.einsum("ij,jk->ik", A, B)
+        assert out.device.type == expected, f"expected {expected}, got {out.device}"
 
-            # from_xla brings it back; content matches a CPU-only run.
-            out_cpu = trntensor.from_xla(out)
-            ref = trntensor.from_xla(A) @ trntensor.from_xla(B)
-            torch.testing.assert_close(out_cpu, ref, atol=ATOL, rtol=RTOL)
-        finally:
-            dispatch._MIN_NKI_FLOPS = prev
+        # from_xla brings it back; content matches a CPU-only run.
+        out_cpu = trntensor.from_xla(out)
+        assert out_cpu.device.type == "cpu"
+        ref = trntensor.from_xla(A) @ trntensor.from_xla(B)
+        torch.testing.assert_close(out_cpu, ref, atol=ATOL, rtol=RTOL)
+
+    def test_matmul_stays_on_device(self, nki_backend):
+        """Same contract through the path-neutral ``to_device`` / ``from_device``."""
+        import trntensor
+
+        expected = _device_type()
+        torch.manual_seed(0)
+        A = trntensor.to_device(torch.randn(128, 128))
+        B = trntensor.to_device(torch.randn(128, 256))
+        out = trntensor.einsum("ij,jk->ik", A, B)
+        assert out.device.type == expected, f"expected {expected}, got {out.device}"
+        out_cpu = trntensor.from_device(out)
+        ref = trntensor.from_device(A) @ trntensor.from_device(B)
+        torch.testing.assert_close(out_cpu, ref, atol=ATOL, rtol=RTOL)
 
     @pytest.mark.skip(
         reason="NKI compiler emits trn2-only shared-memory instructions when "
@@ -325,7 +357,7 @@ class TestXlaResidency:
         eps_vir_x = trntensor.to_xla(eps_vir)
 
         B_x = trntensor.ao_to_mo_transform(eri_x, C_occ_x, C_vir_x)
-        assert B_x.device.type == "xla"
+        assert B_x.device.type == _device_type()
         E_x = trntensor.mp2_energy(B_x, eps_occ_x, eps_vir_x)
         E = trntensor.from_xla(E_x)
 
@@ -341,33 +373,32 @@ class TestXlaResidency:
         import time
 
         import trntensor
-        from trntensor.nki import dispatch
 
         torch.manual_seed(0)
         A = torch.randn(2048, 2048)
         B = torch.randn(2048, 2048)
         N_ITERS = 5
 
-        prev = dispatch._MIN_NKI_FLOPS
-        dispatch._MIN_NKI_FLOPS = 0
-        try:
-            # Cold path: transfer per iteration.
-            trntensor.einsum("ij,jk->ik", A, B)  # warmup
-            t0 = time.perf_counter()
-            for _ in range(N_ITERS):
-                _ = trntensor.einsum("ij,jk->ik", A, B)
-            t_cold = time.perf_counter() - t0
+        # Cold path: transfer per iteration (thresholds zeroed by nki_backend).
+        trntensor.einsum("ij,jk->ik", A, B)  # warmup
+        t0 = time.perf_counter()
+        for _ in range(N_ITERS):
+            _ = trntensor.einsum("ij,jk->ik", A, B)
+        t_cold = time.perf_counter() - t0
 
-            # Residency: transfer once.
-            A_x = trntensor.to_xla(A)
-            B_x = trntensor.to_xla(B)
-            trntensor.einsum("ij,jk->ik", A_x, B_x)  # warmup
-            t0 = time.perf_counter()
-            for _ in range(N_ITERS):
-                _ = trntensor.einsum("ij,jk->ik", A_x, B_x)
-            t_hot = time.perf_counter() - t0
-        finally:
-            dispatch._MIN_NKI_FLOPS = prev
+        # Residency: transfer once.
+        A_x = trntensor.to_xla(A)
+        B_x = trntensor.to_xla(B)
+        trntensor.einsum("ij,jk->ik", A_x, B_x)  # warmup
+        t0 = time.perf_counter()
+        for _ in range(N_ITERS):
+            _ = trntensor.einsum("ij,jk->ik", A_x, B_x)
+        if A_x.device.type == "neuron":
+            # Native eager launches are asynchronous; wait before stopping the clock.
+            import torch_neuronx
+
+            torch_neuronx.synchronize()
+        t_hot = time.perf_counter() - t0
 
         speedup = t_cold / t_hot
         # Loose bar — profile suggests ~10x. Allow 3x for HW variance.
@@ -375,3 +406,48 @@ class TestXlaResidency:
             f"residency speedup {speedup:.2f}× below 3× floor "
             f"(cold={t_cold * 1e3:.1f}ms, hot={t_hot * 1e3:.1f}ms)"
         )
+
+
+@pytest.mark.neuron_sr
+class TestStochasticRoundingRuntime:
+    """SR on NKI 0.7+ is process-wide, from ``NEURON_RT_STOCHASTIC_ROUNDING_EN``
+    at runtime init (#41). Run in a process launched with the variable set::
+
+        NEURON_RT_STOCHASTIC_ROUNDING_EN=1 pytest tests/test_nki_kernels.py -m neuron_sr
+
+    BF16 output of an FP32-accumulated matmul: under SR most elements vary
+    run to run and the signed error is mean-zero; under RNE every run is
+    identical. Measured on Trn2 (SDK 2.33): ~77% of elements vary.
+    """
+
+    RUNS = 8
+
+    def _runs(self, precision):
+        import warnings
+
+        import trntensor
+
+        torch.manual_seed(0)
+        A = torch.randn(128, 128).bfloat16()
+        B = torch.randn(128, 512).bfloat16()
+        exact = A.double() @ B.double()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)  # guard must stay quiet
+            outs = [
+                trntensor.einsum("ij,jk->ik", A, B, precision=precision) for _ in range(self.RUNS)
+            ]
+        stack = torch.stack([o.double() for o in outs])
+        varying = (stack != stack[0]).any(dim=0).double().mean().item()
+        err = stack - exact
+        return varying, err.mean().item(), err.abs().mean().item()
+
+    def test_sr_rounds_stochastically(self, sr_runtime, nki_backend):
+        varying, mean_err, mean_abs = self._runs("sr")
+        assert varying > 0.25, f"only {varying:.1%} of elements vary run to run"
+        assert abs(mean_err) < 0.1 * mean_abs, (mean_err, mean_abs)
+
+    def test_fast_is_also_stochastic_under_sr_runtime(self, sr_runtime, nki_backend):
+        """Documents the process-wide caveat: with the variable set, even
+        ``precision="fast"`` downcasts round stochastically."""
+        varying, _, _ = self._runs("fast")
+        assert varying > 0.25, f"only {varying:.1%} of elements vary run to run"

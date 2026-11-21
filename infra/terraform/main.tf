@@ -11,7 +11,7 @@ terraform {
 variable "aws_region" {
   description = "AWS region for the CI instance"
   type        = string
-  default     = "us-west-2"
+  default     = "us-east-1"
 }
 
 variable "instance_type" {
@@ -30,11 +30,13 @@ variable "instance_tag" {
 variable "vpc_id" {
   description = "VPC to place the instance in"
   type        = string
+  default     = "vpc-cd49bfb0"
 }
 
 variable "subnet_id" {
   description = "Subnet for the instance (public or private with NAT)"
   type        = string
+  default     = "subnet-1bd24d15"
 }
 
 provider "aws" {

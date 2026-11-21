@@ -16,10 +16,10 @@ Einstein summation with contraction planning, CP and Tucker decompositions. Expr
 
 trntensor follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
-- **[Phase 1 — correctness](https://github.com/trnsci/trntensor/issues/27)** (active): matmul + batched-matmul NKI kernels in place; awaiting hardware validation + additional `@pytest.mark.neuron` coverage.
-- **[Phase 2 — precision](https://github.com/trnsci/trntensor/issues/28)**: precision-aware contraction path selection (depends on [trnblas#22](https://github.com/trnsci/trnblas/issues/22) double-double GEMM).
-- **[Phase 3 — perf](https://github.com/trnsci/trntensor/issues/29)**: opt_einsum-style path planner, plan cache reuse.
-- **[Phase 4 — multi-chip](https://github.com/trnsci/trntensor/issues/30)**: sharded tensor contractions.
+- **[Phase 1 — correctness](https://github.com/trnsci/trntensor/issues/27)** (closed): NKI kernels validated on hardware. On the native TorchNeuron path (Trn2/Trn3) the fused `mp2_energy`, `ao_to_mo_transform`, `df_exchange` and `df_coulomb` kernels beat the aten routes they replace; the NKI matmul/bmm kernels never did and are deprecated there in favour of aten (0.19.0).
+- **[Phase 2 — precision](https://github.com/trnsci/trntensor/issues/28)** (closed): precision-aware mode selection (`precision=`, `target_forward_error=`). `precision="dd"` on Trainium still waits on [trnblas#22](https://github.com/trnsci/trnblas/issues/22) double-double GEMM.
+- **[Phase 3 — perf](https://github.com/trnsci/trntensor/issues/29)** (closed): greedy multi-operand path planner, plan cache.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trntensor/issues/30)** (active): sharded tensor contractions (`ShardedTensor`, reduce-parallel all-reduce).
 - **[Phase 5 — generation](https://github.com/trnsci/trntensor/issues/31)**: trn2 fused multi-contraction paths.
 
 Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
@@ -28,7 +28,44 @@ Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1)
 
 ```bash
 pip install trntensor
+
+# Trn2/Trn3 with TorchNeuron (native PyTorch, Neuron SDK 2.33+)
+pip install "trntensor[torchneuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+# Trn1 / PyTorch-XLA lineage
+pip install "trntensor[neuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
 ```
+
+Kernels dispatch on whichever Neuron PyTorch lineage is installed:
+
+- **TorchNeuron (native)**: Trn2/Trn3, Neuron SDK 2.33+, Python ≥ 3.12,
+  `torch` 2.14, `torch-neuronx` 2.14.*. Each kernel is a PyTorch custom op
+  (`torch.ops.trntensor.*`) on the `neuron` device; no `torch_xla`.
+- **PyTorch/XLA**: Trn1 (and any host on the `torch-neuronx` 2.9 lineage).
+  Kernels dispatch through `torch_xla`, unchanged.
+
+trntensor picks the native path when the native `torch_neuronx` and a
+`neuron` device are present, and the XLA path when `torch_xla` is
+installed; otherwise it runs on PyTorch. Set `TRNSCI_NKI_DISPATCH=native`
+or `xla` (shared by all trnsci libraries) to force a path. Pin operands on
+the device with `to_device` / `from_device`; the older `to_xla` /
+`from_xla` still work on both lineages (see the
+[migration note](docs/api/nki.md#migrating-from-to_xla-from_xla)). With an
+editable install (`pip install -e`), set `NKI_ENABLE_TRACE_CACHE=0`: the NKI
+kernel cache only versions installed wheels and can serve stale kernels.
+
+### Known platform issue: NKI trace cache and kernel factories
+
+`import torch_neuronx` turns on the NKI trace cache, and the cache key ignores
+constants captured in a kernel's closure: two `@nki.jit` kernels built by one
+factory, differing only in a captured value, share one trace, and the second
+silently returns the first's results
+([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454)).
+trntensor's kernels do not rely on closure constants (or on module globals that
+can differ between processes): every value that specialises a kernel is a
+kernel argument, and `tests/test_trace_cache_safety.py` enforces this. If you
+write your own NKI kernels with a factory, set `NKI_ENABLE_TRACE_CACHE=0`
+before importing `torch_neuronx`.
 
 ## Usage
 
@@ -37,9 +74,9 @@ import torch
 import trntensor
 
 # Einsum — drop-in for torch.einsum with contraction planning
-C = trntensor.einsum("ij,jk->ik", A, B)           # matmul
-T = trntensor.einsum("ap,bp->ab", B_i, B_j)       # DF-MP2 contraction
-X = trntensor.einsum("mi,mnP->inP", C_occ, eri)   # AO→MO transform
+C = trntensor.einsum("ij,jk->ik", A, B)  # matmul
+T = trntensor.einsum("ap,bp->ab", B_i, B_j)  # DF-MP2 contraction
+X = trntensor.einsum("mi,mnP->inP", C_occ, eri)  # AO→MO transform
 
 # Contraction planning
 plan = trntensor.plan_contraction("ij,jk->ik", A, B)
@@ -63,16 +100,23 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 | Planning | `estimate_flops` | FLOPs for a contraction |
 | Decomposition | `cp_decompose` | CP/PARAFAC via ALS |
 | Decomposition | `tucker_decompose` | Tucker via HOSVD |
+| Decomposition | `tt_decompose` | Tensor Train via TT-SVD |
+| Chemistry | `mp2_energy` | Fused DF-MP2 correlation energy |
+| Chemistry | `ao_to_mo_transform` | Fused AO→MO transform (full or packed integrals) |
+| Chemistry | `df_exchange` / `df_coulomb` | Fused DF exchange (K) / Coulomb (J) from packed integrals |
+| Chemistry | `pack_tril` / `unpack_tril` | Packed (μ≥ν) three-centre integral layout |
+| Sharding | `ShardedTensor`, `scatter`, `gather` | Output- and reduce-parallel sharded contractions |
 
 ## Status
 
-- [x] Einsum with matmul/bmm/torch dispatch
+- [x] Einsum with matmul/bmm/torch dispatch (output index order honoured since 0.22.0; earlier releases returned the wrong layout for transposed/permuted outputs, #64)
 - [x] Contraction planner
 - [x] CP decomposition (ALS)
 - [x] Tucker decomposition (HOSVD)
 - [x] DF-MP2 einsum example
-- [x] NKI fused contraction kernels (`mp2_energy`, `ao_to_mo_transform`)
-- [x] XLA operand residency (`to_xla` / `from_xla`)
+- [x] NKI fused contraction kernels (`mp2_energy`, `ao_to_mo_transform`, `df_exchange`, `df_coulomb`)
+- [x] Device operand residency (`to_device` / `from_device`; `to_xla` / `from_xla` kept)
+- [x] Native TorchNeuron dispatch (Trn2/Trn3, `torch.ops.trntensor.*`) alongside PyTorch/XLA (Trn1)
 - [x] NKI CPU simulator + `nki-simulator` CI gate
 - [x] Optimal contraction ordering — greedy path search for 3+ operands
 - [x] Multi-contraction shared-operand XLA pre-pinning
@@ -83,17 +127,39 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 - [x] Non-negative CP + warm-start CP
 - [x] PEP 561 `py.typed` marker
 - [x] Mixed precision / `dtype` override for bf16/fp16
-- [x] `precision=` kwarg (`"fast"` / `"kahan"` fp64 promotion / `"dd"` stub)
+- [x] `precision=` kwarg (`"fast"` / `"kahan"` fp64 promotion / `"sr"` / `"dd"`: CPU emulation only, raises on Trainium until trnblas#22)
+
+## Known issues in earlier releases
+
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-04 releases. Details are in the [CHANGELOG](CHANGELOG.md).
+
+| Bug | Affected | Fixed in |
+|-----|----------|----------|
+| `einsum` returned the wrong layout for transposed or permuted outputs (e.g. `ij,jk->ki` gave `A@B`), every backend (#64) | through 0.21.0 | 0.22.0 |
+| `einsum(..., out=C)` with `beta=0` read `C`, so NaN/inf in it made the result NaN (#71) | 0.3.0–0.22.0 | 0.23.0 |
+| `tucker_decompose` used `Uᵀ` instead of `Uᴴ` for complex tensors, giving a wrong core (#73) | through 0.22.0 | 0.23.0 |
+| `precision="kahan"` / `"dd"` / `target_forward_error` dropped the imaginary part of complex operands and rounded large integers (#69) | `"kahan"` 0.4.0–0.22.0; `"dd"`, `target_forward_error` 0.17.0–0.22.0 | 0.23.0 |
+| `einsum(precision="dd")` on float32/float64 was less accurate than `"fast"` (CPU emulation, #84) | 0.17.0–0.22.0 | 0.23.0 |
+| `multi_einsum` returned float32 results as float64 in mixed-dtype batches (#75) | 0.17.0–0.22.0 | 0.23.0 |
+| NKI chemistry kernels returned inf for float64 operands, and some kernel routes changed the result dtype (#87) | `df_*` 0.21.0–0.22.0; `ao_to_mo_transform` every release with its kernels | 0.23.0 |
+| `ao_to_mo_transform` aten route on the TorchNeuron device was wrong once `eri` exceeded 4 GiB (#97; the LNC=1 gather case is the 0.24.0 row below) | through 0.22.0 | 0.23.0 |
+| `unpack_tril` / `pack_tril` (and the packed-`eri` aten / legacy routes of `ao_to_mo_transform`) on the neuron device at LNC=1 returned wrong data, at times NaN, once one gathered output reached 4 GiB (154 M mismatched elements at 4.99e9 bytes) (#97) | 0.20.0–0.23.0 | 0.24.0 |
+| Complex `tucker_decompose` on the neuron device used `Uᵀ`, not `Uᴴ`: device matmul ignores the lazy conj bit of `.mH` (#89) | 0.23.0 | 0.24.0 |
+| float64 on the neuron device rounded to fp32 in `gather` (device `torch.cat`) and in `pack_tril` / `unpack_tril` / `pack_density` / `unpack_packed` (device `index_select` / fancy indexing), rel. err ~4e-8 (#92) | through 0.23.0 | 0.24.0 |
+| `multi_einsum` under `"auto"` pinned shared host float64 / complex128 operands to the device, where device aten computed them at fp32 precision (#92) | through 0.23.0 | 0.24.0 |
+| Integer, bool, complex and mixed-dtype operands of `einsum` / `multi_einsum` reached the fp32/bf16/fp16 matmul kernels under `set_backend("nki")`, or under `"auto"` above the size thresholds (trnsci/trnsci#35) | through 0.23.0 | 0.24.0 |
+| `einsum(..., out=)` never wrote `out`, so the documented `einsum(..., beta=1.0, out=acc)` accumulation left `acc` unchanged (#77) | 0.3.0–0.23.0 | 0.24.0 |
+| `cp_reconstruct` returned float32 for bf16 / fp16 factors (#78) | 0.1.1–0.23.0 | 0.24.0 |
 
 ## Related Projects
 
 | Project | What |
 |---------|------|
-| [trnfft](https://github.com/scttfrdmn/trnfft) | FFT + complex ops |
-| [trnblas](https://github.com/scttfrdmn/trnblas) | BLAS operations |
-| [trnsolver](https://github.com/scttfrdmn/trnsolver) | Linear solvers |
-| [trnrand](https://github.com/scttfrdmn/trnrand) | Random number generation |
-| [trnsparse](https://github.com/scttfrdmn/trnsparse) | Sparse operations |
+| [trnfft](https://github.com/trnsci/trnfft) | FFT + complex ops |
+| [trnblas](https://github.com/trnsci/trnblas) | BLAS operations |
+| [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers |
+| [trnrand](https://github.com/trnsci/trnrand) | Random number generation |
+| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse operations |
 
 ## License
 

@@ -38,9 +38,7 @@ factors_new, weights_new = trntensor.cp_decompose(
 )
 
 # nonneg and warm-start compose
-factors_ws, weights_ws = trntensor.cp_decompose(
-    T, rank=8, nonneg=True, factors=seed_factors
-)
+factors_ws, weights_ws = trntensor.cp_decompose(T, rank=8, nonneg=True, factors=seed_factors)
 ```
 
 ### `cp_reconstruct(factors, weights) -> torch.Tensor`

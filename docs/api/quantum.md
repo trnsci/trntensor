@@ -32,7 +32,7 @@ import trntensor
 nocc, nvir, naux = 5, 19, 72
 B = torch.randn(nocc, nvir, naux) * 0.1
 eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
-eps_vir =  torch.sort(torch.rand(nvir))[0] + 0.1
+eps_vir = torch.sort(torch.rand(nvir))[0] + 0.1
 
 E = trntensor.mp2_energy(B, eps_occ, eps_vir)
 print(f"E_MP2 = {E.item():.6f}")
@@ -40,21 +40,56 @@ print(f"E_MP2 = {E.item():.6f}")
 
 ### Backend behaviour
 
-- **CPU**: falls back to a Python loop over `(i, j)` pairs composing `torch.einsum`
-  and element-wise ops. Same as `examples/df_mp2_einsum.py`.
-- **Trainium (NKI)**: dispatches a single `@nki.jit` program that
-  - accumulates `T` in PSUM via `nisa.nc_matmul`,
-  - builds `Δ` on the Vector Engine from SBUF-resident `ε` tiles,
-  - folds the energy into a scalar accumulator in SBUF,
-  - writes one partial per `(i, j)` pair to HBM.
+- **CPU, and small problems on native TorchNeuron**: aten ops on the
+  operands' device. `T[i, j, a, b]` is contracted with `torch.einsum` in
+  chunks over `i`, which bounds peak memory to about 64 MiB of `T` at a time.
+  The `T`-weighted sum is vectorized.
+- **Native TorchNeuron (Trn2/Trn3): the row kernel.** `mp2_energy_row_kernel`
+  is launched once per occupied row `i`. It covers `j = i + d (mod nocc)` for
+  `d = 0..nocc/2` and uses the pair symmetry `e_ij = e_ji`. Per pair, one
+  GEMM fills `T = B[i] B[j]ᵀ` in SBUF, and the `Tᵀ` blocks come from Tensor
+  Engine transposes. `T` never reaches device memory. At LNC=2 each physical
+  core takes half of the `j` window. The design follows trnblas
+  `pair_energy_sym` (trnblas#55, #58).
+  - `"auto"` uses the row kernel when `B` is on the device and each row
+    launch carries at least 3 GFLOP, counted on the padded sizes as
+    `2·(nocc//2+1)·nvir²·naux`. Below that, the ~nocc custom-op launch
+    floors lose to aten.
+  - `set_backend("nki")` uses it whenever its SBUF working set fits.
+  - `TRNTENSOR_MP2_ENERGY=auto|rows|aten|legacy` overrides the choice.
+    `legacy` is the original single-launch kernel, which is deprecated on
+    the native path.
 
-The host sums the `(nocc, nocc)` partial matrix into the final scalar. No intermediate four-index `T` tensor is ever materialized.
+  Measured on Trn2 (fp32, one LNC=2 core, device-resident, warm, #51):
 
-### Current limitations
+  | nocc, nvir, naux | aten | row kernel |
+  |---|---|---|
+  | 16, 128, 512 | 1.5 ms | 5.1 ms |
+  | 32, 256, 768 | 12.1 ms | 11.6 ms |
+  | 32, 320, 1024 | 24.9 ms | 19.8 ms |
+  | 48, 384, 1152 | 75.7 ms | 39.2 ms |
+  | 64, 448, 1536 | 240 ms | 120 ms |
+  | 96, 672, 2304 | 1.30 s | 0.69 s |
 
-- Single-tile path only: `nvir ≤ 128` and `naux ≤ 128`. Larger systems raise `NotImplementedError` — K/M tiling is a follow-up.
-- Dispatch overhead still dominates at small sizes; see [Benchmarks](../benchmarks.md) for the honest comparison against the Python loop.
-
+  Holding 12 or 18 GB of the core's 24 GB on the device did not slow either
+  path. The aten path's 64 MiB `T` chunks stay clear of the slowdown in
+  aws-neuron-sdk#1447. The row kernel's input staging is about 1.5× the
+  padded `B`, so near a full device it needs more memory than aten does.
+  `"auto"` therefore keeps aten when this process's live device allocations
+  plus that staging would leave less than 3 GiB free. A shape whose kernel
+  launch fails anyway falls back to aten and is remembered for the rest of
+  the process.
+- **Host `B` on native TorchNeuron (#56).** Under `"auto"`, a host `B` with
+  `nocc²·nvir²·naux` of at least 1.5e8 multiply-adds (scaled by
+  `torch.get_num_threads() / 2`) is uploaded with the orbital energies, the
+  device route above runs, and the energy comes back as a host scalar.
+  Smaller problems stay on the host. On Trn2 with 2 host threads this took
+  646 ms -> 16 ms at 32/224/1024 and 15.8 s -> 135 ms at 64/448/1536. See
+  [host operands](nki.md#host-operands-upload-or-stay-56) for the table and
+  `TRNTENSOR_HOST_ROUTE`.
+- **PyTorch/XLA path (Trn1)**: the original single-launch `mp2_energy_kernel`.
+  It accumulates `T` in PSUM, builds `Δ` on the Vector Engine, and writes one
+  partial per `(i, j)` pair.
 
 ## `trntensor.ao_to_mo_transform(eri, C_occ, C_vir) -> Tensor`
 
@@ -66,7 +101,10 @@ B[i, a, P] = Σ_{μ, ν} C_occ[μ, i] · C_vir[ν, a] · eri[μ, ν, P]
 
 ### Arguments
 
-- `eri: (nbasis, nbasis, naux) tensor` — density-fitted two-electron integrals in the AO basis
+- `eri` — density-fitted three-centre integrals in the AO basis, one of:
+  - `(nbasis, nbasis, naux)`: the full square;
+  - `(npair, naux)`, `npair = nbasis(nbasis+1)/2`: the packed lower triangle, row `μ(μ+1)/2 + ν` for `ν ≤ μ` (see [Packed integrals](#packed-integrals));
+  - `(naux, npair)`: PySCF's `_cderi`, as is. When `naux == npair` the shape is ambiguous and is read as `(npair, naux)`; pass `cderi.T` then.
 - `C_occ: (nbasis, nocc) tensor` — occupied molecular orbital coefficients
 - `C_vir: (nbasis, nvir) tensor` — virtual molecular orbital coefficients
 
@@ -83,17 +121,325 @@ B = trntensor.ao_to_mo_transform(eri, C_occ, C_vir)
 E = trntensor.mp2_energy(B, eps_occ, eps_vir)
 ```
 
+### Packed integrals
+
+Real three-centre integrals are symmetric in μ↔ν, and drivers store only the
+lower triangle (PySCF `_cderi`, `trnblas.parallel.pack_tril`). Pass it packed
+(#54):
+
+```python
+B = trntensor.ao_to_mo_transform(cderi, C_occ_d, C_vir_d)  # cderi: host (naux, npair)
+```
+
+- `trntensor.pack_tril(eri)` and `trntensor.unpack_tril(eri_packed, nbasis)`
+  convert between the layouts (one `index_select` each, exact).
+- **A host `eri` with device `C_occ` is uploaded to `C_occ`'s device**, in the
+  layout given. The result stays on the device.
+- On the native path, `"auto"` sends packed device integrals to
+  `ao_to_mo_trn2_packed_kernel` under the same conditions as the full kernel.
+  Its stage 1 fetches each `(128 μ, NUB ν, TP aux)` block from the packed
+  rows with one batched indirect DMA. The full square never exists in device
+  memory. Its result is bit-identical to the full kernel's.
+- The aten and legacy routes unpack on the tensor's device first.
+
+Why: on Trn2 the host link carries about 13.8 GB/s for the whole chip, so the
+upload of `eri` was DF-MP2's largest stage. Packed, it is half the bytes.
+
+Upload of `eri` alone (Trn2, one logical core; host threads pinned to 2 CPUs):
+
+| nbasis/naux | full | packed | packed, from pinned host memory |
+|---|---|---|---|
+| 384/1152 | 49.2 ms | 25.1 ms | 24.9 ms |
+| 512/1536 | 115.7 ms | 58.5 ms | 58.4 ms |
+
+Pinned host memory and `copy_` into a preallocated device tensor upload no
+faster: H2D already runs at the link rate from ordinary host memory.
+Packing a full host tensor costs more than it saves: 180 ms on 2 host
+threads at 512/1536, against a 57 ms saving. Neither does uploading the
+triangle row by row (281 ms). So a 3-D host `eri` is uploaded as is.
+Packing pays only when the integrals already arrive packed.
+
+Kernel alone, device-resident, warm (fp32; padded `nvir` included):
+
+| nbasis/naux/nocc | LNC=2 full | LNC=2 packed | LNC=1 full | LNC=1 packed | device `unpack_tril` |
+|---|---|---|---|---|---|
+| 256/768/32 | 1.09 ms | 0.91 ms | 1.86 ms | 1.93 ms | — |
+| 384/1152/48 | 5.38 ms | 5.81 ms | 5.72 ms | 5.95 ms | 3.1 ms |
+| 512/1536/64 | 6.28 ms | 6.27 ms | 12.87 ms | 12.75 ms | 5.5 ms |
+
 ### Backend behaviour
 
-- **CPU**: `torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)` — a single three-operand einsum.
-- **Trainium (NKI)**: dispatches a single `@nki.jit` program that
-  - loads `C_occ` and `C_vir` once, SBUF-resident across all P iterations,
-  - for each auxiliary index P: two sequential `nisa.nc_matmul` calls with the intermediate `(i, ν)` tile round-tripping through kernel-scratch HBM to handle the partition-dim change,
-  - writes one `(nocc, nvir)` slice per P to the output HBM tensor.
+- **CPU**: two explicit aten steps on the operands' device:
+  `einsum("mi,mnP->inP")` then `einsum("na,inP->iaP")`.
+- **Native TorchNeuron (Trn2/Trn3): `ao_to_mo_trn2_kernel`.** Both stages are
+  plain GEMMs with the contraction index on the partition axis, so there are
+  no DMA transposes.
+  - Stage 1: `X[i, ν, P] = Σ_μ C_occ[μ, i] eri[μ, ν, P]`.
+  - Stage 2: `B[i, a, P] = Σ_ν C_vir[ν, a] X[i, ν, P]`.
+  - The auxiliary index is split across both physical cores at LNC=2. With
+    an odd aux-chunk count and `nocc > 128`, the occupied index is split
+    instead.
+  - Any `nocc` (#80): stage 1 runs occupied blocks of ≤ 128 over each eri
+    block, so `eri` is read once per program.
+  - `"auto"` uses the kernel for device-resident `eri` when its SBUF
+    working set fits and the stage-1 work `nocc·nbasis²·naux` is at least
+    5e8 multiply-adds (about nbasis ≥ 256). Smaller problems lose to the
+    launch floor. Two exceptions (#80):
+    - A full `eri` whose nbasis or naux is not a 128 multiple runs aten. The
+      kernel would pad a copy of the whole square, which costs more than
+      aten. Pass the packed form to keep the kernel there.
+    - A packed `eri` with nbasis not a 128 multiple needs 2e9 multiply-adds.
+    `TRNTENSOR_AO_TO_MO=auto|trn2|aten|legacy` overrides the choice.
 
-The "two-step decomposed" form (`intermediate = einsum("mi,mnP->inP", ...)` followed by `einsum("na,inP->iaP", ...)`) materializes the `(nocc, nbasis, naux)` intermediate as a user-visible torch tensor. The fused NKI path keeps it in kernel scratch — the user only ever sees `eri`, `C_occ`, `C_vir`, and `B`.
+  Measured on Trn2 (fp32, one LNC=2 core, device-resident, warm, #51):
+
+  | nbasis, nocc, naux | two aten einsums | Trn2 kernel (op) | `ao_to_mo_transform`, `"auto"` | original kernel |
+  |---|---|---|---|---|
+  | 64, 8, 128 | 0.41 ms | — | 0.41 ms (aten) | 6.0 ms (#49) |
+  | 128, 16, 256 | 0.49 ms | 0.43 ms | 0.49 ms (aten) | 16.1 ms |
+  | 256, 32, 512 | 1.23 ms | 1.11 ms | 0.92 ms | 112 ms (#49) |
+  | 512, 32, 1024 | 7.30 ms | 4.56 ms | 4.72 ms | — |
+  | 768, 48, 1536 | 18.3 ms | 11.8 ms | 12.0 ms | — |
+
+  The op column takes tile-multiple inputs (the raw kernel). The `"auto"`
+  column includes the padding of `nvir` to 128 and is the shipped route. At
+  nbasis 64 and 128 it measured 0.79 and 0.57 ms with the kernel forced,
+  which is why `"auto"` keeps aten there.
+
+  Above `nocc = 128` (#80; Trn2, one logical core, fp32, warm medians in ms,
+  `nvir = nbasis − nocc`). "Per-128 launches" is the `nocc ≤ 128` kernel run
+  once per 128 orbitals, which re-reads `eri` each time:
+
+  | nbasis, naux | LNC | nocc | aten, full / packed | per-128 launches, full / packed | Trn2 kernel, full / packed |
+  |---|---|---|---|---|---|
+  | 512, 1536 | 2 | 160 | 17.2 / 25.1 | 14.1 / 13.5 | **9.4 / 9.2** |
+  | 512, 1536 | 2 | 256 | 24.8 / 34.8 | 15.3 / 14.6 | **10.4 / 9.9** |
+  | 512, 1536 | 2 | 384 | 29.5 / 37.0 | 21.5 / 19.7 | **12.6 / 12.7** |
+  | 512, 1536 | 1 | 160 | 24.8 / 43.1 | 26.7 / 27.6 | **18.7 / 18.7** |
+  | 512, 1536 | 1 | 256 | 33.1 / 52.1 | 28.2 / 29.6 | **20.3 / 20.4** |
+  | 512, 1536 | 1 | 384 | 41.0 / 60.2 | 38.7 / 40.3 | **24.3 / 24.7** |
+  | 768, 2304 | 2 | 160 | 37.5* / 65.0* | 41.7 / 47.6 | **30.2 / 30.6** |
+  | 768, 2304 | 2 | 256 | 84.9* / 112.9* | 44.3 / 51.8 | **33.7 / 33.6** |
+  | 768, 2304 | 2 | 384 | 112.9* / 140.6* | 59.2 / 70.7 | **45.3 / 45.4** |
+
+  \* At nbasis 768 / naux 2304 the aten result was wrong on the device
+  (max error ~1 against float64), while the kernel matched float64 to 2e-7;
+  aten was correct at nbasis 736. Its timings there are for reference only.
+
+- **Large packed bases (#112).** The packed kernel above keeps C_occ,
+  C_vir, one chunk's gather indices and a whole μ column of eri in SBUF. That
+  outgrows the budget from n_ao ≈ 1100–1300 (979 KiB per partition at
+  n_ao 3508). From there on, fp32 packed integrals run
+  `ao_to_mo_trn2_packed_blocked_kernel`. It streams every operand over
+  blocks of up to 8 μ/ν tiles, keeps its PSUM accumulators across the
+  blocks, and has an SBUF footprint (≈ 71–78 KiB) that does not grow with
+  n_ao. Any aux chunk width up to 512 goes in without a padding copy. Where
+  both kernels fit, they agree bit for bit.
+  `TRNTENSOR_AO_TO_MO_PACKED=auto|resident|blocked` picks the kernel.
+
+  Measured on Trn2 with one core, fp32, synthetic packed chunks of the
+  trnsci#115 ladder's widths. The fp64 reference is computed on the host.
+  The host column is the aten route on 2 pinned threads, including the
+  unpack. The kernel column is the device time, synchronised, without the
+  download:
+
+  | n_ao, nocc, chunk naux | LNC | cold compile | kernel | host fp32 | max rel. error, kernel / host |
+  |---|---|---|---|---|---|
+  | 1658, 161, 384 | 2 | 128 s | 56 ms¹ | 6.1 s | 3.2e-7 / 6.6e-7 |
+  | 2522, 215, 168 | 2 | 195 s | 73 ms¹ | 7.9 s | 3.7e-7 / 6.0e-7 |
+  | 3508, 241, 87 | 2 | 162 s | 85 ms | 8.6 s | 3.9e-7 / 5.4e-7 |
+  | 3508, 241, 87 | 1 | 140 s | 94 ms | – | 3.9e-7 |
+  | 3508, 241, 48 (last chunk) | 2 | 56 s | 53 ms | 4.8 s | 4.4e-7 / 5.7e-7 |
+
+  ¹ One chunk of up to 512 columns stays one chunk, so at LNC=2 the two
+  programs split the occupied index and both gather every eri block.
+  Splitting it in two takes 1658 to 35 ms at the same compile time, but
+  2522 to 54 ms at a 552 s compile, so the wider tiling is kept.
+
+  With the NEFF cache the first call at n_ao 3508 takes 26 s. A whole
+  alkane60 / cc-pVTZ-shaped pass through `AuxStream.ao_to_mo` (97 chunks,
+  8400 aux, 207 GB uploaded from host RAM) took 43 s warm. The trnsci#115
+  run did this pass on the host in 673 s, reading the store from NVMe.
+
+- **Host inputs on native TorchNeuron (#56).** Under `"auto"`, with `eri`,
+  `C_occ` and `C_vir` all on the host, the inputs are uploaded (`eri` in the
+  layout given), the device route above runs, and the result is downloaded,
+  once `nocc·nbasis²·naux` reaches 2e8 for a full `eri` or 3e7 for a packed
+  one (both scaled by `torch.get_num_threads() / 2`). A packed host `eri`
+  otherwise pays a host unpack, so its threshold is lower. On Trn2 with 2
+  host threads at 512/1536/64 this took 574 -> 137 ms full and 979 -> 80 ms
+  packed. PySCF's `(naux, npair)` layout went from 5.2 s to 83 ms on one
+  physical core. See [host operands](nki.md#host-operands-upload-or-stay-56)
+  for the table and `TRNTENSOR_HOST_ROUTE`.
+- **PyTorch/XLA path (Trn1)**: the original kernel. It loops over P, with the
+  `(i, ν)` intermediate round-tripping through kernel-scratch HBM. On the
+  native path it is deprecated.
 
 ### Current limitations
 
-- Single-tile path only: `nbasis ≤ 128`, `nocc * naux ≤ 512`, and `nvir * naux ≤ 512`. Larger systems raise `NotImplementedError`. K-tiling and N-tiling are a follow-up.
-- The intermediate briefly visits kernel-scratch HBM to change partition dim between the two nc_matmul steps. A future version may keep it fully SBUF-resident if NKI adds an in-SBUF transpose primitive.
+- The original (XLA-path) kernel needs `nocc ≤ 128` and raises `NotImplementedError` above it. The Trn2 kernels take any `nocc`.
+- At `nocc` just above a multiple of 128 the Trn2 kernel pays for a whole extra block in stage 1 (the occupied block is the stationary operand, and a pass costs the same at any width). For example, nocc 160 at nbasis 768 costs 30 ms against 21 ms at 128.
+- The first call per shape compiles for minutes at large sizes (traced loops unroll): 4–11 min at nbasis 768 / naux 2304 for a full `eri`, 1–4.5 min packed. The NEFF cache keeps that to one compile per shape.
+- The `(nocc, nbasis, naux)` intermediate goes through kernel-scratch HBM between the two stages, as it does between the two aten einsums. Stage 1 leaves `i` on the partition axis, and stage 2 needs `ν` there.
+
+## `trntensor.df_exchange(B, C_occ, alpha=1.0) -> Tensor`
+
+Density-fitted exchange matrix straight from packed three-centre integrals (#60).
+
+```
+K[μ, ν] = alpha · Σ_{i, P} X[i, μ, P] X[i, ν, P],    X[i, ν, P] = Σ_λ C_occ[λ, i] B[λν, P]
+```
+
+For a closed-shell density `D = 2 C_occ C_occᵀ`, the SCF exchange matrix is
+`df_exchange(B, C_occ, alpha=2.0)`.
+
+### Arguments
+
+- `B` — the packed lower triangle `(npair, naux)` (row `μ(μ+1)/2 + ν`,
+  `pack_tril` order), PySCF's `_cderi` `(naux, npair)`, or the full
+  `(nbasis, nbasis, naux)` square (aten route).
+- `C_occ: (nbasis, nocc)` — occupied orbital coefficients.
+- `alpha` — scale factor.
+
+### Returns
+
+The symmetric `(nbasis, nbasis)` matrix, on `B`'s device.
+
+### Example — the K build of a DF-RHF iteration
+
+```python
+B_d = B_packed.to("neuron")  # once: (npair, naux), never unpacked
+K = trntensor.df_exchange(B_d, C_occ_d, alpha=2.0)
+```
+
+### Backend behaviour
+
+- **Native TorchNeuron (Trn2/Trn3): two NKI launches per group of aux chunks.**
+  - `df_half_packed_kernel` gathers the packed rows in place with batched
+    indirect DMA (the gather of `ao_to_mo_transform`'s packed kernel, #54)
+    and forms the half-transformed `Xt[P, i, ν]` with the aux index on the
+    partition axis: each gathered `(128 λ, aux)` block is the stationary
+    operand and the resident `C_occ` λ-tile the moving one. The full
+    `(n, n, naux)` square never exists.
+  - `df_exchange_syrk_kernel` accumulates `K` in PSUM over 128-row aux
+    tiles, computes only the upper-triangle 128-row strips, and mirrors them
+    on the Tensor Engine on the way out. Two running partial Ks are chained
+    through the launches, so there are no extra adds per group.
+  - Both launches split across the programs of the logical core: the first
+    by aux chunks (or ν groups), the second by occupied orbitals (padded to
+    an even count). At LNC=2 both physical cores work.
+  - `B` is never copied or padded. The aux chunk width is a divisor of
+    naux, or a multiple of 128 with a short last chunk of `naux mod width`
+    (#60). Traced NKI loops unroll, so the dispatcher runs the pair
+    over groups of chunks to bound the compile time (about a minute per
+    shape at n_ao = 970) and the `Xt` scratch.
+  - The tiling minimises the 128-row aux tiles of the SYRK launches: a
+    partial tile there costs a full one, and each group of chunks can end
+    in one. At n_ao = 970 (naux = 4686 = 2·3·11·71) the divisor 213 in
+    pairs gave 44 tiles for 4686 rows; chunks of 256 in pairs, with the
+    78-wide last chunk in the last group, give the minimum, 37. Where a
+    divisor already reaches the minimum (n_ao = 250 and 490) it is kept.
+  - `"auto"` uses the kernels for device-resident `B` with `nocc ≤ 512`
+    once `nocc·nbasis²·naux` reaches 1e7 multiply-adds.
+    `TRNTENSOR_DF_EXCHANGE=auto|trn2|aten` overrides the choice.
+- **Otherwise (CPU, small problems)**: aten on `B`'s device. Blocks of rows
+  of the square are gathered (1 GiB at a time), half-transformed with one
+  einsum into `(ν, i, P)` order, and `K` is one GEMM.
+
+### Measured on Trn2
+
+PySCF cc-pVDZ / cc-pvdz-jkfit integrals, fp32, warm medians, device-resident
+inputs, one logical core. *Unpack path* is the K build of
+`trnsolver/examples/scf_df_rhf.py` before this change: `unpack_tril` of
+aux blocks (the square kept resident when it fits in 4 GB), the
+half-transform `einsum`, and `trnblas.syrk`. Error is the max-abs error over
+max |K| against float64.
+
+| system | n_ao / naux / nocc | LNC | unpack path | `df_exchange` | speedup | error, unpack | error, `df_exchange` |
+|---|---|---|---|---|---|---|---|
+| water | 24 / 116 / 5 | 2 | 0.82 ms | 1.32 ms (kernels; `"auto"` runs aten, 1.16 ms) | — | 7.5e-8 | 1.9e-7 |
+| benzene | 114 / 558 / 21 | 2 | 1.43 ms | 1.35 ms | 1.06x | 5.8e-7 | 2.6e-7 |
+| C10H22 | 250 / 1206 / 41 | 2 | 3.17 ms | 2.18 ms | 1.46x | 3.6e-7 | 4.8e-7 |
+| C20H42 | 490 / 2366 / 81 | 2 | 15.5 ms | 9.33 ms | 1.66x | 6.1e-7 | 6.6e-7 |
+| C40H82 | 970 / 4686 / 161 | 2 | 304 ms | 118 ms | 2.58x | 8.3e-7 | 8.1e-7 |
+| C10H22 | 250 / 1206 / 41 | 1 | 4.71 ms | 3.46 ms | 1.36x | 3.6e-7 | 8.1e-7 |
+| C20H42 | 490 / 2366 / 81 | 1 | 25.9 ms | 16.9 ms | 1.53x | 6.1e-7 | 1.1e-6 |
+| C40H82 | 970 / 4686 / 161 | 1 | 424 ms | 230 ms | 1.84x | 8.3e-7 | 1.5e-6 |
+
+- Up to n_ao = 490 the unpack path keeps its square resident (it fits in
+  4 GB), so it pays no gather per call; at 970 it unpacks 9 aux blocks per
+  call. `df_exchange` never builds the square.
+- `df_exchange` scales 1.59x / 1.81x / 1.95x from LNC=1 to LNC=2 at
+  n_ao = 250 / 490 / 970.
+- At n_ao = 970 the table's 118 ms used 11 launch pairs of 2 aux chunks of
+  213. Chunks of 256 (NUB = 8, NVC = 16) take 9 pairs, the last one holding
+  the 78-wide chunk. K then takes 93.8 ms at LNC=2 and 187 ms at LNC=1
+  (from 118 and 230 ms), with error 6.2e-7 and 1.1e-6 (from 8.1e-7 and
+  1.5e-6).
+  - The gain is in the SYRK: 3.1 ms per 512-row group against 3.7 ms per
+    426-row group. The half transform takes about as long per aux row
+    either way.
+  - Summed per-launch times of other tilings: groups of 3 chunks of 213
+    (5 tiles per 639 rows) 117 ms; 256 with NVC = 8 (the earlier 160 KiB
+    SBUF budget) 103 ms; 256 with NUB = 4 115 ms.
+- At n_ao = 490 the 128-multiple widths 256 and 384 were slower in the half
+  transform than 338: 8.9 and 9.1 ms against 6.1 ms per 6–8-chunk launch.
+  Widths whose last 128-row tile is partial (320–352) ran as fast as 338.
+  So the divisor tiling stays where it already gives the fewest SYRK tiles.
+- Padding naux to 4736 (chunks of 128, so no partial tiles) measured
+  126 ms. Eight PSUM banks per SYRK pass instead of six made no difference.
+- Without the `Xt[P, g, i, v]` store layout (ν innermost, 64-byte DMA
+  writes) the same call took 488 ms.
+
+### Current limitations
+
+- `nocc ≤ 512` (one PSUM bank of the stage-1 output).
+- The gather indices are 32-bit: `npair·naux / gcd(naux, width)` must stay
+  below 2^31, which limits the chunk widths for very large `B`.
+- The kernels run the Tensor Engine in fp32, which is what bounds them now.
+  At n_ao = 970 the half transform runs at about 17 TFLOP/s and the SYRK at
+  about 26 TFLOP/s per LNC=2 core (each counts the padded tiles).
+- Host `B` runs the aten route on the host; upload it once and keep it on
+  the device.
+
+## `trntensor.df_coulomb(B, D) -> Tensor`
+
+The density-fitted Coulomb matrix from the same packed integrals (#60).
+
+```
+J[μ, ν] = Σ_P B[μν, P] d[P],    d[P] = Σ_{λσ} D[λ, σ] B[λσ, P]
+```
+
+`D` is a symmetric `(nbasis, nbasis)` density, or its weighted packed form
+`(npair,)` (`w·D[μ, ν]` for `ν ≤ μ`, `w` = 1 on the diagonal and 2 off
+it), in which case the packed `(npair,)` J comes back. A caller that keeps
+the aux index in blocks then packs and unpacks once per call instead of per
+block; on the device those are element gathers.
+
+- **Native TorchNeuron**: two launches, `df_coulomb_d_kernel` and
+  `df_coulomb_j_kernel`. Each streams `B` once in contiguous 128-row tiles
+  (DMAs up to 4096 columns wide), rows split across the programs, with fused
+  Vector Engine instructions: a multiply-add per tile for `d`, a
+  multiply-reduce per 128 columns for `J`. The partial sums are kept short:
+  `d` in groups of 32 tiles, `J` in 128-column chunks. At n_ao = 970 one
+  fp32 chain over all 4686 columns gave J 2.4e-6 off float64 and
+  512-column chunks 5.7e-7; 128-column chunks give 2.8e-7. The < 256
+  leftover rows run as aten GEMVs. `"auto"` uses the kernels for
+  device-resident `B` from `npair·naux` = 1e7.
+  `TRNTENSOR_DF_COULOMB=auto|trn2|aten` overrides.
+- **Otherwise**: two GEMVs.
+
+Measured on Trn2 (fp32, warm; the J of `scf_df_rhf.py`'s `DFJK` on the
+core-guess density, error vs float64 relative to max |J|):
+
+| n_ao / naux | LNC | two GEMVs per aux block (before) | `df_coulomb`, one block | speedup |
+|---|---|---|---|---|
+| 250 / 1206 | 2 | 3.81 ms, 2.1e-7 | 2.90 ms, 2.4e-7 | 1.31x |
+| 490 / 2366 | 2 | 12.6 ms, 1.9e-7 | 8.83 ms, 2.7e-7 | 1.43x |
+| 970 / 4686 | 2 | 86.7 ms (9 blocks), 1.9e-7 | 46.0 ms, 2.8e-7 | 1.89x |
+| 970 / 4686 | 1 | 126 ms (9 blocks), 2.4e-7 | 81.7 ms, 2.6e-7 | 1.55x |
+
+It also allows a single block: at n_ao = 970 the aten GEMV on one 8.8 GB
+block compiled to a 26.7 GB graph and did not fit in HBM. With the DMA as
+narrow as the 128-column reduce, the kernel was descriptor-bound (76 ms at
+970).

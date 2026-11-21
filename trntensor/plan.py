@@ -13,7 +13,9 @@ where many contractions share operands.
 
 from __future__ import annotations
 
+import math
 import re
+import warnings
 from dataclasses import dataclass, field
 
 import torch
@@ -32,11 +34,14 @@ class ContractionPlan:
     batch_indices: list[str] = field(default_factory=list)
     output_indices: list[str] = field(default_factory=list)
     estimated_flops: int = 0
+    # Multiply-adds of the planned execution: for "matmul" / "bmm" / "torch"
+    # the product of all index sizes (== estimate_flops); for "path" the sum
+    # over the binary steps of each pair's index-size product.
     contraction_path: list[tuple[int, int]] = field(default_factory=list)
     # Greedy-optimal order for 3+ operand einsums. Each (i, j) pair refers to
     # indices in the CURRENT operand list at that step (opt_einsum convention):
     # contract ops[i] and ops[j], remove both, append the result.
-    precision: str = "fast"  # "fast" | "kahan" | "dd"
+    precision: str = "fast"  # "fast" | "kahan" | "dd" | "sr"
 
 
 def _backend_for(strategy: str, operands: tuple) -> str:
@@ -50,7 +55,7 @@ def _backend_for(strategy: str, operands: tuple) -> str:
     """
     if strategy not in ("matmul", "bmm"):
         return "pytorch"
-    from .nki.dispatch import _MIN_NKI_FLOPS, HAS_NKI
+    from .nki.dispatch import HAS_NKI, _route
 
     if not HAS_NKI:
         return "pytorch"
@@ -62,7 +67,11 @@ def _backend_for(strategy: str, operands: tuple) -> str:
         Bsz, M, K = operands[0].shape
         _, _, N = operands[1].shape
         flops = Bsz * M * K * N
-    return "nki" if flops >= _MIN_NKI_FLOPS else "pytorch"
+    # Plans are cached by shape, not device, so report the host-operand route;
+    # device-resident operands may still dispatch differently (nki_matmul
+    # applies the pinned threshold at run time). On the native path the
+    # device executor below the pinned threshold is aten, i.e. "pytorch".
+    return "nki" if _route(flops, pinned=False) == "nki" else "pytorch"
 
 
 def _validate_subscripts(subscripts: str, operands: tuple[torch.Tensor, ...]) -> None:
@@ -152,11 +161,29 @@ def plan_contraction(
         precision: Accumulation precision. ``"fast"`` (default) uses native dtype
             and may route to NKI kernels. ``"kahan"`` promotes operands to fp64
             before contracting and casts the result back to the original dtype.
-            ``"dd"`` requests double-double accumulation (not yet available).
+            ``"dd"`` requests double-double accumulation (see below).
+            ``"sr"`` applies stochastic rounding at the PSUM→SBUF downcast step
+            in the NKI matmul kernel — reduces accumulation bias for long
+            K-reductions in BF16 (correctness requirement for K ≥ ~300).
+            Only affects the ``matmul`` strategy; other strategies use fast rounding.
+            On Trainium (NKI 0.7+) SR is a process-wide Neuron Runtime setting:
+            it requires ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1`` at process start.
+            Without it a one-time ``RuntimeWarning`` is emitted and results are
+            round-to-nearest; with it, *all* downcasts in the process round
+            stochastically, including ``"fast"``.
+            ``"dd"`` double-double accumulation. On CPU, by operand dtype:
+            BF16/FP16 run ``_ozaki_matmul_cpu`` (Ozaki-2, named mock for
+            trnblas#22) on ``matmul`` plans and ``path`` steps, kahan on
+            ``bmm`` / ``torch`` plans; FP32 runs as kahan (FP32 products are
+            exact in FP64, so FP64 accumulation is inside K·u²); FP64 runs
+            ``_dd_matmul_fp64_cpu`` (exact TwoProduct products, double-word
+            accumulation) on ``matmul`` / ``bmm`` plans and ``path`` steps, and
+            plain FP64 accumulation on ``torch`` plans.
+            On Trainium: requires trnblas Phase 2 GEMM kernels (trnblas#22).
     """
     _validate_subscripts(subscripts, operands)
-    if precision not in ("fast", "kahan", "dd"):
-        raise ValueError(f"precision must be 'fast', 'kahan', or 'dd', got {precision!r}")
+    if precision not in ("fast", "kahan", "dd", "sr"):
+        raise ValueError(f"precision must be 'fast', 'kahan', 'dd', or 'sr', got {precision!r}")
     key = _shape_key(subscripts, operands, precision)
     if key in _PLAN_CACHE:
         return _PLAN_CACHE[key]
@@ -176,9 +203,12 @@ def plan_contraction(
             subscripts=subscripts,
             strategy="path",
             contraction_path=path,
+            estimated_flops=_path_macs(input_indices, output_str, size_map, path),
         )
     else:
         plan = ContractionPlan(subscripts=subscripts, strategy="torch")
+    if plan.strategy != "path":
+        plan.estimated_flops = estimate_flops(subscripts, *operands)
     plan.backend = _backend_for(plan.strategy, operands)
     plan.precision = precision
     _PLAN_CACHE[key] = plan
@@ -208,7 +238,7 @@ def _greedy_path_search(
 
     while len(inputs) > 2:
         best_pair: tuple[int, int] = (0, 1)
-        best_cost = float("inf")
+        best_cost: tuple[bool, float] = (True, float("inf"))
         best_inter: set[str] = set()
 
         for i in range(len(inputs)):
@@ -223,10 +253,17 @@ def _greedy_path_search(
                 contracted = pair_union - surviving
                 intermediate = pair_union - contracted
 
-                # FLOPs ≈ product of all index sizes in the pair union
-                cost = 1
+                # FLOPs ≈ product of all index sizes in the pair union. Pairs
+                # that share no index are outer products: their union cost
+                # understates the work, because the (larger) intermediate
+                # makes every later step more expensive (e.g. "mi,na,mnP->iaP"
+                # would build the 4-index "mina" first). Rank them after every
+                # pair that shares an index.
+                flops = 1
                 for idx in pair_union:
-                    cost *= size_map.get(idx, 1)
+                    flops *= size_map.get(idx, 1)
+                outer = not (set(inputs[i]) & set(inputs[j]))
+                cost = (outer, flops)
 
                 if cost < best_cost:
                     best_cost = cost
@@ -241,6 +278,30 @@ def _greedy_path_search(
 
     path.append((0, 1))
     return path
+
+
+def _path_macs(
+    input_list: list[str],
+    output_str: str,
+    size_map: dict[str, int],
+    path: list[tuple[int, int]],
+) -> int:
+    """Multiply-adds of ``path`` (from :func:`_greedy_path_search`): the sum
+    over its binary steps of the product of the pair's index sizes."""
+    inputs = list(input_list)
+    total = 0
+    for step, (i, j) in enumerate(path):
+        pair = set(inputs[i]) | set(inputs[j])
+        total += math.prod(size_map.get(c, 1) for c in pair)
+        if step == len(path) - 1:
+            break
+        surviving = set(output_str)
+        for k, inp in enumerate(inputs):
+            if k not in (i, j):
+                surviving |= set(inp)
+        inter = "".join(sorted(pair & surviving))
+        inputs = [inp for k, inp in enumerate(inputs) if k not in (i, j)] + [inter]
+    return total
 
 
 def _parse_subscripts(subscripts: str) -> tuple[str, str]:
@@ -280,8 +341,20 @@ def _plan_binary(
 
     A, B = operands
 
-    # Simple matmul: ij,jk->ik or ji,jk->ik etc.
-    if len(contracted) == 1 and len(batch) == 0 and A.dim() == 2 and B.dim() == 2:
+    # Simple matmul: ij,jk->ik or ji,jk->ik etc. The executor returns
+    # op(A) @ op(B), so the output must list A's free index then B's: a
+    # transposed output (->ki) or a free index summed away (->i) goes to
+    # torch.einsum instead (#64).
+    if (
+        len(contracted) == 1
+        and len(batch) == 0
+        and A.dim() == 2
+        and B.dim() == 2
+        and len(set_a) == 2
+        and len(set_b) == 2
+        and idx_out
+        == [c for c in idx_a if c not in contracted] + [c for c in idx_b if c not in contracted]
+    ):
         c_idx = list(contracted)[0]
         transA = idx_a.index(c_idx) == 0  # Contracted index is first → need transpose
         transB = idx_b.index(c_idx) == 1  # Contracted index is second → need transpose
@@ -294,8 +367,19 @@ def _plan_binary(
             output_indices=idx_out,
         )
 
-    # Batched matmul: bij,bjk->bik
-    if len(contracted) == 1 and len(batch) == 1 and A.dim() == 3 and B.dim() == 3:
+    # Batched matmul: exactly bij,bjk->bik (the executor is torch.bmm-shaped:
+    # batch first, A's contracted index last, B's first, output (b, i, k)) (#64).
+    if (
+        len(contracted) == 1
+        and len(batch) == 1
+        and A.dim() == 3
+        and B.dim() == 3
+        and len(set_a) == 3
+        and len(set_b) == 3
+        and idx_a[0] == idx_b[0] == idx_out[0]
+        and idx_a[2] == idx_b[1]
+        and idx_out == [idx_a[0], idx_a[1], idx_b[2]]
+    ):
         return ContractionPlan(
             subscripts=subscripts,
             strategy="bmm",
@@ -323,10 +407,153 @@ def estimate_flops(subscripts: str, *operands: torch.Tensor) -> int:
     index_sizes = {}
     for op_str, op in zip(input_str.split(","), operands, strict=False):
         for idx, size in zip(op_str, op.shape, strict=False):
-            index_sizes[idx] = size
+            index_sizes[idx] = int(size)
 
     flops = 1
     for idx in all_indices:
         flops *= index_sizes.get(idx, 1)
 
     return flops
+
+
+# Unit roundoffs by dtype (half machine epsilon, round-to-nearest convention).
+# Sources: IEEE 754-2019, Higham 2002 §2.2.
+_UNIT_ROUNDOFF: dict = {
+    torch.bfloat16: 2**-8,
+    torch.float16: 2**-11,
+    torch.float32: 2**-24,
+    torch.float64: 2**-53,
+}
+
+# Dtypes for which SR and Ozaki-DD are meaningful (NKI SR is BF16/FP16;
+# Ozaki splitting requires sub-FP32 precision to have correction terms).
+_SR_DD_DTYPES = (torch.bfloat16, torch.float16)
+
+
+_output_floor_warning_emitted = False
+
+
+def _warn_target_below_output_floor(
+    dtype: torch.dtype, K: int, target_forward_error: float, floor: float
+) -> None:
+    """One-time ``RuntimeWarning``: target is below what the result dtype can hold."""
+    global _output_floor_warning_emitted
+    if _output_floor_warning_emitted:
+        return
+    _output_floor_warning_emitted = True
+    warnings.warn(
+        f"trntensor: target_forward_error={target_forward_error:.2e} is below the "
+        f"achievable floor {floor:.2e} for {dtype} results (K={K}). The result is "
+        f"returned in {dtype}, so its final rounding alone contributes up to the "
+        f"unit roundoff u={_UNIT_ROUNDOFF.get(dtype, _UNIT_ROUNDOFF[torch.float32]):.2e} "
+        "per element regardless of how the accumulation is done. Using the most "
+        "accurate mode ('kahan'); pass float32/float64 operands (or dtype=) or "
+        "loosen the target to meet it. This warning is shown once per process.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def forward_error_bound(mode: str, dtype: torch.dtype, K: int) -> float:
+    """Componentwise forward error bound promised for ``mode`` on ``dtype`` results.
+
+    The bound is on ``max_ij |C - C_exact|_ij / (|A| |B|)_ij`` with the exact
+    product taken over the operands as given, and is the accumulation term
+    plus the final rounding of the result to ``dtype`` (unit roundoff
+    ``u_out``)::
+
+        "fast":  K · u   + u_out
+        "sr":    √K · u  + u_out   (expected value, not worst case)
+        "dd":    K · u²  + u_out
+        "kahan": K · 2⁻⁵³ + u_out
+
+    Here ``u`` is the operand unit roundoff; the result is returned in the
+    operand dtype, so ``u_out == u``. ``u_out`` is the floor no mode can beat.
+
+    ``"dd"`` on CPU: float32 operands run with fp64 accumulation, whose
+    K · 2⁻⁵³ is inside K · u²; float64 operands use double-word accumulation
+    (at most ~3 K · u², far below ``u_out`` for any feasible K), except on
+    generic ``torch``-strategy plans, which accumulate in plain fp64 and get
+    the ``"kahan"`` bound.
+    """
+    u = _UNIT_ROUNDOFF.get(dtype, _UNIT_ROUNDOFF[torch.float32])
+    if mode == "fast":
+        accum = K * u
+    elif mode == "sr":
+        accum = K**0.5 * u
+    elif mode == "dd":
+        accum = K * u * u
+    elif mode == "kahan":
+        accum = K * _UNIT_ROUNDOFF[torch.float64]
+    else:
+        raise ValueError(f"unknown precision mode {mode!r}")
+    return accum + u
+
+
+def select_precision_for_error(dtype: torch.dtype, K: int, target_forward_error: float) -> str:
+    """Select the cheapest precision mode whose forward error bound ≤ target.
+
+    Selects from ``"fast"`` → ``"sr"`` → ``"dd"`` → ``"kahan"`` in order of
+    increasing cost. Returns the first mode whose error bound (see
+    :func:`forward_error_bound`) satisfies ``target_forward_error``.
+
+    Args:
+        dtype: Operand dtype (= result dtype). Determines unit roundoff u.
+        K: Product of all contracted dimension sizes.
+        target_forward_error: Desired upper bound on componentwise relative
+            forward error per output element.
+
+    Returns:
+        ``"fast"``, ``"sr"``, ``"dd"``, or ``"kahan"``.
+
+    Raises:
+        ValueError: If even an exact FP64 accumulation (K · u_f64) cannot
+            achieve the target.
+
+    Warns:
+        RuntimeWarning: Once per process, when the target is below the
+            result dtype's floor (``"kahan"``'s bound, ≈ u of ``dtype``):
+            the result is rounded to ``dtype`` at the end, so no accumulation
+            mode can meet the target. ``"kahan"`` (the most accurate mode) is
+            returned anyway.
+
+    Error bounds (Higham 2002 §3, Connolly–Higham–Mary SIAM 2021), with
+    u_out the unit roundoff of the result dtype:
+
+    .. code-block:: text
+
+        "fast":  K · u   + u_out    Wilkinson worst-case, round-to-nearest
+        "sr":    √K · u  + u_out    Expected; mean-zero bias — statistical, not worst-case
+        "dd":    K · u²  + u_out    Ozaki-2 worst-case
+        "kahan": K · 2⁻⁵³ + u_out   FP64 accumulation, one final rounding
+
+    For BF16 the floor is u_out = 2⁻⁸ ≈ 3.9e-3; for FP32, 2⁻²⁴ ≈ 6.0e-8.
+
+    ``"sr"`` and ``"dd"`` are only considered for BF16 and FP16 inputs —
+    those are the dtypes where NKI SR and Ozaki splitting are meaningful.
+
+    The ``"sr"`` bound assumes stochastic rounding actually happens. On the
+    Trainium NKI path that requires ``NEURON_RT_STOCHASTIC_ROUNDING_EN=1`` at
+    process start; when ``"sr"`` is selected without it, execution emits a
+    one-time ``RuntimeWarning`` and rounds to nearest, so the effective bound
+    is the ``"fast"`` one (K · u + u_out).
+    """
+    u_f64 = _UNIT_ROUNDOFF[torch.float64]
+
+    if forward_error_bound("fast", dtype, K) <= target_forward_error:
+        return "fast"
+    if dtype in _SR_DD_DTYPES and forward_error_bound("sr", dtype, K) <= target_forward_error:
+        return "sr"
+    if dtype in _SR_DD_DTYPES and forward_error_bound("dd", dtype, K) <= target_forward_error:
+        return "dd"
+    if K * u_f64 > target_forward_error:
+        raise ValueError(
+            f"Cannot achieve target_forward_error={target_forward_error:.2e} for "
+            f"K={K}, dtype={dtype}. "
+            f"Best available: 'kahan' (K·u_f64 ≈ {K * u_f64:.2e}, plus the "
+            f"{dtype} output rounding)."
+        )
+    floor = forward_error_bound("kahan", dtype, K)
+    if floor > target_forward_error:
+        _warn_target_below_output_floor(dtype, K, target_forward_error, floor)
+    return "kahan"

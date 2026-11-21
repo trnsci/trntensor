@@ -13,11 +13,15 @@ is the product.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
-from .nki.dispatch import HAS_NKI, _use_nki
+from .nki import dispatch as _dispatch
+from .nki.dispatch import _ao_to_mo_route, _fp64_host_guard, _mp2_energy_route
 
 
+@_fp64_host_guard("mp2_energy")
 def mp2_energy(
     B: torch.Tensor,
     eps_occ: torch.Tensor,
@@ -34,12 +38,31 @@ def mp2_energy(
         T_{ijab}  = Σ_P B[i,a,P] B[j,b,P]
         Δ_{ijab}  = ε_i + ε_j - ε_a - ε_b
 
-    On Trainium the entire sum is one fused NKI dispatch: contraction
-    accumulates in PSUM, the spin-adapted numerator and denominator are
-    built in SBUF, and the final reduction folds into a scalar
-    accumulator — no intermediate ``T`` tensor is ever materialized to
-    HBM. On CPU the reference path falls back to a Python loop of
-    einsum calls (same as ``examples/df_mp2_einsum.py``).
+    On Trainium the contraction, the spin-adapted numerator, the
+    denominator and the reduction run inside NKI kernels: ``T`` accumulates
+    in PSUM, is folded on the Vector Engine and never reaches device memory.
+
+    - Native TorchNeuron path (Trn2/Trn3): the row kernel
+      (``mp2_energy_row_kernel``, one launch per occupied row, pair symmetry,
+      both physical cores at LNC=2). ``"auto"`` uses it for device-resident
+      ``B`` once each row launch carries at least 3 GFLOP (padded
+      ``2·(nocc//2+1)·nvir²·naux``; e.g. ``nocc=32, nvir=320, naux=1024``).
+      There it measured 1.25-1.9x faster than aten on Trn2, with the gap
+      growing with size (#51). Smaller problems use the aten formulation on
+      the device. ``set_backend("nki")`` uses the row kernel whenever it fits
+      in SBUF. ``TRNTENSOR_MP2_ENERGY=auto|rows|aten|legacy`` overrides the
+      choice.
+    - **Host ``B`` under native ``"auto"`` (#56)**: from
+      ``nocc²·nvir²·naux`` of 1.5e8 multiply-adds (times host threads / 2),
+      ``B`` and the orbital energies are uploaded and the device route above
+      runs; the energy comes back as a host scalar. On Trn2 with 2 host threads that took 646 ms ->
+      16 ms at nocc=32, nvir=224, naux=1024 and 15.8 s -> 135 ms at
+      64/448/1536. Smaller problems stay on the host.
+      ``TRNTENSOR_HOST_ROUTE=host|device`` overrides the size test.
+    - PyTorch/XLA path (Trn1): the original single-launch kernel.
+
+    The aten formulation contracts ``T`` in occupied-index chunks, so its
+    peak memory is bounded.
 
     Parameters
     ----------
@@ -63,25 +86,63 @@ def mp2_energy(
     if eps_vir.shape != (nvir,):
         raise ValueError(f"eps_vir must have shape ({nvir},); got {tuple(eps_vir.shape)}")
 
-    if _use_nki() and HAS_NKI:
-        # NotImplementedError propagates — it signals an unsupported shape,
-        # not a transient kernel failure. Other exceptions fall back to CPU
-        # unless TRNTENSOR_REQUIRE_NKI=1.
-        from .nki.dispatch import _nki_mp2_energy
+    if _dispatch._offload_host(
+        nocc * nocc * nvir * nvir * _naux, _dispatch._MP2_HOST_OFFLOAD_MACS, B, eps_occ, eps_vir
+    ):
+        e = _on_device(mp2_energy, B, eps_occ, eps_vir)
+        if e is not None:
+            return e.to(B.device)
+    route = _mp2_energy_route(B)
+    kops = None
+    if route != "aten":
+        # fp32 / bf16 kernels: float64 / float16 run in fp32; integer, bool
+        # and complex take aten (the dtype guard, `_chem_kernel_operands`).
+        kops = _dispatch._chem_kernel_operands("mp2_energy", B, eps_occ, eps_vir)
+    if kops is not None:
+        from .nki import dispatch as _d
 
-        if nvir > 128 or _naux > 128:
-            raise NotImplementedError(
-                f"mp2_energy NKI path requires nvir ≤ 128 and naux ≤ 128 "
-                f"(got nvir={nvir}, naux={_naux}). K/M tiling not yet implemented."
-            )
         try:
-            return _nki_mp2_energy(B, eps_occ, eps_vir)
+            # The kernels compute in fp32; return the dtype the aten path
+            # gives (fp64 / bf16 callers got fp32 through 0.22.0).
+            out_dtype = torch.promote_types(
+                torch.promote_types(B.dtype, eps_occ.dtype), eps_vir.dtype
+            )
+            kB, keo, kev = kops
+            if route == "rows":
+                return _d._nki_mp2_energy_rows(kB, keo, kev).to(out_dtype)
+            if _d._on_native_path():
+                _d._warn_native_kernel_deprecated(
+                    "original mp2_energy",
+                    "the Trn2 row kernel replaces it (TRNTENSOR_MP2_ENERGY=rows)",
+                )
+            return _d._nki_mp2_energy(kB, keo, kev).to(out_dtype)
         except Exception:
             import os
 
             if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
                 raise
+            if route == "rows":
+                _d._note_native_kernel_failure(("mp2", tuple(B.shape)))
     return _cpu_mp2_energy(B, eps_occ, eps_vir)
+
+
+def _on_device(fn, *tensors: torch.Tensor):
+    """``fn`` on the operands uploaded to the ``neuron`` device (#56), or None
+    when that fails (e.g. the device is full), so the caller runs on the host.
+    ``TRNTENSOR_REQUIRE_NKI=1`` re-raises instead."""
+    import os
+
+    try:
+        return fn(*(t.to(_dispatch._NEURON_DEVICE) for t in tensors))
+    except Exception:
+        if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
+            raise
+        return None
+
+
+# Elements of the per-chunk T block (chunk·nocc·nvir²) the aten MP2 path
+# materializes at once: 2²⁴ fp32 elements = 64 MiB.
+_MP2_CHUNK_ELEMS = 1 << 24
 
 
 def _cpu_mp2_energy(
@@ -89,17 +150,122 @@ def _cpu_mp2_energy(
     eps_occ: torch.Tensor,
     eps_vir: torch.Tensor,
 ) -> torch.Tensor:
-    """Reference implementation. Same loop as ``examples/df_mp2_einsum.py``."""
-    nocc = B.shape[0]
+    """Reference implementation in aten ops, on ``B``'s device.
+
+    Vectorized over ``(j, a, b)`` and chunked over ``i``:
+    ``T[i,j,a,b] = Σ_P B[i,a,P] B[j,b,P]`` for a chunk of ``i``, then
+    ``Σ T (2T - T_ijba) / Δ``. ``T_ijba`` is the last-two-dims transpose
+    of the same block, so each chunk is self-contained. Replaces the
+    former nocc² Python loop (``examples/df_mp2_einsum.py``), which on a
+    Trainium device ran 10-40x slower than this form (#41).
+    """
+    nocc, nvir, _naux = B.shape
+    # T blocks of at most _MP2_CHUNK_ELEMS elements (i and j both chunked).
+    # Chunking i alone left one i row's T at nocc·nvir² elements: 1.37 GB
+    # (with ~4 temporaries per step) at nocc=161, nvir=1461, which ran a
+    # 24 GiB NeuronCore out of memory with only 5.7 GB of B resident.
+    jstep = max(1, min(nocc, _MP2_CHUNK_ELEMS // max(1, nvir * nvir)))
+    istep = max(1, _MP2_CHUNK_ELEMS // max(1, jstep * nvir * nvir))
+    eps_occ = eps_occ.to(B.device)
+    eps_vir = eps_vir.to(B.device)
+    ev = eps_vir[:, None] + eps_vir[None, :]  # (a, b)
     e = B.new_zeros(())
-    for i in range(nocc):
-        for j in range(nocc):
-            T = torch.einsum("ap,bp->ab", B[i], B[j])
-            denom = eps_occ[i] + eps_occ[j] - eps_vir.unsqueeze(1) - eps_vir.unsqueeze(0)
-            e = e + (T * (2 * T - T.T) / denom).sum()
+    for i0 in range(0, nocc, istep):
+        Bi = B[i0 : i0 + istep]
+        for j0 in range(0, nocc, jstep):
+            T = torch.einsum("iap,jbp->ijab", Bi, B[j0 : j0 + jstep])
+            eij = eps_occ[i0 : i0 + istep, None] + eps_occ[None, j0 : j0 + jstep]
+            denom = eij[:, :, None, None] - ev
+            e = e + (T * (2 * T - T.transpose(2, 3)) / denom).sum()
     return e
 
 
+# ``index_select`` along dim 0 on the neuron device returns wrong data at
+# LNC=1 once its output passes 2^32 bytes, with no error (#97). Device gathers
+# are split into row blocks whose output stays at or below this many bytes.
+_GATHER_MAX_BYTES = 1 << 31
+
+
+def _gather_in_blocks(t: torch.Tensor) -> bool:
+    """Whether gathers from ``t`` are split (any non-CPU device; patched in tests)."""
+    return t.device.type != "cpu"
+
+
+def _index_select_rows(
+    src: torch.Tensor, idx: torch.Tensor, what: str = "unpack_tril"
+) -> torch.Tensor:
+    """``src.index_select(0, idx)``, in blocks of at most ``_GATHER_MAX_BYTES``
+    of output on a device (#97), concatenated in order.
+
+    On the neuron device both the gather (``index_select`` / fancy indexing)
+    and ``torch.cat`` round float64 to fp32 (measured on Trn2: rel err ~4e-8;
+    fp32 and narrower dtypes are exact). So under ``"auto"`` a float64 /
+    complex128 ``src`` on the neuron device is gathered on the host and the
+    result goes back to ``src``'s device (one warning per op), unless
+    ``TRNTENSOR_FP64_ON_DEVICE=1``; ``TRNTENSOR_REQUIRE_NKI=1`` raises."""
+    from .nki.dispatch import _fp64_host_devices
+
+    if _fp64_host_devices(what, src.dtype, [src.device]) is not None:
+        return src.cpu().index_select(0, idx.cpu()).to(src.device)
+    row_bytes = math.prod(src.shape[1:]) * src.element_size()
+    if not _gather_in_blocks(src) or idx.numel() * row_bytes <= _GATHER_MAX_BYTES:
+        return src.index_select(0, idx)
+    step = max(1, _GATHER_MAX_BYTES // max(1, row_bytes))
+    blocks = [src.index_select(0, idx[i : i + step]) for i in range(0, idx.numel(), step)]
+    return torch.cat(blocks)
+
+
+def pack_tril(eri: torch.Tensor) -> torch.Tensor:
+    """``(nbasis, nbasis, naux)`` μ↔ν-symmetric integrals → packed ``(npair, naux)``.
+
+    Row ``μ(μ+1)/2 + ν`` holds ``eri[μ, ν]`` for ``ν ≤ μ``, with ``npair =
+    nbasis(nbasis+1)/2``: PySCF's ``lib.pack_tril`` order (its ``_cderi``,
+    ``(naux, npair)``, is the transpose) and ``trnblas.parallel.pack_tril``'s
+    layout. Only the lower triangle is read; the input is assumed symmetric.
+    """
+    if eri.dim() != 3 or eri.shape[0] != eri.shape[1]:
+        raise ValueError(f"eri must be (nbasis, nbasis, naux); got shape {tuple(eri.shape)}")
+    n = eri.shape[0]
+    r = torch.tril_indices(n, n)
+    rows = (r[0] * n + r[1]).to(eri.device)
+    return _index_select_rows(eri.reshape(n * n, eri.shape[2]), rows, "pack_tril")
+
+
+def unpack_tril(eri_packed: torch.Tensor, nbasis: int) -> torch.Tensor:
+    """Inverse of :func:`pack_tril`: packed ``(npair, naux)`` → full ``(nbasis, nbasis, naux)``.
+
+    One ``index_select`` on the packed tensor's device, split into row
+    blocks of at most 2 GiB of output on a device (#97: one gather with an
+    output over 4 GiB is silently wrong on the neuron device at LNC=1). Exact
+    for fp32 and narrower; a float64 / complex128 input on the neuron device
+    is gathered on the host under ``"auto"`` (device gathers round float64 to
+    fp32), see ``_index_select_rows``.
+    """
+    npair, naux = eri_packed.shape
+    if npair != nbasis * (nbasis + 1) // 2:
+        raise ValueError(
+            f"packed eri has {npair} rows; nbasis={nbasis} needs {nbasis * (nbasis + 1) // 2}"
+        )
+    from .nki.dispatch import _tril_rows
+
+    idx = _tril_rows(nbasis).reshape(-1).to(eri_packed.device)
+    return _index_select_rows(eri_packed, idx, "unpack_tril").reshape(nbasis, nbasis, naux)
+
+
+def _as_packed_rows(eri: torch.Tensor, nbasis: int) -> torch.Tensor:
+    """A 2-D ``eri`` as ``(npair, naux)``: accepts that, or PySCF's ``(naux, npair)``."""
+    npair = nbasis * (nbasis + 1) // 2
+    if eri.shape[0] == npair:
+        return eri
+    if eri.shape[1] == npair:
+        return eri.T
+    raise ValueError(
+        f"eri must be 3D (nbasis, nbasis, naux), or packed 2D (npair, naux) / (naux, npair) "
+        f"with npair = nbasis(nbasis+1)/2 = {npair} for nbasis={nbasis}; got {tuple(eri.shape)}"
+    )
+
+
+@_fp64_host_guard("ao_to_mo_transform")
 def ao_to_mo_transform(
     eri: torch.Tensor,
     C_occ: torch.Tensor,
@@ -111,11 +277,57 @@ def ao_to_mo_transform(
 
         B[i, a, P] = Σ_{μ, ν} C_occ[μ, i] · C_vir[ν, a] · eri[μ, ν, P]
 
-    as the canonical chemistry primitive. On Trainium, this is one NKI
-    program: the first matmul's result lives in SBUF as an intermediate
-    ``(i, ν)`` tile that feeds the second matmul directly — no
-    intermediate four-index tensor is materialized to HBM. On CPU the
-    fallback is ``torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)``.
+    as the canonical chemistry primitive, one NKI program on Trainium.
+
+    - Native TorchNeuron path (Trn2/Trn3): ``ao_to_mo_trn2_kernel``. Both
+      stages are plain GEMMs with the contraction index on the partition
+      axis (no DMA transposes), and the auxiliary index is split across both
+      physical cores at LNC=2; ``nocc > 128`` runs in occupied blocks of
+      ≤ 128 over one read of ``eri`` (#80). ``"auto"`` uses it for
+      device-resident ``eri`` when its SBUF working set fits and the stage-1
+      work ``nocc·nbasis²·naux`` is at least 5e8 multiply-adds (about
+      nbasis ≥ 256). There it measured 1.3-1.6x faster than the two aten
+      einsums on Trn2 (#51). Otherwise the
+      two-step aten contraction below runs. ``TRNTENSOR_AO_TO_MO=
+      auto|trn2|aten|legacy`` overrides the choice.
+    - PyTorch/XLA path (Trn1): the original kernel (``nocc ≤ 128``).
+
+    Without NKI the fallback is the same two-step contraction.
+
+    **Packed integrals (#54).** Real three-centre integrals are symmetric in
+    μ↔ν, and drivers store only the lower triangle. A 2-D ``eri`` is taken
+    as that packed form: ``(npair, naux)`` with row ``μ(μ+1)/2 + ν`` for
+    ``ν ≤ μ`` and ``npair = nbasis(nbasis+1)/2`` (:func:`pack_tril`;
+    ``trnblas.parallel.pack_tril``), or PySCF's ``_cderi`` ``(naux, npair)``
+    as is (one transpose copy on the tensor's device; pass ``cderi.T`` when
+    ``naux == npair``). On the native path the packed tensor feeds
+    ``ao_to_mo_trn2_packed_kernel``, which gathers its rows in place: the
+    full square never exists in device memory, and only half the bytes
+    cross the host link. Where that kernel's SBUF working set (which grows
+    with n_ao: 979 KiB per partition at n_ao = 3508) passes the budget,
+    fp32 integrals take ``ao_to_mo_trn2_packed_blocked_kernel`` instead,
+    which streams every operand over blocks of μ/ν tiles and keeps an SBUF
+    footprint independent of n_ao (#112);
+    ``TRNTENSOR_AO_TO_MO_PACKED=auto|resident|blocked`` overrides. The
+    aten and legacy routes unpack it with one
+    ``index_select`` (exact for fp32; float64 operands on the neuron device
+    already run on the host under ``"auto"``).
+
+    **Host inputs (#56).** Under native ``"auto"`` with ``eri``, ``C_occ``
+    and ``C_vir`` all on the host, the inputs are uploaded (``eri`` in the
+    layout given), the device route above runs and the result comes back to
+    the host, once the stage-1 work ``nocc·nbasis²·naux`` reaches 2e8
+    multiply-adds for a full ``eri`` or 3e7 for a packed one, times host
+    threads / 2 (packed host input otherwise pays a host unpack). ``TRNTENSOR_HOST_ROUTE=host|device``
+    overrides the size test.
+
+    **Host integrals, device orbitals.** When ``eri`` is on the host and
+    ``C_occ`` on a Neuron device, ``eri`` is uploaded to that device first
+    (the result stays there). Send it packed: the upload runs at the host
+    link's ~14 GB/s whatever the host buffer (pinned memory measured no
+    faster), so halving the bytes is what moves it. Packing a full host
+    tensor here would cost more host time than it saves, so a 3-D ``eri``
+    is uploaded as is.
 
     Composes with :func:`mp2_energy`: ``B = ao_to_mo_transform(eri, C_occ,
     C_vir)`` then ``E = mp2_energy(B, eps_occ, eps_vir)`` is the full
@@ -123,8 +335,9 @@ def ao_to_mo_transform(
 
     Parameters
     ----------
-    eri : (nbasis, nbasis, naux) tensor
-        Density-fitted two-electron integrals in the AO basis.
+    eri : (nbasis, nbasis, naux), (npair, naux) or (naux, npair) tensor
+        Density-fitted three-centre integrals in the AO basis, full or
+        packed lower triangle.
     C_occ : (nbasis, nocc) tensor
         Occupied molecular orbital coefficients.
     C_vir : (nbasis, nvir) tensor
@@ -135,53 +348,98 @@ def ao_to_mo_transform(
     (nocc, nvir, naux) tensor
         The transformed DF coefficients ``B_ia^P``.
     """
-    if eri.dim() != 3:
-        raise ValueError(f"eri must be 3D (nbasis, nbasis, naux); got shape {tuple(eri.shape)}")
-    nbasis_mu, nbasis_nu, _naux = eri.shape
-    if nbasis_mu != nbasis_nu:
+    if C_occ.dim() != 2 or C_vir.dim() != 2:
         raise ValueError(
-            f"eri first two dims must match (nbasis, nbasis); got ({nbasis_mu}, {nbasis_nu})"
+            f"C_occ and C_vir must be 2D; got {tuple(C_occ.shape)} and {tuple(C_vir.shape)}"
         )
-    nbasis = nbasis_mu
-    if C_occ.dim() != 2 or C_occ.shape[0] != nbasis:
+    nbasis = C_occ.shape[0]
+    if eri.dim() == 2:
+        eri = _as_packed_rows(eri, nbasis)
+    elif eri.dim() == 3:
+        nbasis_mu, nbasis_nu, _naux = eri.shape
+        if nbasis_mu != nbasis_nu:
+            raise ValueError(
+                f"eri first two dims must match (nbasis, nbasis); got ({nbasis_mu}, {nbasis_nu})"
+            )
+        nbasis = nbasis_mu
+    else:
+        raise ValueError(
+            "eri must be 3D (nbasis, nbasis, naux) or packed 2D (npair, naux); "
+            f"got shape {tuple(eri.shape)}"
+        )
+    if C_occ.shape[0] != nbasis:
         raise ValueError(f"C_occ must have shape ({nbasis}, nocc); got {tuple(C_occ.shape)}")
-    if C_vir.dim() != 2 or C_vir.shape[0] != nbasis:
+    if C_vir.shape[0] != nbasis:
         raise ValueError(f"C_vir must have shape ({nbasis}, nvir); got {tuple(C_vir.shape)}")
     _, nocc = C_occ.shape
     _, nvir = C_vir.shape
+    packed = eri.dim() == 2
+    if _dispatch._offload_host(
+        nocc * nbasis * nbasis * eri.shape[-1],
+        _dispatch._AO_TO_MO_HOST_OFFLOAD_MACS_PACKED
+        if packed
+        else _dispatch._AO_TO_MO_HOST_OFFLOAD_MACS,
+        eri,
+        C_occ,
+        C_vir,
+    ):
+        # Host in, host out through the device (#56): upload the orbitals
+        # here and the integrals below (in the caller's layout), run the
+        # device route, download into cached host memory.
+        out = _on_device(lambda co, cv: ao_to_mo_transform(eri, co, cv), C_occ, C_vir)
+        if out is not None:
+            return _dispatch._to_host(out, "cpu")
+    if eri.device.type == "cpu" and C_occ.device.type != "cpu":
+        # Upload in the caller's layout: PySCF's (naux, npair) goes up as is
+        # (a host-side transpose would cost more than the upload saves).
+        if packed and not eri.is_contiguous() and eri.T.is_contiguous():
+            eri = eri.T.to(C_occ.device).T
+        else:
+            eri = eri.contiguous().to(C_occ.device)
 
-    if _use_nki() and HAS_NKI:
-        from .nki.dispatch import _nki_ao_to_mo_transform
+    route = _ao_to_mo_route(eri, nocc, nvir, nbasis)
+    kops = None
+    if route != "aten":
+        kops = _dispatch._chem_kernel_operands("ao_to_mo_transform", eri, C_occ, C_vir)
+        if kops is None:  # integer / bool / complex: aten
+            route = "aten"
+    if packed and route != "trn2":
+        # aten / legacy consume the full square.
+        return ao_to_mo_transform(unpack_tril(eri, nbasis), C_occ, C_vir)
+    if route != "aten":
+        from .nki import dispatch as _d
 
-        # K-tiled path: nbasis is tiled in chunks of 128 (TILE_K), so
-        # nbasis itself is no longer bounded by 128 — only by the moving
-        # free dim (ν side of the step-1 eri tile): nbasis ≤ 512.
-        # NOCC ≤ 128: stationary free dim (M) of both nc_matmul steps.
-        # NVIR ≤ 512: moving free dim (N) of the step-2 C_vir tile.
-        if nbasis > 512:
-            raise NotImplementedError(
-                f"ao_to_mo_transform NKI path requires nbasis ≤ 512 "
-                f"(got nbasis={nbasis}); N-tiling for the ν (moving) dim "
-                f"not yet implemented."
-            )
-        if nocc > 128:
+        # The original kernel: NOCC ≤ 128 is the stationary M dim of its
+        # step-2 nc_matmul; M-tiling not implemented. (The Trn2 kernel
+        # tiles the occupied index itself, #80.)
+        if route == "legacy" and nocc > 128:
             raise NotImplementedError(
                 f"ao_to_mo_transform NKI path requires nocc ≤ 128 "
                 f"(got nocc={nocc}); M-tiling not yet implemented."
             )
-        if nvir > 512:
-            raise NotImplementedError(
-                f"ao_to_mo_transform NKI path requires nvir ≤ 512 "
-                f"(got nvir={nvir}); N-tiling for the virtual dim "
-                f"not yet implemented."
-            )
+        # The kernels compute in fp32; return the dtype the aten path gives.
+        out_dtype = torch.promote_types(torch.promote_types(eri.dtype, C_occ.dtype), C_vir.dtype)
+        k_eri, k_co, k_cv = kops
         try:
-            return _nki_ao_to_mo_transform(eri, C_occ, C_vir)
+            if route == "trn2":
+                if packed:
+                    return _d._nki_ao_to_mo_trn2_packed(k_eri, k_co, k_cv).to(out_dtype)
+                return _d._nki_ao_to_mo_trn2(k_eri, k_co, k_cv).to(out_dtype)
+            if _d._on_native_path():
+                _d._warn_native_kernel_deprecated(
+                    "original ao_to_mo_transform",
+                    "the Trn2 kernel replaces it (TRNTENSOR_AO_TO_MO=trn2)",
+                )
+            return _d._nki_ao_to_mo_transform(k_eri, k_co, k_cv).to(out_dtype)
         except Exception:
             import os
 
             if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
                 raise
+            if route == "trn2":
+                _d._note_native_kernel_failure(("ao2mo", tuple(eri.shape), nocc, nvir))
+    if packed:
+        eri = unpack_tril(eri, nbasis)
     return _cpu_ao_to_mo_transform(eri, C_occ, C_vir)
 
 
@@ -190,5 +448,226 @@ def _cpu_ao_to_mo_transform(
     C_occ: torch.Tensor,
     C_vir: torch.Tensor,
 ) -> torch.Tensor:
-    """Reference: the fused 3-operand einsum form."""
-    return torch.einsum("mi,na,mnP->iaP", C_occ, C_vir, eri)
+    """Reference: ``einsum("mi,na,mnP->iaP")`` as two explicit binary steps.
+
+    Contracting ``μ`` first (``inP``), then ``ν``, is the O(nbasis²·nocc·naux)
+    order; it never builds the 4-index ``C_occ ⊗ C_vir`` outer product.
+    """
+    if eri.device.type == _dispatch._NEURON_DEVICE and (
+        eri.numel() * eri.element_size() >= _dispatch._ATEN_TRANSPOSED_LHS_MAX_BYTES
+        or C_occ.shape[1] * eri.shape[1] * eri.shape[2] * eri.element_size()
+        >= _dispatch._ATEN_TRANSPOSED_LHS_MAX_BYTES
+    ):
+        return _ao_to_mo_contiguous_lhs(eri, C_occ, C_vir)
+    half = torch.einsum("mi,mnP->inP", C_occ, eri)
+    return torch.einsum("na,inP->iaP", C_vir, half)
+
+
+def _ao_to_mo_contiguous_lhs(
+    eri: torch.Tensor,
+    C_occ: torch.Tensor,
+    C_vir: torch.Tensor,
+) -> torch.Tensor:
+    """The two aten steps with contiguous left operands (large ``eri`` on a device).
+
+    ``torch.einsum`` lowers both steps to a matmul whose left operand is a
+    transposed view (``C_occ.T``, ``C_vir.T``). On TorchNeuron that matmul
+    returns wrong values without an error (or aborts with a DMA error) once
+    the right operand reaches 4 GiB (#97, aws-neuron-sdk#1448). With
+    the transposes materialised (a few MB) the same products are correct.
+    A contiguous left operand is not enough once a row of
+    ``eri.reshape(nbasis, nbasis * naux)`` reaches 32 MiB
+    (``nbasis * naux >= 8,388,608`` fp32, #123): both steps go through
+    ``_neuron_matmul``, which blocks such operands by rows.
+    """
+    nbasis, _, naux = eri.shape
+    nocc, nvir = C_occ.shape[1], C_vir.shape[1]
+    mm = _dispatch._neuron_matmul
+    half = mm(C_occ.T.contiguous(), eri.reshape(nbasis, nbasis * naux))
+    half = half.reshape(nocc, nbasis, naux)
+    return mm(C_vir.T.contiguous().expand(nocc, nvir, nbasis), half)
+
+
+# Bytes of gathered packed rows the aten df_exchange path materialises at
+# once (one block of ν rows of the square).
+_DF_K_GATHER_BYTES = 1 << 30
+
+
+@_fp64_host_guard("df_exchange")
+def df_exchange(
+    B: torch.Tensor,
+    C_occ: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Density-fitted exchange matrix from packed three-centre integrals.
+
+    Computes
+
+        K[μ, ν] = alpha · Σ_{i, P} X[i, μ, P] X[i, ν, P],
+        X[i, ν, P] = Σ_λ C_occ[λ, i] B[λν, P]
+
+    For a closed-shell density ``D = 2 C_occ C_occᵀ`` the SCF exchange
+    matrix is ``df_exchange(B, C_occ, alpha=2.0)``.
+
+    - Native TorchNeuron path (Trn2/Trn3): two NKI launches (#60). The
+      first gathers the packed rows in place with batched indirect DMA (as
+      ``ao_to_mo_transform``'s packed kernel does) and forms the
+      half-transformed ``Xt[P, i, ν]`` with the aux index on partitions; the
+      full square never exists. The second accumulates ``K`` in PSUM over
+      128-row aux tiles, computes only the upper-triangle strips and mirrors
+      them on the Tensor Engine. Both launches split their work across the
+      programs of the logical core (both physical cores at LNC=2).
+      ``"auto"`` uses it for device-resident ``B`` when a tiling fits (see
+      :func:`trntensor.nki.dispatch._df_exchange_route`).
+      ``TRNTENSOR_DF_EXCHANGE=auto|trn2|aten`` overrides the choice.
+    - Otherwise (and on the host) an aten formulation: gather blocks of
+      rows of the square, half-transform them with one einsum into
+      ``(ν, i, P)`` order, and one GEMM ``K = Xm Xmᵀ``.
+
+    Parameters
+    ----------
+    B : (npair, naux) or (naux, npair) tensor
+        Packed lower triangle (``μ(μ+1)/2 + ν`` row order, :func:`pack_tril`;
+        PySCF ``_cderi`` is the ``(naux, npair)`` form). A full
+        ``(nbasis, nbasis, naux)`` tensor is also accepted (aten route).
+    C_occ : (nbasis, nocc) tensor
+        Occupied orbital coefficients.
+    alpha : float
+        Scale factor.
+
+    Returns
+    -------
+    (nbasis, nbasis) tensor, symmetric.
+    """
+    if C_occ.dim() != 2:
+        raise ValueError(f"C_occ must be 2D; got {tuple(C_occ.shape)}")
+    nbasis, nocc = C_occ.shape
+    if B.dim() == 2:
+        B = _as_packed_rows(B, nbasis)
+    elif B.dim() == 3:
+        if B.shape[0] != nbasis or B.shape[1] != nbasis:
+            raise ValueError(
+                f"B must be (nbasis, nbasis, naux) with nbasis={nbasis}; got {tuple(B.shape)}"
+            )
+    else:
+        raise ValueError(f"B must be packed 2D or full 3D; got shape {tuple(B.shape)}")
+    if B.device != C_occ.device:
+        C_occ = C_occ.to(B.device)
+    kops = None
+    if B.dim() == 2 and _dispatch._df_exchange_route(B, nocc, nbasis) == "trn2":
+        # C_occ is cast to the kernel dtype, as the aten route casts it to B's.
+        kops = _dispatch._chem_kernel_operands("df_exchange", B, allowed=_dispatch._F32_DTYPES)
+    if kops is not None:
+        try:
+            # fp32 kernel; the aten path returns B's dtype.
+            (kB,) = kops
+            K = _dispatch._nki_df_exchange(kB, C_occ.to(kB.dtype)).to(B.dtype)
+            return K * alpha if alpha != 1.0 else K
+        except Exception:
+            import os
+
+            if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
+                raise
+            _dispatch._note_native_kernel_failure(("dfk", tuple(B.shape), nocc))
+    return _aten_df_exchange(B, C_occ, alpha)
+
+
+def _aten_df_exchange(B: torch.Tensor, C_occ: torch.Tensor, alpha: float) -> torch.Tensor:
+    """``df_exchange`` in aten ops on ``B``'s device (exact up to rounding)."""
+    nbasis, nocc = C_occ.shape
+    C = C_occ.to(B.dtype)
+    if B.dim() == 3:
+        X = torch.einsum("lvp,li->vip", B, C)
+    else:
+        from .nki.dispatch import _tril_rows
+
+        naux = B.shape[1]
+        rows = _tril_rows(nbasis).to(B.device)  # (ν, λ) -> packed row
+        nv = max(1, _DF_K_GATHER_BYTES // max(1, nbasis * naux * B.element_size()))
+        parts = []
+        for v0 in range(0, nbasis, nv):
+            v1 = min(nbasis, v0 + nv)
+            Bv = B.index_select(0, rows[v0:v1].reshape(-1)).reshape(v1 - v0, nbasis, naux)
+            parts.append(torch.einsum("vlp,li->vip", Bv, C))
+        X = parts[0] if len(parts) == 1 else torch.cat(parts)
+    Xm = X.reshape(nbasis, -1)
+    return torch.matmul(Xm, Xm.T) * alpha if alpha != 1.0 else torch.matmul(Xm, Xm.T)
+
+
+@_fp64_host_guard("df_coulomb")
+def df_coulomb(B: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
+    """Density-fitted Coulomb matrix from packed three-centre integrals.
+
+    Computes
+
+        J[μ, ν] = Σ_P B[μν, P] d[P],    d[P] = Σ_{λσ} D[λ, σ] B[λσ, P]
+
+    for a symmetric density ``D`` (closed shell: ``D = 2 C_occ C_occᵀ``).
+    With :func:`df_exchange` this is the J/K build of a DF-SCF iteration.
+
+    ``D`` may also be given packed: the ``(npair,)`` vector ``w·D[μ, ν]``
+    for ``ν ≤ μ`` (``w`` = 1 on the diagonal, 2 off it; :func:`pack_tril`
+    order). Then the packed ``(npair,)`` J comes back, so a caller that
+    splits the aux index into blocks packs and unpacks once, not per block:
+    on the device those are element gathers.
+
+    - Native TorchNeuron path (Trn2/Trn3): two NKI launches (#60), each
+      streaming the packed ``B`` once in contiguous 128-row tiles with one
+      fused multiply-add (``d``) or multiply-reduce (``J``) per tile on the
+      Vector Engine, rows split across both physical cores at LNC=2. The
+      < 256 leftover rows are small aten GEMVs. ``"auto"`` uses them for
+      device-resident ``B`` from ``npair·naux`` = 1e7.
+      ``TRNTENSOR_DF_COULOMB=auto|trn2|aten`` overrides the choice.
+    - Otherwise two GEMVs on ``B``'s device.
+
+    Parameters
+    ----------
+    B : (npair, naux) or (naux, npair) tensor
+        Packed lower triangle, as for :func:`df_exchange`.
+    D : (nbasis, nbasis) or (npair,) tensor
+        Symmetric density matrix (only its lower triangle is read), or its
+        weighted packed form.
+
+    Returns
+    -------
+    (nbasis, nbasis) tensor, symmetric; ``(npair,)`` for a packed ``D``.
+    """
+    from .nki.dispatch import _tril_rows
+
+    if B.dim() != 2:
+        raise ValueError(f"B must be packed 2D; got shape {tuple(B.shape)}")
+    if D.dim() == 1:
+        npair = D.shape[0]
+        nbasis = int(round(((8 * npair + 1) ** 0.5 - 1) / 2))
+        if nbasis * (nbasis + 1) // 2 != npair:
+            raise ValueError(f"packed D has {npair} entries, not nbasis(nbasis+1)/2")
+        B = _as_packed_rows(B, nbasis)
+        pw = D.to(B.dtype).to(B.device)
+    elif D.dim() == 2 and D.shape[0] == D.shape[1]:
+        nbasis = D.shape[0]
+        B = _as_packed_rows(B, nbasis)
+        r = torch.tril_indices(nbasis, nbasis)
+        lin = (r[0] * nbasis + r[1]).to(B.device)
+        w = torch.where(r[0] == r[1], 1.0, 2.0).to(B.dtype).to(B.device)
+        pw = D.to(B.device).reshape(-1).to(B.dtype).index_select(0, lin) * w
+    else:
+        raise ValueError(f"D must be (nbasis, nbasis) or packed (npair,); got {tuple(D.shape)}")
+    jp = None
+    kops = None
+    if _dispatch._df_coulomb_route(B) == "trn2":
+        kops = _dispatch._chem_kernel_operands("df_coulomb", B, allowed=_dispatch._F32_DTYPES)
+    if kops is not None:
+        try:
+            (kB,) = kops
+            jp = _dispatch._nki_df_coulomb(kB, pw.to(kB.dtype)).to(B.dtype)
+        except Exception:
+            import os
+
+            if os.environ.get("TRNTENSOR_REQUIRE_NKI", "").lower() in ("1", "true", "yes"):
+                raise
+            _dispatch._note_native_kernel_failure(("dfj", tuple(B.shape)))
+    if jp is None:
+        jp = B @ (B.T @ pw)
+    if D.dim() == 1:
+        return jp
+    return jp.index_select(0, _tril_rows(nbasis).reshape(-1).to(B.device)).reshape(nbasis, nbasis)
