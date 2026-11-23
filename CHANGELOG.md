@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`trntensor.equivariant`: MACE-style equivariant contractions with
+  forward and input gradients** (#138, MLIP exemplar trnsci/trnsci#170).
+  These are the first trntensor ops with a registered backward.
+  - `conv_tp(x, y, w, spec)`: the e3nn "uvu" tensor product with per-edge
+    weights, the MLIP interaction. Gradients ∂x, ∂y, ∂w.
+  - `symmetric_contraction(x, species, spec)`: MACE's product basis,
+    correlation ≤ 3. Gradient ∂x.
+  - `conv_tp_spec` / `symmetric_contraction_spec` build the static spec
+    either from an e3nn / MACE module or from explicit irreps (or coupling
+    tensors and weights). e3nn and mace-torch stay optional, test-only
+    dependencies. `wigner_3j` and `wigner_D` reproduce e3nn 0.4.4's basis
+    and sign convention for l ≤ 3.
+  - The fused PyTorch path is a fixed handful of aten launches per call: 8
+    at MACE-MP layer 1 forward, against 34 for e3nn. Against the MACE-MP-0b2
+    medium captures it matches MACE to ≤ 3.6e-7 relative for every output and
+    input gradient on all six exemplar captures (16 / 64 / 216 atoms, two
+    geometries each).
+  - The NKI kernels run one launch per direction per layer. conv_tp keeps
+    edges on partitions; its Clebsch-Gordan blocks stay in SBUF and come out
+    of one Tensor Engine matmul, and the work is split over the GpSimd,
+    Scalar and Vector engines. symmetric_contraction runs as Tensor Engine
+    matmuls over a pruned symmetric-monomial basis, accumulating in PSUM.
+  - On the native TorchNeuron path the ops are `nki_op` custom ops with
+    `register_autograd`. On the XLA path and the simulator they are wrapped
+    in `torch.autograd.Function`.
+  - The kernels pass MLIR verification for trn1 and trn2 (LNC 1 and 2), and
+    match MACE in `nki.simulate`. They are not yet validated on device, so
+    `"auto"` runs the PyTorch path unless `TRNTENSOR_EQUIVARIANT_NKI=1` is
+    set; `set_backend("nki")` runs the kernels.
+  - Device tests and a timing harness are in
+    `tests/test_equivariant_neuron.py`.
+
 ## [0.25.2] — 2026-11-10
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

@@ -27,6 +27,7 @@ nav:
       - Decompositions: api/decompose.md
       - Quantum primitives: api/quantum.md
       - Streaming DF integrals: api/stream.md
+      - Equivariant contractions: api/equivariant.md
       - NKI dispatch: api/nki.md
   - Architecture: architecture.md
   - Benchmarks: benchmarks.md

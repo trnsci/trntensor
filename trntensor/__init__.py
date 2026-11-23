@@ -16,6 +16,16 @@ from .decompose import (
     tucker_reconstruct,
 )
 from .einsum import einsum, multi_einsum
+from .equivariant import (
+    ConvTPSpec,
+    SymmetricContractionSpec,
+    conv_tp,
+    conv_tp_spec,
+    symmetric_contraction,
+    symmetric_contraction_spec,
+    wigner_3j,
+    wigner_D,
+)
 from .nki import HAS_NKI, get_backend, set_backend
 from .nki.dispatch import from_device, from_xla, to_device, to_xla
 from .parallel import ShardedTensor, gather, scatter
@@ -80,6 +90,14 @@ __all__ = [
     "pack_density",
     "unpack_packed",
     "mp2_energy_blocked",
+    "conv_tp",
+    "conv_tp_spec",
+    "ConvTPSpec",
+    "symmetric_contraction",
+    "symmetric_contraction_spec",
+    "SymmetricContractionSpec",
+    "wigner_3j",
+    "wigner_D",
     "ShardedTensor",
     "scatter",
     "gather",
