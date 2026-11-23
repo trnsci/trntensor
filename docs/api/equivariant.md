@@ -46,13 +46,11 @@ Built once per layer.
   (`ConvTPSpec.from_dict`, `spec.as_dict()`).
 
 ```python
-spec = trntensor.conv_tp_spec(
-    "128x0e+128x1o", "1x0e+1x1o+1x2e+1x3o",
-    "128x0e+128x0e+128x1o+128x1o+128x1o+128x2e+128x2e+128x2e+128x3o+128x3o",
-    [(0, 0, 0), (1, 1, 1), (0, 1, 2), (1, 0, 3), (1, 2, 4),
-     (0, 2, 5), (1, 1, 6), (1, 3, 7), (0, 3, 8), (1, 2, 9)],
-)
-out = trntensor.conv_tp(x, y, w, spec)        # [E, 5120]
+ins = [(0, 0, 0), (1, 1, 1), (0, 1, 2), (1, 0, 3), (1, 2, 4)]
+ins += [(0, 2, 5), (1, 1, 6), (1, 3, 7), (0, 3, 8), (1, 2, 9)]
+irreps_out = "128x0e+128x0e+128x1o+128x1o+128x1o+128x2e+128x2e+128x2e+128x3o+128x3o"
+spec = trntensor.conv_tp_spec("128x0e+128x1o", "1x0e+1x1o+1x2e+1x3o", irreps_out, ins)
+out = trntensor.conv_tp(x, y, w, spec)  # [E, 5120]
 # or from the model: trntensor.conv_tp_spec(module=model.interactions[1].conv_tp)
 ```
 
