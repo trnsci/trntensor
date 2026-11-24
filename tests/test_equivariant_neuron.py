@@ -308,17 +308,35 @@ def _variants_symcon(spec):
     }
 
 
+def _emit(rows, row):
+    """Record one timing row and print it at once (a long run keeps what it measured)."""
+    rows.append(row)
+    print("BENCH " + json.dumps(row), flush=True)
+
+
+def _bench_filter(name: str, default: str) -> set[str]:
+    return set(os.environ.get(name, default).split(","))
+
+
 @pytest.mark.parametrize("atoms", sorted(SHAPES))
 def test_timing(atoms):
     """Warm medians (ms) and aten op counts per call; prints a table, writes JSON."""
     N, E = SHAPES[atoms]
     rows = []
-    for layer in (0, 1):
+    # Optional subsets for long device runs: TRNTENSOR_EQUIVARIANT_BENCH_LAYERS=0,1,
+    # TRNTENSOR_EQUIVARIANT_BENCH_VARIANTS=nki,fused,per_path,e3nn,
+    # TRNTENSOR_EQUIVARIANT_BENCH_BLOCKS=conv_tp,symmetric_contraction.
+    layers = [int(v) for v in _bench_filter("TRNTENSOR_EQUIVARIANT_BENCH_LAYERS", "0,1")]
+    variants = _bench_filter("TRNTENSOR_EQUIVARIANT_BENCH_VARIANTS", "nki,fused,per_path,e3nn")
+    blocks = _bench_filter("TRNTENSOR_EQUIVARIANT_BENCH_BLOCKS", "conv_tp,symmetric_contraction")
+    for layer in layers:
         spec = mace_conv_tp_spec(layer)
         x, y, w, go = _conv_tp_inputs(spec, E)
         xd, yd, wd, god = (t.to(DEV) for t in (x, y, w, go))
         need_x = layer == 1
         for name, fn in _variants_conv_tp(spec).items():
+            if name not in variants or "conv_tp" not in blocks:
+                continue
 
             def fwd(fn=fn, xd=xd, yd=yd, wd=wd):
                 return fn(xd, yd, wd)
@@ -330,7 +348,8 @@ def test_timing(atoms):
                 return torch.autograd.grad(out, [t for t in (xs, ys, ws) if t.requires_grad], god)
 
             try:
-                rows.append(
+                _emit(
+                    rows,
                     {
                         "block": "conv_tp",
                         "layer": layer,
@@ -341,17 +360,18 @@ def test_timing(atoms):
                         "fwd_bwd_ms": _time(fwdbwd),
                         "fwd_ops": _count(fwd),
                         "fwd_bwd_ops": _count(fwdbwd),
-                    }
+                    },
                 )
             except Exception as exc:  # record, do not hide: a variant may not run on device
-                rows.append(
+                _emit(
+                    rows,
                     {
                         "block": "conv_tp",
                         "layer": layer,
                         "atoms": int(atoms),
                         "variant": name,
                         "error": repr(exc)[:300],
-                    }
+                    },
                 )
         sspec = mace_symcon_spec(layer)
         g = torch.Generator().manual_seed(2)
@@ -359,6 +379,8 @@ def test_timing(atoms):
         z = torch.randint(0, 89, (N,), generator=g).to(DEV)
         sgo = torch.randn(N, sspec.dim_out, generator=g).to(DEV)
         for name, fn in _variants_symcon(sspec).items():
+            if name not in variants or "symmetric_contraction" not in blocks:
+                continue
 
             def sfwd(fn=fn, xs0=xs0, z=z):
                 return fn(xs0, z)
@@ -368,7 +390,8 @@ def test_timing(atoms):
                 return torch.autograd.grad(fn(xs, z), xs, sgo)
 
             try:
-                rows.append(
+                _emit(
+                    rows,
                     {
                         "block": "symmetric_contraction",
                         "layer": layer,
@@ -379,17 +402,18 @@ def test_timing(atoms):
                         "fwd_bwd_ms": _time(sfwdbwd),
                         "fwd_ops": _count(sfwd),
                         "fwd_bwd_ops": _count(sfwdbwd),
-                    }
+                    },
                 )
             except Exception as exc:
-                rows.append(
+                _emit(
+                    rows,
                     {
                         "block": "symmetric_contraction",
                         "layer": layer,
                         "atoms": int(atoms),
                         "variant": name,
                         "error": repr(exc)[:300],
-                    }
+                    },
                 )
     print(
         f"\n{'block':24s} {'L':>2s} {'atoms':>5s} {'variant':9s} {'fwd ms':>9s} {'f+b ms':>9s} {'ops f':>6s} {'ops f+b':>7s}"
@@ -408,4 +432,5 @@ def test_timing(atoms):
     if path:
         prev = json.loads(Path(path).read_text()) if Path(path).exists() else []
         Path(path).write_text(json.dumps(prev + rows, indent=1))
-    assert any(r["variant"] == "nki" and "error" not in r for r in rows)
+    if "nki" in variants:
+        assert any(r["variant"] == "nki" and "error" not in r for r in rows)
