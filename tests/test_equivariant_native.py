@@ -392,3 +392,30 @@ class TestRouting:
         monkeypatch.setenv("TRNTENSOR_REQUIRE_NKI", "1")
         with pytest.raises(NotImplementedError, match="tiling"):
             eqk.conv_tp_kernel_route(x, y, w, big)
+
+
+class TestPadRows:
+    def test_backward_is_a_row_prefix_view(self):
+        """The edge / node padding's backward adds no copy (no second constant_pad_nd)."""
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        class Ops(TorchDispatchMode):
+            def __init__(self):
+                super().__init__()
+                self.names = []
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                self.names.append(str(func))
+                return func(*args, **(kwargs or {}))
+
+        t = torch.randn(5, 3, 2, dtype=torch.float64, requires_grad=True)
+        p = eqk._pad_rows(t, 8)
+        assert p.shape == (8, 3, 2) and torch.equal(p[:5], t) and not p[5:].any()
+        g = torch.randn(8, 3, 2, dtype=torch.float64)
+        with Ops() as m:
+            (gt,) = torch.autograd.grad(p, t, g)
+        assert torch.equal(gt, g[:5])
+        assert not any("constant_pad_nd" in n for n in m.names), m.names
+        assert eqk._pad_rows(t, 5) is t
+        torch.autograd.gradcheck(lambda a: eqk._pad_rows(a, 7), (t,))
+        torch.autograd.gradgradcheck(lambda a: eqk._pad_rows(a, 7) ** 2, (t,))

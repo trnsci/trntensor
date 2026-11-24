@@ -245,6 +245,28 @@ def symcon_bwd_torch(g, x, wr, sel, usymT, sT):
     return dxa[:, :L].reshape(N, C, L)
 
 
+class _PadRows(torch.autograd.Function):
+    """Zero-pad dim 0 to ``n`` rows; the backward is the row-prefix view.
+
+    ``torch.nn.functional.pad``'s own backward is a second ``constant_pad_nd``
+    (a copy of every input gradient, one launch each on the device); this one
+    returns ``g[:rows]``, a view. Differentiable, so double backward holds.
+    """
+
+    @staticmethod
+    def forward(ctx, t, n):
+        ctx.rows = t.shape[0]
+        return torch.nn.functional.pad(t, (0, 0) * (t.dim() - 1) + (0, n - t.shape[0]))
+
+    @staticmethod
+    def backward(ctx, g):
+        return g[: ctx.rows], None
+
+
+def _pad_rows(t, n):
+    return t if t.shape[0] == n else _PadRows.apply(t, n)
+
+
 # ── conv_tp ────────────────────────────────────────────────────────────────
 
 
@@ -289,10 +311,7 @@ def conv_tp_nki(x, y, w, spec) -> torch.Tensor:
     c = spec.constants(dev, torch.float32)
 
     def prep(t):
-        t = t.to(dev, torch.float32)
-        if Ep != E:
-            t = torch.nn.functional.pad(t, (0, 0, 0, Ep - E))
-        return t.contiguous()
+        return _pad_rows(t.to(dev, torch.float32), Ep).contiguous()
 
     xs, ys, ws = prep(x), prep(y), prep(w)
     cg, cgT = c["cg_kernel"], c["cg_kernel_T"]
@@ -342,7 +361,7 @@ def symmetric_contraction_nki(x, species, spec) -> torch.Tensor:
     xs = x.to(dev, torch.float32)
     z = species.to(dev)
     if Np != N:
-        xs = torch.nn.functional.pad(xs, (0, 0, 0, 0, 0, Np - N))
+        xs = _pad_rows(xs, Np)
         z = torch.nn.functional.pad(z, (0, Np - N))
     xs = xs.contiguous()
     # Species enter as one row gather of the folded weight table.
