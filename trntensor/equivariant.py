@@ -783,6 +783,9 @@ class _SymConLayout:
             "out_gather_inv": self.out_gather_inv.to(dev),
             "sel": sel,  # [L+1, 3, A]
             "selT": sel.permute(2, 1, 0).contiguous(),  # [A, 3, L+1]
+            # [3, A, L]: sel_fac[j, alpha, a] = [factor j of alpha == a], the
+            # ones column dropped; the PyTorch-path backward's scatter as GEMMs.
+            "sel_fac": sel.permute(1, 2, 0)[:, :, : self.L].contiguous(),
         }
 
 
@@ -1003,12 +1006,14 @@ def _symcon_rows_forward(xr, wr, c):
 def _symcon_rows_backward(go, xr, wr, c, L):
     x1, x2, x3 = _monomials(xr, c)
     gm = ((go @ c["ST"]) * wr) @ c["usymT"]
-    f = c["factors"]
-    dxa = xr.new_zeros(xr.shape[0], L + 1)
-    dxa.index_add_(1, f[0], gm * x2 * x3)
-    dxa.index_add_(1, f[1], gm * x1 * x3)
-    dxa.index_add_(1, f[2], gm * x1 * x2)
-    return dxa[:, :L]
+    # dx[:, a] = sum over factors j and monomials alpha with factor j == a of
+    # gm[:, alpha] times the other two factors: a GEMM per factor against the
+    # 0/1 selection matrix. Three ``index_add_`` along dim 1 took 1.5 s each
+    # on Trn2 at 216 atoms (trntensor#140).
+    s = c["sel_fac"]
+    dx = (gm * x2 * x3) @ s[0]
+    dx = torch.addmm(dx, gm * x1 * x3, s[1])
+    return torch.addmm(dx, gm * x1 * x2, s[2])
 
 
 def _node_chunks(N, C, width):

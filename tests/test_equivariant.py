@@ -422,6 +422,56 @@ class TestSymmetricContraction:
         (g2,) = torch.autograd.grad(ref, x, g)
         torch.testing.assert_close(g1, g2, rtol=1e-10, atol=1e-10)
 
+    @pytest.mark.parametrize("layer", [0, 1])
+    def test_backward_scatter_is_gemm(self, cap, layer):
+        """The PyTorch-path backward folds the factor scatter into GEMMs
+        against the selection matrix: no ``index_add_`` / scatter, which
+        lowered to ~1.5 s per call on Trn2 (trntensor#140). Checked against
+        the scatter formulation it replaces and the reference."""
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        a, d = _symcon_inputs(cap, layer)
+        spec = eq._as_spec(d, eq.SymmetricContractionSpec)
+        x = a["x"][:7].double()
+        z = a["species"][:7]
+        g = torch.randn(
+            x.shape[0],
+            spec.dim_out,
+            dtype=torch.float64,
+            generator=torch.Generator().manual_seed(layer),
+        )
+        c = spec.constants("cpu", torch.float64)  # built once, not per call
+
+        names = []
+
+        class Names(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                names.append(str(func.overloadpacket))
+                return func(*args, **(kwargs or {}))
+
+        with Names():
+            dx = eq._symcon_backward_torch(g, x, z, spec)
+        assert not [n for n in names if "index_add" in n or "scatter" in n], names
+        assert names.count("aten.mm") + names.count("aten.addmm") == 5, names
+        assert len(names) <= 32, len(names)
+
+        lay = spec.layout
+        N, C, L = x.shape
+        go = g.index_select(1, c["out_gather_inv"]).reshape(-1, lay.Dsum)
+        xr = x.reshape(-1, L)
+        wr = c["W_zcm"].index_select(0, z).reshape(-1, lay.MK)
+        x1, x2, x3 = eq._monomials(xr, c)
+        gm = ((go @ c["ST"]) * wr) @ c["usymT"]
+        f = c["factors"]
+        dxa = xr.new_zeros(xr.shape[0], L + 1)
+        dxa.index_add_(1, f[0], gm * x2 * x3)
+        dxa.index_add_(1, f[1], gm * x1 * x3)
+        dxa.index_add_(1, f[2], gm * x1 * x2)
+        torch.testing.assert_close(dx, dxa[:, :L].reshape(N, C, L), rtol=1e-12, atol=1e-12)
+        xx = x.clone().requires_grad_(True)
+        (ref,) = torch.autograd.grad(symmetric_contraction_reference(xx, z, d), xx, g)
+        torch.testing.assert_close(dx, ref, rtol=1e-10, atol=1e-10)
+
     def test_monomial_basis_is_pruned(self, cap):
         sizes = {}
         for a in cap["A2"]:
