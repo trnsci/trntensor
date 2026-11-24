@@ -35,9 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `register_autograd`. On the XLA path and the simulator they are wrapped
     in `torch.autograd.Function`.
   - The kernels pass MLIR verification for trn1 and trn2 (LNC 1 and 2), and
-    match MACE in `nki.simulate`. They are not yet validated on device, so
-    `"auto"` runs the PyTorch path unless `TRNTENSOR_EQUIVARIANT_NKI=1` is
-    set; `set_backend("nki")` runs the kernels.
+    match MACE in `nki.simulate`. On Trn2 (SDK 2.33.1, neuronx-cc 2.28,
+    native TorchNeuron, LNC=2) they match the fp64 host path to ≤ 2.2e-7
+    relative at 216 and 1728 atoms and every MACE-MP-0b2 capture to ≤ 2.9e-7
+    (bar 2e-5), forward, input gradients and double backward; reruns are
+    bitwise identical. `"auto"` therefore runs them for fp32 operands on the
+    `neuron` device (`TRNTENSOR_EQUIVARIANT_NKI=0` opts out); elsewhere it
+    runs the PyTorch path. Timings are in trntensor#139.
+  - The symmetric-contraction factor products run on the Vector Engine:
+    neuronx-cc 2.28 elides a PSUM → SBUF `tensor_copy` into a GpSimd
+    consumer and then fails with NCC_IBFD004.
+  - With `create_graph=True` (training on forces) the backward is built from
+    differentiable aten ops on the kernel operands, so double backward works
+    with the kernels on; first-order backward (forces) stays on the kernels.
   - Device tests and a timing harness are in
     `tests/test_equivariant_neuron.py`.
 
