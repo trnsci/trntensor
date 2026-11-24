@@ -86,10 +86,10 @@ e3nn-compatible real Wigner-3j symbols (`l ≤ 3`, checked against e3nn 0.4.4 to
 |---|---|
 | `"pytorch"` | the fused PyTorch formulation on the operands' device |
 | `"nki"` | the NKI kernels, one launch per direction per layer; float64 is computed in fp32 with a one-time warning |
-| `"auto"` | the fused PyTorch path. With `TRNTENSOR_EQUIVARIANT_NKI=1`, fp32 operands on the `neuron` device use the kernels. float64 on the `neuron` device is computed on the host. |
+| `"auto"` | the NKI kernels for fp32 operands on the `neuron` device (native TorchNeuron path); the fused PyTorch path everywhere else. `TRNTENSOR_EQUIVARIANT_NKI=0` keeps `"auto"` on the PyTorch path. float64 on the `neuron` device is computed on the host. |
 
-The kernels are opt-in under `"auto"` until they have been validated on
-Trainium (#138). `TRNTENSOR_REQUIRE_NKI=1` raises instead of falling back.
+`"auto"` uses the kernels on the device since their Trn2 validation
+(trntensor#139). `TRNTENSOR_REQUIRE_NKI=1` raises instead of falling back.
 
 ## Design
 
@@ -155,8 +155,11 @@ is compiled in.
 `trntensor::symcon` are `nki_op` custom ops with `register_autograd`. Their
 backward ops are `trntensor::conv_tp_bwd` and `trntensor::symcon_bwd`. On the
 XLA path and the CPU simulator, `torch.autograd.Function` wrappers run the
-same kernels. The kernel backward is first order only: forces work, double
-backward does not.
+same kernels. The backward kernels are first order. When autograd records
+the backward (`create_graph=True`, training on forces), the backward is
+built from differentiable aten ops on the same padded operands instead, so
+double backward works on every path; forces (first order) stay on the
+kernels.
 
 ## Tests
 

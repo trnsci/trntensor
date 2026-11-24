@@ -15,8 +15,10 @@ that ``nki_op`` returns (the trnsparse ``spmm_dense`` pattern), so it also
 holds under ``torch.compile``. The constant operands (CG blocks, selections,
 coupling and reduction matrices, per-node weight rows) get no gradient: they
 are constants of the spec. The ``*_bwd`` ops are not differentiable
-themselves, so on this path forces work (first derivatives) and training
-through forces (double backward) does not; the PyTorch path supports both.
+themselves; when autograd records the backward (``create_graph=True``,
+training through forces) the backward formulas switch to the differentiable
+aten statements in ``_equivariant.conv_tp_bwd_torch`` / ``symcon_bwd_torch``,
+so double backward works, with first-order backward (forces) on the kernels.
 
 Loaded by ``_equivariant._native_ops`` only after the native path is
 selected. No ``from __future__ import annotations``: ``nki_op`` builds the op
@@ -27,6 +29,7 @@ schema from the live annotations. Kernels are looked up on
 import torch
 from torch_neuronx import nki_op
 
+from . import _equivariant as _eqh
 from . import _equivariant_kernels as _ek
 
 
@@ -126,6 +129,11 @@ def _conv_tp_backward(ctx, grad):
     nx, ny, nw = ctx.needs_input_grad[:3]
     if not (nx or ny or nw):
         return (None,) * 7
+    if torch.is_grad_enabled():
+        # create_graph=True (training through forces): the *_bwd kernel has no
+        # gradient, so build this backward from differentiable aten ops.
+        dx, dy, dw = _eqh.conv_tp_bwd_torch(grad, x, y, w, cg, ctx.plan, nx, ny, nw)
+        return (dx, dy, dw, None, None, None, None)
     grads = OPS["conv_tp_bwd"](
         grad.contiguous(), x, y, w, cg, cgT, ctx.plan, int(nx), int(ny), int(nw)
     )
@@ -142,6 +150,8 @@ def _symcon_backward(ctx, grad):
     if not ctx.needs_input_grad[0]:
         return (None,) * 8
     x, wr, sel, selT, usymT, sT = ctx.saved_tensors
+    if torch.is_grad_enabled():  # create_graph=True: see _conv_tp_backward
+        return (_eqh.symcon_bwd_torch(grad, x, wr, sel, usymT, sT),) + (None,) * 7
     dx = OPS["symcon_bwd"](grad.contiguous(), x, wr, sel, selT, usymT, sT)
     return (dx,) + (None,) * 7
 

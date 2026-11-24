@@ -228,6 +228,36 @@ def _check_symcon(a):
     torch.testing.assert_close(gs[0], rg[0], rtol=1e-5, atol=1e-6)
 
 
+def _second_order(fn, inputs, want, grad_out, backend):
+    """∂/∂(inputs) of |∂out/∂x · grad_out|²: double backward (training on forces)."""
+    with pytest.MonkeyPatch.context() as m:
+        m.setenv("TRNTENSOR_FORCE_BACKEND", backend)
+        ins = {
+            k: v.clone().requires_grad_(k in want)
+            if torch.is_tensor(v) and v.is_floating_point()
+            else v
+            for k, v in inputs.items()
+        }
+        out = fn(**ins)
+        (gx,) = torch.autograd.grad(out, ins["x"], grad_out, create_graph=True)
+        # conv_tp is linear in x, so ∂x only reaches y and w there.
+        second = [k for k in want if not (k == "x" and "y" in want)]
+        return torch.autograd.grad(gx.square().sum(), [ins[k] for k in second])
+
+
+def _check_double_backward(a, block):
+    if block == "A1":
+        fn, want = trntensor.conv_tp, ["x", "y", "w"]
+        inputs = {"x": a["x"], "y": a["y"], "w": a["w"], "spec": a["spec"]}
+    else:
+        fn, want = trntensor.symmetric_contraction, ["x"]
+        inputs = {"x": a["x"], "species": a["species"], "spec": a["spec"]}
+    ref = _second_order(fn, inputs, want, a["grad_out"], "pytorch")
+    got = _second_order(fn, inputs, want, a["grad_out"], "nki")
+    for g1, g2 in zip(got, ref, strict=True):
+        torch.testing.assert_close(g1, g2, rtol=1e-4, atol=1e-5)
+
+
 # ─────────────────────────────────────────────────────────────── native path
 
 
@@ -242,6 +272,11 @@ class TestNativePath:
     @pytest.mark.parametrize("layer", [0, 1])
     def test_symcon_autograd_through_registered_ops(self, native, cap, layer):
         _check_symcon(next(a for a in cap["A2"] if a["layer"] == layer))
+
+    @pytest.mark.parametrize("block", ["A1", "A2"])
+    def test_double_backward_falls_back_to_aten(self, native, cap, block):
+        """create_graph=True: the backward is built from differentiable aten ops."""
+        _check_double_backward(next(a for a in cap[block] if a["layer"] == 1), block)
 
     def test_ops_pass_opcheck(self, native, cap):
         """Schema, fake functions and autograd registration are consistent."""
@@ -293,6 +328,11 @@ class TestAutogradFunctionPath:
         _check_symcon(next(a for a in cap["A2"] if a["layer"] == layer))
         assert xla == ["symcon", "symcon_bwd"]
 
+    @pytest.mark.parametrize("block", ["A1", "A2"])
+    def test_double_backward_falls_back_to_aten(self, xla, cap, block):
+        _check_double_backward(next(a for a in cap[block] if a["layer"] == 1), block)
+        assert not any(c.endswith("_bwd") for c in xla)
+
     def test_fp64_under_explicit_nki_warns_and_keeps_dtype(self, xla, cap, monkeypatch):
         monkeypatch.setattr(dispatch, "_fp64_warned", set())
         a = cap["A1"][1]
@@ -318,7 +358,7 @@ class TestAutogradFunctionPath:
 
 
 class TestRouting:
-    def test_auto_needs_opt_in_native_and_device_fp32(self, kernels, monkeypatch):
+    def test_auto_needs_native_device_fp32_and_no_opt_out(self, kernels, monkeypatch):
         monkeypatch.delenv("TRNTENSOR_FORCE_BACKEND")
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
         spec = trntensor.conv_tp_spec(
@@ -328,10 +368,13 @@ class TestRouting:
         prev = trntensor.get_backend()
         try:
             trntensor.set_backend("auto")
-            assert not eqk.conv_tp_kernel_route(x, y, w, spec)  # no opt-in
-            monkeypatch.setenv(eq.EQUIVARIANT_NKI_ENV, "1")
+            monkeypatch.delenv(eq.EQUIVARIANT_NKI_ENV, raising=False)
             assert not eqk.conv_tp_kernel_route(x, y, w, spec)  # host tensors
             monkeypatch.setattr(dispatch, "_on_neuron_device", lambda t: True)
+            assert eqk.conv_tp_kernel_route(x, y, w, spec)  # default on
+            monkeypatch.setenv(eq.EQUIVARIANT_NKI_ENV, "0")
+            assert not eqk.conv_tp_kernel_route(x, y, w, spec)  # opt-out
+            monkeypatch.setenv(eq.EQUIVARIANT_NKI_ENV, "1")
             assert eqk.conv_tp_kernel_route(x, y, w, spec)
             assert not eqk.conv_tp_kernel_route(x.double(), y.double(), w.double(), spec)
             trntensor.set_backend("pytorch")

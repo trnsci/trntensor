@@ -35,10 +35,12 @@ Backends follow ``trntensor.set_backend``:
 - ``"nki"``: the NKI kernels (``trntensor/nki/_equivariant_kernels.py``), one
   launch per direction (forward, backward) per layer. float64 follows the
   suite policy (computed in fp32 with a one-time warning).
-- ``"auto"``: the PyTorch path. The NKI kernels are opt-in until they are
-  validated on device; set ``TRNTENSOR_EQUIVARIANT_NKI=1`` to let ``"auto"``
-  use them for fp32 operands on the ``neuron`` device. float64 on the
-  ``neuron`` device is computed on the host (suite fp64 policy).
+- ``"auto"``: the NKI kernels for fp32 operands on the ``neuron`` device
+  (native TorchNeuron path), the PyTorch path everywhere else. The kernels
+  were validated on Trn2 in the trntensor#139 device window, where they beat
+  the fused PyTorch path and e3nn on the device at both MACE-MP layers.
+  ``TRNTENSOR_EQUIVARIANT_NKI=0`` keeps ``"auto"`` on the PyTorch path.
+  float64 on the ``neuron`` device is computed on the host (suite fp64 policy).
 
 MACE and e3nn are optional: :func:`conv_tp_spec` and
 :func:`symmetric_contraction_spec` read a module when one is given, and
@@ -1060,7 +1062,12 @@ EQUIVARIANT_NKI_ENV = "TRNTENSOR_EQUIVARIANT_NKI"
 
 
 def _auto_uses_kernels() -> bool:
-    return os.environ.get(EQUIVARIANT_NKI_ENV, "").strip().lower() in ("1", "true", "yes")
+    """Whether ``"auto"`` may route fp32 neuron-device operands to the kernels.
+
+    On by default since the trntensor#139 device validation;
+    ``TRNTENSOR_EQUIVARIANT_NKI=0`` (or ``false`` / ``no``) turns it off.
+    """
+    return os.environ.get(EQUIVARIANT_NKI_ENV, "").strip().lower() not in ("0", "false", "no")
 
 
 def _check_conv_tp_args(x, y, w, spec: ConvTPSpec):

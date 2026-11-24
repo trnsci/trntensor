@@ -540,12 +540,17 @@ class TestDispatch:
             trntensor.symmetric_contraction(b["x"], b["species"], b["spec"]), ref
         )
 
-    def test_auto_keeps_kernels_off_without_opt_in(self, monkeypatch):
+    def test_auto_keeps_host_tensors_and_opt_out_on_pytorch(self, monkeypatch):
         from trntensor.nki import _equivariant as eqk
         from trntensor.nki import dispatch
 
         monkeypatch.setattr(dispatch, "HAS_NKI", True)
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.delenv(eq.EQUIVARIANT_NKI_ENV, raising=False)
+        assert eq._auto_uses_kernels()
+        for off in ("0", "false", "no"):
+            monkeypatch.setenv(eq.EQUIVARIANT_NKI_ENV, off)
+            assert not eq._auto_uses_kernels()
         monkeypatch.delenv(eq.EQUIVARIANT_NKI_ENV, raising=False)
         trntensor.set_backend("auto")
         spec = trntensor.conv_tp_spec(*mace_conv_tp_irreps(1, 2))

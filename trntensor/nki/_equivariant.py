@@ -185,6 +185,66 @@ def _run(kernel, op_name: str, tensors, consts) -> tuple:
     return tuple(o.to(orig) for o in outs)
 
 
+# ── differentiable statements of the backward kernels ─────────────────────
+#
+# The kernel backward is first order: the ``*_bwd`` kernels have no gradient of
+# their own. When autograd builds a graph through the backward
+# (``create_graph=True``, e.g. training on forces), the backward formulas
+# below compute the same quantities from the same padded fp32 operands with
+# differentiable aten ops, so double backward works on every path. First-order
+# backward (forces in MD) keeps the kernel.
+
+
+def conv_tp_bwd_torch(g, x, y, w, cg, plan, need_dx=True, need_dy=True, need_dw=True):
+    """``(∂x, ∂y, ∂w)`` of the conv_tp kernel contract (differentiable aten)."""
+    from ._equivariant_kernels import conv_tp_plan_paths
+
+    E, D1 = x.shape
+    paths = conv_tp_plan_paths(tuple(plan))
+    U = w.shape[1] // len(paths)
+    G = y @ cg
+    dx_parts, dw_parts, dG_parts = {}, [], []
+    for p, (x_off, d1, q_off, d3, o_off, _acc) in enumerate(paths):
+        xv = x[:, x_off : x_off + U * d1].reshape(E, U, d1)
+        gv = g[:, o_off : o_off + U * d3].reshape(E, U, d3)
+        wp = w[:, p * U : (p + 1) * U]
+        Gp = G[:, q_off : q_off + d1 * d3].reshape(E, d1, d3)
+        h = torch.einsum("euk,eik->eui", gv, Gp)
+        dw_parts.append((xv * h).sum(-1))
+        part = (wp[:, :, None] * h).reshape(E, U * d1)
+        dx_parts[x_off] = part if x_off not in dx_parts else dx_parts[x_off] + part
+        dG_parts.append(torch.einsum("eui,euk->eik", xv * wp[:, :, None], gv).reshape(E, d1 * d3))
+    dx = None
+    if need_dx:
+        cols, at = [], 0
+        for x_off in sorted(dx_parts):
+            if x_off > at:
+                cols.append(x.new_zeros(E, x_off - at))
+            cols.append(dx_parts[x_off])
+            at = x_off + dx_parts[x_off].shape[1]
+        if at < D1:
+            cols.append(x.new_zeros(E, D1 - at))
+        dx = torch.cat(cols, 1)
+    dy = torch.cat(dG_parts, 1) @ cg.T if need_dy else None
+    dw = torch.cat(dw_parts, 1) if need_dw else None
+    return dx, dy, dw
+
+
+def symcon_bwd_torch(g, x, wr, sel, usymT, sT):
+    """``∂x`` of the symmetric-contraction kernel contract (differentiable aten).
+
+    ``g [D, N·C]`` is the m-major cotangent of ``symcon_fwd_kernel``.
+    """
+    N, C, L = x.shape
+    xa = torch.cat([x.reshape(N * C, L), x.new_ones(N * C, 1)], 1)
+    X0, X1, X2 = (xa @ sel[:, j, :] for j in range(3))
+    wrows = wr.permute(0, 2, 1).reshape(N * C, -1)
+    R = ((g.T @ sT) * wrows) @ usymT
+    dxa = (R * X1 * X2) @ sel[:, 0, :].T + (R * X0 * X2) @ sel[:, 1, :].T
+    dxa = dxa + (R * X0 * X1) @ sel[:, 2, :].T
+    return dxa[:, :L].reshape(N, C, L)
+
+
 # ── conv_tp ────────────────────────────────────────────────────────────────
 
 
@@ -204,6 +264,9 @@ class _ConvTPKernel(torch.autograd.Function):
     def backward(ctx, g):
         x, y, w, cg, cgT = ctx.saved_tensors
         nx, ny, nw = ctx.needs_input_grad[:3]
+        if torch.is_grad_enabled():  # create_graph: the kernel backward is first order
+            dx, dy, dw = conv_tp_bwd_torch(g, x, y, w, cg, ctx.plan, nx, ny, nw)
+            return dx, dy, dw, None, None, None, None
         (grads,) = _run(
             _ek.conv_tp_bwd_kernel,
             "conv_tp_bwd",
@@ -259,6 +322,8 @@ class _SymConKernel(torch.autograd.Function):
         x, wr, sel, selT, usymT, sT = ctx.saved_tensors
         if not ctx.needs_input_grad[0]:
             return (None,) * 8
+        if torch.is_grad_enabled():  # create_graph: the kernel backward is first order
+            return (symcon_bwd_torch(g, x, wr, sel, usymT, sT),) + (None,) * 7
         (dx,) = _run(
             _ek.symcon_bwd_kernel, "symcon_bwd", (g.contiguous(), x, wr, sel, selT, usymT, sT), {}
         )
