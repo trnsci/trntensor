@@ -377,7 +377,16 @@ if HAS_NKI:
         return wt
 
     def _symcon_factors(sel_sb, xT, L, a0, aw, RB, ja):
-        """The three factor rows of monomials ``a0 : a0+aw`` (SBUF copies)."""
+        """The three factor rows of monomials ``a0 : a0+aw`` (SBUF copies).
+
+        Consumers of these copies must not run on GpSimd: on trn2 with
+        neuronx-cc 2.28 the compiler elides a ``tensor_copy`` from PSUM into its
+        GpSimd consumer, which then reads PSUM and the build fails with
+        NCC_IBFD004 ("non-PSUM engine accesses PSUM memloc"). An
+        ``activation`` copy is not elided. Found in the trntensor#139 device
+        window with a three-variant probe (tensor_copy + GpSimd fails;
+        activation + GpSimd and tensor_copy + Vector compile and are correct).
+        """
         Xs = []
         for j in range(3):
             Xp = nl.ndarray((aw, RB), dtype=nl.float32, buffer=nl.psum)
@@ -434,9 +443,10 @@ if HAS_NKI:
                 aw = min(P, A - a0)
                 X0, X1, X2 = _symcon_factors(sel_sb, xT, L, a0, aw, RB, ja)
                 m01 = nl.ndarray((aw, RB), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(
-                    dst=m01, data1=X0, data2=X1, op=nl.multiply, engine=nisa.engine.gpsimd
-                )
+                # Vector, not GpSimd: neuronx-cc 2.28 forwards the PSUM -> SBUF
+                # tensor_copy of a factor into a GpSimd consumer and then fails
+                # with NCC_IBFD004 (GpSimd cannot read PSUM). See _symcon_factors.
+                nisa.tensor_tensor(dst=m01, data1=X0, data2=X1, op=nl.multiply)
                 mono = nl.ndarray((aw, RB), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(dst=mono, data1=m01, data2=X2, op=nl.multiply)
                 for i in range(nM):
@@ -527,9 +537,8 @@ if HAS_NKI:
                 nisa.activation(dst=R, op=nl.copy, data=R_ps)
                 for j, (fa, fb) in enumerate(((X1, X2), (X0, X2), (X0, X1))):
                     tj = nl.ndarray((aw, RB), dtype=nl.float32, buffer=nl.sbuf)
-                    nisa.tensor_tensor(
-                        dst=tj, data1=fa, data2=fb, op=nl.multiply, engine=nisa.engine.gpsimd
-                    )
+                    # Vector, not GpSimd (NCC_IBFD004, see symcon_fwd_kernel).
+                    nisa.tensor_tensor(dst=tj, data1=fa, data2=fb, op=nl.multiply)
                     dj = nl.ndarray((aw, RB), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_tensor(dst=dj, data1=tj, data2=R, op=nl.multiply)
                     nisa.nc_matmul(
