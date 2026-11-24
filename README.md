@@ -106,6 +106,8 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 | Chemistry | `df_exchange` / `df_coulomb` | Fused DF exchange (K) / Coulomb (J) from packed integrals |
 | Chemistry | `pack_tril` / `unpack_tril` | Packed (μ≥ν) three-centre integral layout |
 | Sharding | `ShardedTensor`, `scatter`, `gather` | Output- and reduce-parallel sharded contractions |
+| Equivariant | `conv_tp` | e3nn "uvu" tensor product (MACE interaction), forward + ∂x/∂y/∂w |
+| Equivariant | `symmetric_contraction` | MACE product basis (correlation ≤ 3), forward + ∂x |
 
 ## Status
 

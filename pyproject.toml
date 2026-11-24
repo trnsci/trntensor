@@ -93,6 +93,7 @@ ignore = [
 # look unused to the linter, etc). Don't fight the kernel authoring loop.
 "trntensor/nki/_kernels.py" = ["F841", "B007"]
 "trntensor/nki/dispatch.py" = ["F841", "B007"]
+"trntensor/nki/_equivariant_kernels.py" = ["F841", "B007"]
 "scripts/*" = ["F401"]
 "tests/*"   = ["F401", "F811"]
 
