@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-11-25
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.1, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `trntensor.equivariant`, MACE-style equivariant contractions with registered backwards (#138, #139): `conv_tp` (the e3nn "uvu" tensor product, gradients for x, y and w) and `symmetric_contraction` (correlation ≤ 3, gradient for x). On Trn2 the NKI kernels match the fp64 host path to ≤ 2.2e-7 relative, forward, input gradients and double backward, so `"auto"` runs them for fp32 operands on the `neuron` device. The PyTorch-path `symmetric_contraction` backward is a few GEMMs instead of `index_add_` (#140).
+
 ### Added
 
 - **`trntensor.equivariant`: MACE-style equivariant contractions with
@@ -48,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - With `create_graph=True` (training on forces) the backward is built from
     differentiable aten ops on the kernel operands, so double backward works
     with the kernels on; first-order backward (forces) stays on the kernels.
+  - The PyTorch-path `symmetric_contraction` backward scatters the factors
+    as three GEMMs against a 0/1 factor-selection matrix, not `index_add_`
+    (#140). On Trn2 at 216 atoms the backward drops from 4485 to 5.1 ms
+    (layer 0) and from 1030 to 2.6 ms (layer 1).
   - Device tests and a timing harness are in
     `tests/test_equivariant_neuron.py`.
 
