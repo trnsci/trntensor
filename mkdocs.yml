@@ -28,6 +28,7 @@ nav:
       - Quantum primitives: api/quantum.md
       - Streaming DF integrals: api/stream.md
       - Equivariant contractions: api/equivariant.md
+      - MLIP edge and node ops: api/mlip_edge.md
       - NKI dispatch: api/nki.md
   - Architecture: architecture.md
   - Benchmarks: benchmarks.md

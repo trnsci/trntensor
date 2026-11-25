@@ -7,4 +7,5 @@ trntensor's public API is organized into these modules:
 - **[decompose](decompose.md)** — `cp_decompose`, `tucker_decompose`, and reconstructors
 - **[quantum](quantum.md)** — fused chemistry primitives (`mp2_energy`, `ao_to_mo_transform`, `df_exchange`, `df_coulomb`)
 - **[equivariant](equivariant.md)** — MACE-style equivariant contractions (`conv_tp`, `symmetric_contraction`) with forward and input gradients
+- **[mlip_edge](mlip_edge.md)** — the rest of a MACE step as fused ops with analytic backwards (`spherical_harmonics`, `edge_chain`, `equivariant_linear`) and compiled regions (`set_region_backend`)
 - **[nki](nki.md)** — backend dispatch (`set_backend`, `get_backend`, `HAS_NKI`)
