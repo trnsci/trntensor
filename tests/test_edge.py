@@ -456,6 +456,33 @@ class TestCompiledRegion:
         (gg,) = torch.autograd.grad(g.sum(), v)
         assert torch.isfinite(gg).all()
 
+    @pytest.mark.parametrize("device_type, compiled", [("cpu", True), ("neuron", False)])
+    def test_device_backend_skips_host_only_calls(self, region, monkeypatch, device_type, compiled):
+        """A device backend (``neuron``) compiles only calls that touch its
+        device; host-only calls (a host fp64 reference, say) run eagerly
+        instead of being moved to the device. Emulated by mapping
+        ``aot_eager`` to a device type, with ``torch.compile`` recorded."""
+        from trntensor import _region
+
+        used = []
+
+        def fake_compile(fn, **kw):
+            def run(*a, **k):
+                used.append(kw["backend"])
+                return fn(*a, **k)
+
+            return run
+
+        monkeypatch.setattr(_region, "_DEVICE_BACKENDS", {"aot_eager": device_type})
+        monkeypatch.setattr(_region.torch, "compile", fake_compile)
+        _region.clear_region_cache()
+        x = torch.randn(4)
+        with torch.no_grad():  # as inside the ops' autograd.Function bodies
+            f = _region.region(lambda t: t * 2.0, site=("probe", device_type))
+            torch.testing.assert_close(f(x), x * 2.0)
+        assert bool(used) is compiled
+        _region.clear_region_cache()
+
 
 def test_linear_module_exports():
     assert trntensor.EquivariantLinearSpec is linear.EquivariantLinearSpec

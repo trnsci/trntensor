@@ -27,6 +27,7 @@ selects them.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 
@@ -111,15 +112,20 @@ def edge_chain_kernel_route(r, r0, spec) -> bool:
 # ── constants ──────────────────────────────────────────────────────────────
 
 
+@functools.cache
 def sh_tables(lmax: int, normalization: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    """Static coefficient tables of the SH kernels (tuples: NKI static arguments)."""
+    """Static coefficient tables of the SH kernels (tuples: NKI static arguments).
+
+    Cached: built per call, the per-element ``float()`` conversions were ~800
+    host ``aten::item`` dispatches per spherical-harmonics call (Trn2, window 8).
+    """
     from ..edge import sh_coefficients
 
     t = sh_coefficients(lmax, normalization)
-    table = [float(v) for v in t["c0"]] + [float(v) for v in t["C"].reshape(-1)]
+    table = t["c0"].tolist() + t["C"].reshape(-1).tolist()
     if lmax == 0:
         table = table[:1] + [0.0]
-    return tuple(table), tuple(float(v) for v in t["dC"].reshape(-1))
+    return tuple(float(v) for v in table), tuple(float(v) for v in t["dC"].reshape(-1).tolist())
 
 
 def kernel_dims(spec) -> tuple[int, ...]:

@@ -178,6 +178,21 @@ def test_fixture(nki_backend):
         (d["r0"].to(DEV),),
     )
     y, dv = _vjp(trntensor.spherical_harmonics, s["vectors"].to(DEV), [s["grad_out"].to(DEV)])
+    # The same fp32 math as aten on the device (the PyTorch path, eager): the
+    # device's own floor. Its transcendentals are less accurate than the host's,
+    # so on Trn2 (window 8) it is 1.8e-6 from fp64 for the edge-chain gradient,
+    # where MACE fp32 on the host is 6e-7.
+    prev = trntensor.get_backend()
+    trntensor.set_backend("pytorch")
+    try:
+        _, dl_aten = _vjp(
+            lambda t, z: trntensor.edge_chain(t, spec, z),
+            d["lengths"].to(DEV),
+            [g.to(DEV) for g in d["grad_out"]],
+            (d["r0"].to(DEV),),
+        )
+    finally:
+        trntensor.set_backend(prev)
     _sync()
     truth = _host_fp64(lambda: trntensor.edge_chain(d["lengths"].double(), spec, d["r0"].double()))
     errs = {
@@ -185,12 +200,14 @@ def test_fixture(nki_backend):
         "edge out MACE32 vs fp64": max(_rel(o, t) for o, t in zip(d["out"], truth, strict=True)),
         "edge dr vs fp64": _rel(dl, d["grad_lengths_fp64"]),
         "edge dr MACE32 vs fp64": _rel(d["grad_lengths"], d["grad_lengths_fp64"]),
+        "edge dr device aten vs fp64": _rel(dl_aten, d["grad_lengths_fp64"]),
         "sh out vs MACE": _rel(y[0], s["out"]),
         "sh dv vs MACE": _rel(dv, s["grad_vectors"]),
     }
     print("fixture: " + ", ".join(f"{k} {v:.2e}" for k, v in errs.items()))
     assert errs["edge out vs fp64"] < max(3 * errs["edge out MACE32 vs fp64"], 2e-6)
-    assert errs["edge dr vs fp64"] < max(3 * errs["edge dr MACE32 vs fp64"], 2e-6)
+    floor = max(3 * errs["edge dr MACE32 vs fp64"], 1.5 * errs["edge dr device aten vs fp64"])
+    assert errs["edge dr vs fp64"] < max(floor, 2e-6)
     assert errs["sh out vs MACE"] < 2e-6 and errs["sh dv vs MACE"] < 2e-6
 
 
@@ -282,6 +299,33 @@ def _count(fn) -> int:
         fn()
     _sync()
     return c.n
+
+
+_REGION_EVENTS = ("Torch-Compiled Region", "CompiledFunction")
+
+
+def _count_profiled(fn) -> int:
+    """Top-level host dispatches of ``fn`` from the PyTorch profiler: each
+    compiled-region call counts once, plus every aten / trntensor op outside
+    one. Used for the ``region`` variant: TorchDynamo does not trace under the
+    dispatch mode that ``_count`` uses."""
+    from torch.profiler import ProfilerActivity, profile
+
+    def counted(name):
+        return name.startswith(_REGION_EVENTS) or name.startswith(("aten::", "trntensor::"))
+
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        fn()
+        _sync()
+    n = 0
+    for e in prof.events():
+        if not counted(e.name):
+            continue
+        p = e.cpu_parent
+        while p is not None and not counted(p.name):
+            p = p.cpu_parent
+        n += p is None
+    return n
 
 
 def _variant(name):
@@ -386,8 +430,10 @@ def test_timing(atoms):
                             "variant": name,
                             "fwd_ms": _time(fwd),
                             "fwd_bwd_ms": _time(fwdbwd),
-                            "fwd_ops": _count(fwd),
-                            "fwd_bwd_ops": _count(fwdbwd),
+                            "fwd_ops": (_count_profiled if name == "region" else _count)(fwd),
+                            "fwd_bwd_ops": (_count_profiled if name == "region" else _count)(
+                                fwdbwd
+                            ),
                         },
                     )
             except Exception as exc:  # record, do not hide: a variant may not run on device

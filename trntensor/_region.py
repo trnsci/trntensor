@@ -75,8 +75,32 @@ def region(fn, site=None):
             c = torch.compile(
                 _site_copy(fn, len(_compiled)), backend=name, dynamic=False, fullgraph=True
             )
+            if name in _DEVICE_BACKENDS:
+                c = _on_device_only(fn, c, _DEVICE_BACKENDS[name])
             _compiled[key] = c
     return c
+
+
+# Backends that compile for one device type. On TorchNeuron, a graph compiled
+# with ``backend="neuron"`` and called with host tensors runs on the device and
+# returns device tensors (seen on Trn2, window 8: a host fp64 reference under
+# ``set_region_backend("neuron")`` came back on ``neuron:0``). A call with no
+# tensor on that device runs the eager body instead; any call that touches the
+# device still takes the compiled graph, so a device step never silently
+# drops to eager.
+_DEVICE_BACKENDS = {"neuron": "neuron"}
+
+
+def _on_device_only(fn, compiled, device_type: str):
+    from torch.utils._pytree import tree_leaves
+
+    def call(*args, **kwargs):
+        ts = [t for t in tree_leaves((args, kwargs)) if isinstance(t, torch.Tensor)]
+        if any(t.device.type == device_type for t in ts):
+            return compiled(*args, **kwargs)
+        return fn(*args, **kwargs)
+
+    return call
 
 
 def clear_region_cache() -> None:
