@@ -339,15 +339,19 @@ if HAS_NKI:
                                 reduce_res=dG[0:T, q : q + 1],
                             )
             if need_dy:
-                dy_ps = nl.zeros((T, D2), dtype=nl.float32, buffer=nl.psum)
+                dy_ps = nl.ndarray((T, D2), dtype=nl.float32, buffer=nl.psum)
                 for c in range(n_qc):
                     qw = min(T, Q - c * T)
                     dGT_ps = nl.ndarray((qw, T), dtype=nl.float32, buffer=nl.psum)
                     nisa.nc_transpose(dst=dGT_ps, data=dG[0:T, c * T : c * T + qw])
                     dGT = nl.ndarray((qw, T), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_copy(dst=dGT, src=dGT_ps)
+                    # The first matmul writes and opens the group (#185).
                     nisa.nc_matmul(
-                        dst=dy_ps, stationary=dGT, moving=cgT_sb[0:qw, c, 0:D2], accumulate=True
+                        dst=dy_ps,
+                        stationary=dGT,
+                        moving=cgT_sb[0:qw, c, 0:D2],
+                        accumulate=(c > 0),
                     )
                 dyt = nl.ndarray((T, D2), dtype=y.dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=dyt, src=dy_ps)
@@ -437,7 +441,7 @@ if HAS_NKI:
             Pp = []
             for i in range(nM):
                 mw = min(P, MK - i * P)
-                Pp.append(nl.zeros((mw, RB), dtype=nl.float32, buffer=nl.psum))
+                Pp.append(nl.ndarray((mw, RB), dtype=nl.float32, buffer=nl.psum))
             for ja in range(nA):
                 a0 = ja * P
                 aw = min(P, A - a0)
@@ -451,19 +455,22 @@ if HAS_NKI:
                 nisa.tensor_tensor(dst=mono, data1=m01, data2=X2, op=nl.multiply)
                 for i in range(nM):
                     mw = min(P, MK - i * P)
+                    # Monomial block 0 writes and opens each group (#185).
                     nisa.nc_matmul(
                         dst=Pp[i],
                         stationary=usym_sb[0:aw, ja, i * P : i * P + mw],
                         moving=mono,
-                        accumulate=True,
+                        accumulate=(ja > 0),
                     )
-            o_ps = nl.zeros((D, RB), dtype=nl.float32, buffer=nl.psum)
+            o_ps = nl.ndarray((D, RB), dtype=nl.float32, buffer=nl.psum)
             for i in range(nM):
                 mw = min(P, MK - i * P)
                 wt = _symcon_load_w(wr, n0, NB, C, i * P, mw)
                 qi = nl.ndarray((mw, RB), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(dst=qi, data1=Pp[i], data2=wt, op=nl.multiply)
-                nisa.nc_matmul(dst=o_ps, stationary=s_sb[0:mw, i, 0:D], moving=qi, accumulate=True)
+                nisa.nc_matmul(
+                    dst=o_ps, stationary=s_sb[0:mw, i, 0:D], moving=qi, accumulate=(i > 0)
+                )
             o_sb = nl.ndarray((D, RB), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=o_sb, src=o_ps)
             nisa.dma_copy(dst=out[0:D, r0 : r0 + RB], src=o_sb)
@@ -519,19 +526,19 @@ if HAS_NKI:
                 gw = nl.ndarray((mw, RB), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(dst=gw, data1=ps, data2=wt, op=nl.multiply)
                 GW.append(gw)
-            dxT_ps = nl.zeros((L + 1, RB), dtype=nl.float32, buffer=nl.psum)
+            dxT_ps = nl.ndarray((L + 1, RB), dtype=nl.float32, buffer=nl.psum)
             for ja in range(nA):
                 a0 = ja * P
                 aw = min(P, A - a0)
                 X0, X1, X2 = _symcon_factors(sel_sb, xT, L, a0, aw, RB, ja)
-                R_ps = nl.zeros((aw, RB), dtype=nl.float32, buffer=nl.psum)
+                R_ps = nl.ndarray((aw, RB), dtype=nl.float32, buffer=nl.psum)
                 for i in range(nM):
                     mw = min(P, MK - i * P)
                     nisa.nc_matmul(
                         dst=R_ps,
                         stationary=usymT_sb[0:mw, i, a0 : a0 + aw],
                         moving=GW[i],
-                        accumulate=True,
+                        accumulate=(i > 0),
                     )
                 R = nl.ndarray((aw, RB), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.activation(dst=R, op=nl.copy, data=R_ps)
@@ -541,11 +548,12 @@ if HAS_NKI:
                     nisa.tensor_tensor(dst=tj, data1=fa, data2=fb, op=nl.multiply)
                     dj = nl.ndarray((aw, RB), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_tensor(dst=dj, data1=tj, data2=R, op=nl.multiply)
+                    # (ja, j) = (0, 0) writes and opens the group (#185).
                     nisa.nc_matmul(
                         dst=dxT_ps,
                         stationary=selT_sb[0:aw, ja, j, 0 : L + 1],
                         moving=dj,
-                        accumulate=True,
+                        accumulate=(ja > 0 or j > 0),
                     )
             dxT = nl.ndarray((L, RB), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=dxT, src=dxT_ps[0:L, 0:RB])

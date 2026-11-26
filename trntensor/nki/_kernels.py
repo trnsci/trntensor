@@ -179,6 +179,26 @@ def ao_to_mo_blocked_sbuf_bytes(nocc: int, tp: int, nb: int = 1 << 30) -> int:
     return 4 * (stage1 + stage2)
 
 
+def _psum_legs(n: int, opens: bool = True) -> tuple[tuple[int, int, bool], ...]:
+    """``range(n)`` as ``(start, count, opens)`` legs of one PSUM accumulation group.
+
+    The ``nc_matmul`` calls of a leg pass ``accumulate=not opens``. With
+    ``opens`` (and ``n > 0``) index 0 is a leg of its own whose matmuls write
+    with ``accumulate=False`` and so open the group; every other index
+    accumulates. A group that spans several loops passes ``opens`` only to
+    the legs that hold its first matmul.
+
+    On NeuronCore-v3 a matmul that accumulates onto PSUM initialised by a
+    non-matmul instruction (``nl.zeros`` is a memset) is undefined behaviour,
+    and the first write must use ``accumulate=False`` (trnsci/trnsci#185).
+    ``nl.affine_range`` indices may be symbolic, so the first step is peeled
+    into its own leg rather than passing ``accumulate=(k > 0)``.
+    """
+    if opens and n > 0:
+        return ((0, 1, True), (1, n - 1, False))
+    return ((0, n, False),)
+
+
 if HAS_NKI:
 
     @nki.jit
@@ -215,13 +235,17 @@ if HAS_NKI:
                 m_off = m * tile_m
                 n_off = n * tile_n
 
-                psum = nl.zeros((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
+                psum = nl.ndarray((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
 
-                for k in nl.affine_range(K // tile_k):
-                    k_off = k * tile_k
-                    a_t = nl.load_transpose2d(a[m_off : m_off + tile_m, k_off : k_off + tile_k])
-                    b_tile = nl.load(b[k_off : k_off + tile_k, n_off : n_off + tile_n])
-                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                for k0, nk, opens in _psum_legs(K // tile_k):
+                    for dk in nl.affine_range(nk):
+                        k = k0 + dk
+                        k_off = k * tile_k
+                        a_t = nl.load_transpose2d(a[m_off : m_off + tile_m, k_off : k_off + tile_k])
+                        b_tile = nl.load(b[k_off : k_off + tile_k, n_off : n_off + tile_n])
+                        nisa.nc_matmul(
+                            dst=psum, stationary=a_t, moving=b_tile, accumulate=not opens
+                        )
 
                 # NKI 0.3.0: nl.copy(psum, ...) returns a view. Allocate a
                 # fresh SBUF tile and nisa.tensor_copy PSUM into it before
@@ -269,15 +293,21 @@ if HAS_NKI:
                     m_off = m * tile_m
                     n_off = n * tile_n
 
-                    psum = nl.zeros((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
+                    psum = nl.ndarray((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
 
-                    for k in nl.affine_range(K // tile_k):
-                        k_off = k * tile_k
-                        a_t = nl.load_transpose2d(
-                            a[batch, m_off : m_off + tile_m, k_off : k_off + tile_k]
-                        )
-                        b_tile = nl.load(b[batch, k_off : k_off + tile_k, n_off : n_off + tile_n])
-                        nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                    for k0, nk, opens in _psum_legs(K // tile_k):
+                        for dk in nl.affine_range(nk):
+                            k = k0 + dk
+                            k_off = k * tile_k
+                            a_t = nl.load_transpose2d(
+                                a[batch, m_off : m_off + tile_m, k_off : k_off + tile_k]
+                            )
+                            b_tile = nl.load(
+                                b[batch, k_off : k_off + tile_k, n_off : n_off + tile_n]
+                            )
+                            nisa.nc_matmul(
+                                dst=psum, stationary=a_t, moving=b_tile, accumulate=not opens
+                            )
 
                     c_sbuf = nl.ndarray((tile_m, tile_n), dtype=a.dtype, buffer=nl.sbuf)
                     if use_sr:
@@ -364,24 +394,34 @@ if HAS_NKI:
                         n_off = n_tile * TILE_M
                         ev_n = nl.load(eps_vir_b[0:TILE_M, n_off : n_off + TILE_M])  # ε_b
 
-                        psum_T = nl.zeros((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
-                        psum_Tt = nl.zeros((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
+                        psum_T = nl.ndarray((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
+                        psum_Tt = nl.ndarray((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
 
-                        for k_p in nl.affine_range(NAUX // TILE_K):
-                            p_off = k_p * TILE_K
-                            # (TILE_K, TILE_M) tiles: partition = P chunk.
-                            Bi_m = nl.load(B_T[i, p_off : p_off + TILE_K, m_off : m_off + TILE_M])
-                            Bj_n = nl.load(B_T[j, p_off : p_off + TILE_K, n_off : n_off + TILE_M])
-                            Bj_m = nl.load(B_T[j, p_off : p_off + TILE_K, m_off : m_off + TILE_M])
-                            Bi_n = nl.load(B_T[i, p_off : p_off + TILE_K, n_off : n_off + TILE_M])
-                            # T[m,n] = Σ_P B[i,m,P] * B[j,n,P]
-                            nisa.nc_matmul(
-                                dst=psum_T, stationary=Bi_m, moving=Bj_n, accumulate=True
-                            )
-                            # T.T[m,n] = T[n,m] = Σ_P B[j,m,P] * B[i,n,P]
-                            nisa.nc_matmul(
-                                dst=psum_Tt, stationary=Bj_m, moving=Bi_n, accumulate=True
-                            )
+                        for k_p0, nk_p, opens in _psum_legs(NAUX // TILE_K):
+                            for dk_p in nl.affine_range(nk_p):
+                                k_p = k_p0 + dk_p
+                                p_off = k_p * TILE_K
+                                # (TILE_K, TILE_M) tiles: partition = P chunk.
+                                Bi_m = nl.load(
+                                    B_T[i, p_off : p_off + TILE_K, m_off : m_off + TILE_M]
+                                )
+                                Bj_n = nl.load(
+                                    B_T[j, p_off : p_off + TILE_K, n_off : n_off + TILE_M]
+                                )
+                                Bj_m = nl.load(
+                                    B_T[j, p_off : p_off + TILE_K, m_off : m_off + TILE_M]
+                                )
+                                Bi_n = nl.load(
+                                    B_T[i, p_off : p_off + TILE_K, n_off : n_off + TILE_M]
+                                )
+                                # T[m,n] = Σ_P B[i,m,P] * B[j,n,P]
+                                nisa.nc_matmul(
+                                    dst=psum_T, stationary=Bi_m, moving=Bj_n, accumulate=not opens
+                                )
+                                # T.T[m,n] = T[n,m] = Σ_P B[j,m,P] * B[i,n,P]
+                                nisa.nc_matmul(
+                                    dst=psum_Tt, stationary=Bj_m, moving=Bi_n, accumulate=not opens
+                                )
 
                         t = nl.ndarray((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.sbuf)
                         t_T = nl.ndarray((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.sbuf)
@@ -401,8 +441,8 @@ if HAS_NKI:
                         acc[...] = nl.subtract(acc, row)
 
                 # Cross-partition sum: accᵀ · ones → (1, 1).
-                psum_r = nl.zeros((1, 1), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dst=psum_r, stationary=acc, moving=ones, accumulate=True)
+                psum_r = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=psum_r, stationary=acc, moving=ones, accumulate=False)
                 e_ij = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(src=psum_r, dst=e_ij)
                 nl.store(partial[i : i + 1, j : j + 1], value=e_ij)
@@ -472,16 +512,18 @@ if HAS_NKI:
             # ------------------------------------------------------------------
             for v_tile in nl.affine_range(NBASIS // TILE_K):
                 v_off = v_tile * TILE_K
-                psum_1 = nl.zeros((TILE_K, NOCC), dtype=nl.float32, buffer=nl.psum)
-                for k_mu in nl.affine_range(NBASIS // TILE_K):
-                    k_off = k_mu * TILE_K
-                    # eri tile: (TILE_K, TILE_K) — partition=μ_chunk, free=ν_chunk
-                    eri_tile = nl.load(eri[k_off : k_off + TILE_K, v_off : v_off + TILE_K, p])
-                    # C_occ tile: (TILE_K, NOCC) — partition=μ_chunk, free=i
-                    C_occ_tile = nl.load(C_occ[k_off : k_off + TILE_K, 0:NOCC])
-                    nisa.nc_matmul(
-                        dst=psum_1, stationary=eri_tile, moving=C_occ_tile, accumulate=True
-                    )
+                psum_1 = nl.ndarray((TILE_K, NOCC), dtype=nl.float32, buffer=nl.psum)
+                for k_mu0, nk_mu, opens in _psum_legs(NBASIS // TILE_K):
+                    for dk_mu in nl.affine_range(nk_mu):
+                        k_mu = k_mu0 + dk_mu
+                        k_off = k_mu * TILE_K
+                        # eri tile: (TILE_K, TILE_K) — partition=μ_chunk, free=ν_chunk
+                        eri_tile = nl.load(eri[k_off : k_off + TILE_K, v_off : v_off + TILE_K, p])
+                        # C_occ tile: (TILE_K, NOCC) — partition=μ_chunk, free=i
+                        C_occ_tile = nl.load(C_occ[k_off : k_off + TILE_K, 0:NOCC])
+                        nisa.nc_matmul(
+                            dst=psum_1, stationary=eri_tile, moving=C_occ_tile, accumulate=not opens
+                        )
                 # PSUM → SBUF → kernel-scratch HBM for this ν-chunk.
                 inter_sbuf = nl.ndarray((TILE_K, NOCC), dtype=eri.dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(src=psum_1, dst=inter_sbuf)
@@ -494,16 +536,21 @@ if HAS_NKI:
             # ------------------------------------------------------------------
             for a_tile in nl.affine_range(NVIR // TILE_N):
                 a_off = a_tile * TILE_N
-                psum_2 = nl.zeros((NOCC, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for k_nu in nl.affine_range(NBASIS // TILE_K):
-                    k_off = k_nu * TILE_K
-                    # interᵀ tile: (TILE_K, NOCC) — partition=ν_chunk, free=i.
-                    inter_tile = nl.load(inter_hbm[k_off : k_off + TILE_K, 0:NOCC, p])
-                    # C_vir tile: (TILE_K, TILE_N) — partition=ν_chunk, free=a_chunk
-                    C_vir_tile = nl.load(C_vir[k_off : k_off + TILE_K, a_off : a_off + TILE_N])
-                    nisa.nc_matmul(
-                        dst=psum_2, stationary=inter_tile, moving=C_vir_tile, accumulate=True
-                    )
+                psum_2 = nl.ndarray((NOCC, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for k_nu0, nk_nu, opens in _psum_legs(NBASIS // TILE_K):
+                    for dk_nu in nl.affine_range(nk_nu):
+                        k_nu = k_nu0 + dk_nu
+                        k_off = k_nu * TILE_K
+                        # interᵀ tile: (TILE_K, NOCC) — partition=ν_chunk, free=i.
+                        inter_tile = nl.load(inter_hbm[k_off : k_off + TILE_K, 0:NOCC, p])
+                        # C_vir tile: (TILE_K, TILE_N) — partition=ν_chunk, free=a_chunk
+                        C_vir_tile = nl.load(C_vir[k_off : k_off + TILE_K, a_off : a_off + TILE_N])
+                        nisa.nc_matmul(
+                            dst=psum_2,
+                            stationary=inter_tile,
+                            moving=C_vir_tile,
+                            accumulate=not opens,
+                        )
                 out_sbuf = nl.ndarray((NOCC, TILE_N), dtype=eri.dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(src=psum_2, dst=out_sbuf)
                 nl.store(B_out[0:NOCC, a_off : a_off + TILE_N, p], value=out_sbuf)
@@ -518,8 +565,9 @@ if HAS_NKI:
 # 2``) and every program takes its share of the work; at LNC=1 there is one
 # program. No DMA transposes: operands are either laid out by the host so the
 # contraction index is the leading (partition) axis, or transposed on the
-# Tensor Engine from SBUF. PSUM tiles are fresh ``nl.zeros`` per output block,
-# at most one 2 KiB bank per partition, accumulated with ``accumulate=True``.
+# Tensor Engine from SBUF. PSUM tiles are fresh per output block, at most one
+# 2 KiB bank per partition; the first matmul of each accumulation group writes
+# with ``accumulate=False`` and the rest accumulate (``_psum_legs``, #185).
 
 if HAS_NKI:
 
@@ -590,14 +638,18 @@ if HAS_NKI:
                 a_off = a * TILE
                 for b in nl.affine_range(NB):
                     b_off = b * TN
-                    pt = nl.zeros((TILE, TN), dtype=nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(NK):
-                        nisa.nc_matmul(
-                            dst=pt,
-                            stationary=bi_sb[0:TILE, k * NVIR + a_off : k * NVIR + a_off + TILE],
-                            moving=bj_sb[0:TILE, k * NVIR + b_off : k * NVIR + b_off + TN],
-                            accumulate=True,
-                        )
+                    pt = nl.ndarray((TILE, TN), dtype=nl.float32, buffer=nl.psum)
+                    for k0, nk, opens in _psum_legs(NK):
+                        for dk in nl.affine_range(nk):
+                            k = k0 + dk
+                            nisa.nc_matmul(
+                                dst=pt,
+                                stationary=bi_sb[
+                                    0:TILE, k * NVIR + a_off : k * NVIR + a_off + TILE
+                                ],
+                                moving=bj_sb[0:TILE, k * NVIR + b_off : k * NVIR + b_off + TN],
+                                accumulate=not opens,
+                            )
                     nisa.tensor_copy(
                         src=pt, dst=t_all[0:TILE, a * NVIR + b_off : a * NVIR + b_off + TN]
                     )
@@ -720,14 +772,16 @@ if HAS_NKI:
                     # NUM ν per matmul: one 512-column moving pass (one PSUM bank).
                     for ug in nl.affine_range(NUB // NUM):
                         u0 = ug * NUM
-                        px = nl.zeros((osz, NUM, TP), dtype=nl.float32, buffer=nl.psum)
-                        for k in nl.affine_range(NKB):
-                            nisa.nc_matmul(
-                                dst=px,
-                                stationary=co_sb[0:TILE, k * NOCC + o0 : k * NOCC + o0 + osz],
-                                moving=e_blk[0:TILE, k, u0 : u0 + NUM, 0:TP],
-                                accumulate=True,
-                            )
+                        px = nl.ndarray((osz, NUM, TP), dtype=nl.float32, buffer=nl.psum)
+                        for k0, nk, opens in _psum_legs(NKB):
+                            for dk in nl.affine_range(nk):
+                                k = k0 + dk
+                                nisa.nc_matmul(
+                                    dst=px,
+                                    stationary=co_sb[0:TILE, k * NOCC + o0 : k * NOCC + o0 + osz],
+                                    moving=e_blk[0:TILE, k, u0 : u0 + NUM, 0:TP],
+                                    accumulate=not opens,
+                                )
                         nisa.tensor_copy(src=px, dst=x_sb[0:osz, u0 : u0 + NUM, 0:TP])
                     nl.store(x_hbm[o0 : o0 + osz, v0 : v0 + NUB, p_off : p_off + TP], value=x_sb)
             # Stage 2: B[i, a-tile, Pc], NI occupied orbitals per 512-column
@@ -745,16 +799,18 @@ if HAS_NKI:
                         ),
                     )
                 for av in nl.affine_range(NAV):
-                    pb = nl.zeros((TILE, ni, TP), dtype=nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(NKB):
-                        nisa.nc_matmul(
-                            dst=pb,
-                            stationary=cv_sb[
-                                0:TILE, k * NVIR + av * TILE : k * NVIR + (av + 1) * TILE
-                            ],
-                            moving=x_g[0:TILE, k, 0:ni, 0:TP],
-                            accumulate=True,
-                        )
+                    pb = nl.ndarray((TILE, ni, TP), dtype=nl.float32, buffer=nl.psum)
+                    for k0, nk, opens in _psum_legs(NKB):
+                        for dk in nl.affine_range(nk):
+                            k = k0 + dk
+                            nisa.nc_matmul(
+                                dst=pb,
+                                stationary=cv_sb[
+                                    0:TILE, k * NVIR + av * TILE : k * NVIR + (av + 1) * TILE
+                                ],
+                                moving=x_g[0:TILE, k, 0:ni, 0:TP],
+                                accumulate=not opens,
+                            )
                     b_sb = nl.ndarray((TILE, ni, TP), dtype=eri.dtype, buffer=nl.sbuf)
                     nisa.tensor_copy(src=pb, dst=b_sb)
                     nisa.dma_copy(
@@ -885,10 +941,12 @@ if HAS_NKI:
             po0 = o_base + pas[0][0]
             pw = pas[-1][0] + pas[-1][1] - pas[0][0]
             accs = [
-                [nl.zeros((osz, NUM, TP), dtype=nl.float32, buffer=nl.psum) for _ in range(NUG)]
+                [nl.ndarray((osz, NUM, TP), dtype=nl.float32, buffer=nl.psum) for _ in range(NUG)]
                 for _, osz in pas
             ]
-            for k0, kbs in kblocks:
+            # Each μ sum is one PSUM accumulation group across the μ blocks:
+            # the first matmul (block 0, tile 0) opens it (_psum_legs, #185).
+            for kb_i, (k0, kbs) in enumerate(kblocks):
                 idx_sb = nl.ndarray((TILE, kbs * NUB), dtype=nl.uint32, buffer=nl.sbuf)
                 nisa.dma_copy(dst=idx_sb, src=img[c, vb, 0:TILE, k0 * NUB : (k0 + kbs) * NUB])
                 e_blk = nl.ndarray((TILE, kbs, NUB, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
@@ -911,13 +969,15 @@ if HAS_NKI:
                 for j, (b0, osz) in enumerate(pas):
                     ob = b0 - pas[0][0]
                     for ug in range(NUG):
-                        for k in nl.affine_range(kbs):
-                            nisa.nc_matmul(
-                                dst=accs[j][ug],
-                                stationary=co_blk[0:TILE, k, ob : ob + osz],
-                                moving=e_blk[0:TILE, k, ug * NUM : (ug + 1) * NUM, 0:TP],
-                                accumulate=True,
-                            )
+                        for kl0, nkl, opens in _psum_legs(kbs, kb_i == 0):
+                            for dk in nl.affine_range(nkl):
+                                k = kl0 + dk
+                                nisa.nc_matmul(
+                                    dst=accs[j][ug],
+                                    stationary=co_blk[0:TILE, k, ob : ob + osz],
+                                    moving=e_blk[0:TILE, k, ug * NUM : (ug + 1) * NUM, 0:TP],
+                                    accumulate=not opens,
+                                )
             for j, (b0, osz) in enumerate(pas):
                 x_sb = nl.ndarray((osz, NUB, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
                 for ug in range(NUG):
@@ -931,9 +991,9 @@ if HAS_NKI:
             for ab in nl.affine_range(NAV // AVB):
                 a0 = ab * AVW
                 accs = [
-                    nl.zeros((TILE, ni, TP), dtype=nl.float32, buffer=nl.psum) for _ in range(AVB)
+                    nl.ndarray((TILE, ni, TP), dtype=nl.float32, buffer=nl.psum) for _ in range(AVB)
                 ]
-                for k0, kbs in kblocks:
+                for kb_i, (k0, kbs) in enumerate(kblocks):
                     x_g = nl.ndarray((TILE, kbs, ni, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
                     for k in nl.affine_range(kbs):
                         r0 = (k0 + k) * TILE
@@ -951,13 +1011,15 @@ if HAS_NKI:
                         ),
                     )
                     for j in range(AVB):
-                        for k in nl.affine_range(kbs):
-                            nisa.nc_matmul(
-                                dst=accs[j],
-                                stationary=cv_blk[0:TILE, k, j * TILE : (j + 1) * TILE],
-                                moving=x_g[0:TILE, k, 0:ni, 0:TP],
-                                accumulate=True,
-                            )
+                        for kl0, nkl, opens in _psum_legs(kbs, kb_i == 0):
+                            for dk in nl.affine_range(nkl):
+                                k = kl0 + dk
+                                nisa.nc_matmul(
+                                    dst=accs[j],
+                                    stationary=cv_blk[0:TILE, k, j * TILE : (j + 1) * TILE],
+                                    moving=x_g[0:TILE, k, 0:ni, 0:TP],
+                                    accumulate=not opens,
+                                )
                 for j in range(AVB):
                     b_sb = nl.ndarray((TILE, ni, TP), dtype=eri_v.dtype, buffer=nl.sbuf)
                     nisa.tensor_copy(src=accs[j], dst=b_sb)
@@ -1213,14 +1275,16 @@ if HAS_NKI:
                 for u in nl.affine_range(NUB):
                     for s in range(ns):
                         ms = min(TILE, w - s * TILE)
-                        px = nl.zeros((ms, NOCC), dtype=nl.float32, buffer=nl.psum)
-                        for k in nl.affine_range(NKB):
-                            nisa.nc_matmul(
-                                dst=px,
-                                stationary=e_blk[0:TILE, k, u, s * TILE : s * TILE + ms],
-                                moving=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
-                                accumulate=True,
-                            )
+                        px = nl.ndarray((ms, NOCC), dtype=nl.float32, buffer=nl.psum)
+                        for k0, nk, opens in _psum_legs(NKB):
+                            for dk in nl.affine_range(nk):
+                                k = k0 + dk
+                                nisa.nc_matmul(
+                                    dst=px,
+                                    stationary=e_blk[0:TILE, k, u, s * TILE : s * TILE + ms],
+                                    moving=co_sb[0:TILE, k * NOCC : (k + 1) * NOCC],
+                                    accumulate=not opens,
+                                )
                         nisa.tensor_copy(src=px, dst=x_sb[0:ms, s, 0:NOCC, vb * NUB + u])
             for s in range(ns):
                 ms = min(TILE, w - s * TILE)
@@ -1280,39 +1344,52 @@ if HAS_NKI:
             g_lo = lo // NVC
             W = NB - lo
             accs = [
-                nl.zeros((TILE, w), dtype=nl.float32, buffer=nl.psum) for (_m, _v0, w) in blocks
+                nl.ndarray((TILE, w), dtype=nl.float32, buffer=nl.psum) for (_m, _v0, w) in blocks
             ]
-            for r0, nt, ms in ((0, NTF, TILE), (NTF * TILE, 1 if TAIL else 0, TAIL)):
-                for t in nl.affine_range(nt):
-                    for i_base, ng, gi in ((0, NGF, GI), (NGF * GI, 1 if GR else 0, GR)):
-                        for ig in nl.affine_range(ng):
-                            i0 = pid * NO_per + i_base + ig * gi
-                            xg = nl.ndarray(
-                                (ms, NVG - g_lo, gi, NVC), dtype=nl.float32, buffer=nl.sbuf
-                            )
-                            nisa.dma_copy(
-                                dst=xg,
-                                src=xt[
-                                    r0 + t * TILE : r0 + t * TILE + ms,
-                                    g_lo:NVG,
-                                    i0 : i0 + gi,
-                                    0:NVC,
-                                ],
-                            )
-                            for ii in nl.affine_range(gi):
-                                xr = nl.ndarray((ms, W), dtype=nl.float32, buffer=nl.sbuf)
-                                nisa.tensor_copy(
-                                    dst=xr.reshape_dim(1, (NVG - g_lo, NVC)),
-                                    src=xg[0:ms, 0 : NVG - g_lo, ii, 0:NVC],
-                                )
-                                for b, (m, v0, w) in enumerate(blocks):
-                                    a0 = m * TILE - lo
-                                    nisa.nc_matmul(
-                                        dst=accs[b],
-                                        stationary=xr[0:ms, a0 : a0 + TILE],
-                                        moving=xr[0:ms, v0 - lo : v0 - lo + w],
-                                        accumulate=True,
+            # One accumulation group per K block over every aux row and orbital;
+            # its first matmul (first row tile, orbital group and orbital) opens
+            # it (_psum_legs, #185). Empty row and orbital groups are skipped.
+            rgroups = [g for g in ((0, NTF, TILE), (NTF * TILE, 1 if TAIL else 0, TAIL)) if g[1]]
+            igroups = [g for g in ((0, NGF, GI), (NGF * GI, 1 if GR else 0, GR)) if g[1]]
+            for r_i, (r0, nt, ms) in enumerate(rgroups):
+                for t0, ntl, t_opens in _psum_legs(nt, r_i == 0):
+                    for dt in nl.affine_range(ntl):
+                        t = t0 + dt
+                        for i_i, (i_base, ng, gi) in enumerate(igroups):
+                            for g0, ngl, g_opens in _psum_legs(ng, t_opens and i_i == 0):
+                                for dg in nl.affine_range(ngl):
+                                    ig = g0 + dg
+                                    i0 = pid * NO_per + i_base + ig * gi
+                                    xg = nl.ndarray(
+                                        (ms, NVG - g_lo, gi, NVC), dtype=nl.float32, buffer=nl.sbuf
                                     )
+                                    nisa.dma_copy(
+                                        dst=xg,
+                                        src=xt[
+                                            r0 + t * TILE : r0 + t * TILE + ms,
+                                            g_lo:NVG,
+                                            i0 : i0 + gi,
+                                            0:NVC,
+                                        ],
+                                    )
+                                    for ii0, nii, opens in _psum_legs(gi, g_opens):
+                                        for dii in nl.affine_range(nii):
+                                            ii = ii0 + dii
+                                            xr = nl.ndarray(
+                                                (ms, W), dtype=nl.float32, buffer=nl.sbuf
+                                            )
+                                            nisa.tensor_copy(
+                                                dst=xr.reshape_dim(1, (NVG - g_lo, NVC)),
+                                                src=xg[0:ms, 0 : NVG - g_lo, ii, 0:NVC],
+                                            )
+                                            for b, (m, v0, w) in enumerate(blocks):
+                                                a0 = m * TILE - lo
+                                                nisa.nc_matmul(
+                                                    dst=accs[b],
+                                                    stationary=xr[0:ms, a0 : a0 + TILE],
+                                                    moving=xr[0:ms, v0 - lo : v0 - lo + w],
+                                                    accumulate=not opens,
+                                                )
             for b, (m, v0, w) in enumerate(blocks):
                 kb = nl.ndarray((TILE, w), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(dst=kb, src=kin[pid, m * TILE : (m + 1) * TILE, v0 : v0 + w])
@@ -1409,9 +1486,9 @@ if HAS_NKI:
             dsb = nl.ndarray((1, w), dtype=nl.float32, buffer=nl.sbuf)
             for j0 in range(0, w, TILE_N):
                 jw = min(TILE_N, w - j0)
-                ps = nl.zeros((1, jw), dtype=nl.float32, buffer=nl.psum)
+                ps = nl.ndarray((1, jw), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(
-                    dst=ps, stationary=ones, moving=acc[0:TILE, j0 : j0 + jw], accumulate=True
+                    dst=ps, stationary=ones, moving=acc[0:TILE, j0 : j0 + jw], accumulate=False
                 )
                 nisa.tensor_copy(src=ps, dst=dsb[0:1, j0 : j0 + jw])
             nl.store(out[pid, 0:1, c0 : c0 + w], value=dsb)
