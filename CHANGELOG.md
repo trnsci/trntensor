@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **PSUM accumulation groups now open with a matmul write
+  (trnsci/trnsci#185).** The NKI kernels zeroed PSUM tiles with
+  `nl.zeros(..., buffer=nl.psum)` (a memset) and then accumulated into them
+  with `nisa.nc_matmul(..., accumulate=True)`. The `nc_matmul` docs make that
+  undefined behaviour on NeuronCore-v3 (Trn2): accumulating onto PSUM that a
+  non-matmul instruction initialised is not supported, and the first write
+  must use `accumulate=False`. Device results matched the references so far,
+  but they relied on that behaviour. All 20 sites now open each group with an
+  `accumulate=False` matmul: the matmul / batched-matmul, DF-MP2 energy,
+  AO→MO (4-index, Trn2, packed and blocked), DF exchange (half transform and
+  SYRK) and DF Coulomb `d` kernels peel the first K step of their
+  `nl.affine_range` loops into its own leg (`_psum_legs`), and the MACE
+  `conv_tp` backward and `symmetric_contraction` forward/backward kernels pass
+  `accumulate=(k > 0)` over their static loops. Those PSUM tiles are plain
+  `nl.ndarray`s now, so the redundant memsets are gone. Simulator outputs are
+  bitwise equal to 0.26.0 at the test shapes. A new static lint
+  (`tests/test_psum_accumulate_lint.py`) fails when a zeroed PSUM tile is a
+  matmul accumulation target, or when a tile is only ever accumulated into.
+
 ## [0.26.0] — 2026-11-25
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.1, native TorchNeuron) — see trnsci/trnsci#35.
