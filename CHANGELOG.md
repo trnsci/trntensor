@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-11-28
+
 ### Added
 
 - **MLIP edge and node ops: the rest of a MACE step as fused ops with
@@ -54,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New fixture `tests/fixtures/mace_mp0b2_edge.pt` (341 KiB), written by
     the exemplar's `check_fused.py --trntensor-fixture` from the public
     checkpoint.
+
 ### Fixed
 
 - **PSUM accumulation groups now open with a matmul write
