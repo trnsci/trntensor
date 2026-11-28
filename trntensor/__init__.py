@@ -7,6 +7,8 @@ for scientific computing. Part of the trnsci scientific computing suite.
 
 __version__ = "0.26.0"
 
+from ._region import get_region_backend, set_region_backend
+from ._region import region as compiled_region
 from .decompose import (
     cp_decompose,
     cp_reconstruct,
@@ -14,6 +16,14 @@ from .decompose import (
     tt_reconstruct,
     tucker_decompose,
     tucker_reconstruct,
+)
+from .edge import (
+    EdgeChainSpec,
+    EdgeMLP,
+    edge_chain,
+    edge_chain_spec,
+    sh_coefficients,
+    spherical_harmonics,
 )
 from .einsum import einsum, multi_einsum
 from .equivariant import (
@@ -26,6 +36,7 @@ from .equivariant import (
     wigner_3j,
     wigner_D,
 )
+from .linear import EquivariantLinearSpec, equivariant_linear, equivariant_linear_spec
 from .nki import HAS_NKI, get_backend, set_backend
 from .nki.dispatch import from_device, from_xla, to_device, to_xla
 from .parallel import ShardedTensor, gather, scatter
@@ -98,6 +109,18 @@ __all__ = [
     "SymmetricContractionSpec",
     "wigner_3j",
     "wigner_D",
+    "spherical_harmonics",
+    "sh_coefficients",
+    "edge_chain",
+    "edge_chain_spec",
+    "EdgeChainSpec",
+    "EdgeMLP",
+    "equivariant_linear",
+    "equivariant_linear_spec",
+    "EquivariantLinearSpec",
+    "set_region_backend",
+    "compiled_region",
+    "get_region_backend",
     "ShardedTensor",
     "scatter",
     "gather",

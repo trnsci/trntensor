@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MLIP edge and node ops: the rest of a MACE step as fused ops with
+  analytic backwards** (MLIP exemplar trnsci/trnsci#178, item 1). On the
+  MACE-MP-0b2 medium step on Trn2 at 216 atoms, about 92 of 118 ms went to
+  roughly 1,500 small aten launches outside the equivariant and graph
+  blocks.
+  - `spherical_harmonics(vectors, lmax=3)`: e3nn's real spherical harmonics
+    (basis, order and normalisation of `o3.SphericalHarmonics` for l ≤ 3).
+    The forward is one matmul of the degree ≤ 3 monomials against fixed
+    coefficients, and the backward is one matmul against their derivative
+    tables.
+  - `edge_chain(lengths, spec, r0)` with `edge_chain_spec(module=model)`:
+    the radial basis (Agnesi transform, Bessel basis, polynomial cutoff) and
+    every radial MLP that reads it, fused. It produces both layers'
+    `conv_tp` weights and edge densities `tanh(density_fn(·)²)`. The Agnesi
+    species constant is an input built once per neighbour list. Edges past
+    `r_max` contribute exactly zero, so padded edge buckets are safe.
+  - `equivariant_linear(x, spec, species=None)` with
+    `equivariant_linear_spec(module)`: an e3nn `o3.Linear` as one matmul per
+    irrep type (`W_l ⊗ I_{2l+1}`, probed once and checked exactly). The
+    one-hot `FullyConnectedTensorProduct` (MACE's `skip_tp`) becomes a
+    per-species map.
+  - Each op is one autograd node with an analytic backward, written in
+    differentiable aten, so double backward works. Against MACE at the six
+    MLIP exemplar captures, outputs match MACE fp32 to ≤ 4.6e-7 relative.
+    Input gradients for the real force-step cotangents are no further from
+    fp64 than MACE's own fp32 gradients.
+  - `set_region_backend("neuron")` (`TRNTENSOR_REGION_BACKEND`) runs the
+    forward and backward bodies of these ops as one
+    `torch.compile(dynamic=False)` graph per direction and call site.
+    `compiled_region(fn)` exposes the same wrapper.
+  - NKI kernels for `spherical_harmonics` and `edge_chain`, one launch per
+    direction. Edges are laid out partition-major (`[128, M·F]` views). The
+    radial MLPs run on the Tensor Engine with the weights resident in SBUF.
+    `sin` stays inside the Scalar Engine's accurate `[−π, π]` range. The
+    kernels are native `nki_op`s with `register_autograd`, or
+    `autograd.Function` on the XLA path and the simulator. They pass MLIR
+    verification for trn1 and trn2 (LNC 1 and 2). In `nki.simulate` they
+    match the fp64 PyTorch path to ≤ 2e-6 relative, and MACE at the
+    committed fixture. They are not yet validated on a device, so `"auto"`
+    leaves them off; `set_backend("nki")` or `TRNTENSOR_EDGE_NKI=1` selects
+    them. `tests/test_edge_neuron.py` holds the device checks and a timing
+    harness.
+  - New fixture `tests/fixtures/mace_mp0b2_edge.pt` (341 KiB), written by
+    the exemplar's `check_fused.py --trntensor-fixture` from the public
+    checkpoint.
 ### Fixed
 
 - **PSUM accumulation groups now open with a matmul write

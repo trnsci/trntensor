@@ -108,6 +108,9 @@ core, factors = trntensor.tucker_decompose(tensor, ranks=(5, 5, 5))
 | Sharding | `ShardedTensor`, `scatter`, `gather` | Output- and reduce-parallel sharded contractions |
 | Equivariant | `conv_tp` | e3nn "uvu" tensor product (MACE interaction), forward + ∂x/∂y/∂w |
 | Equivariant | `symmetric_contraction` | MACE product basis (correlation ≤ 3), forward + ∂x |
+| MLIP edge | `spherical_harmonics` | e3nn real spherical harmonics, l ≤ 3, forward + ∂v |
+| MLIP edge | `edge_chain` | Fused radial basis + cutoff + radial MLPs (the `conv_tp` weights), forward + ∂r |
+| MLIP node | `equivariant_linear` | e3nn `Linear` / one-hot skip tensor product as one matmul per irrep, forward + ∂x |
 
 ## Status
 
