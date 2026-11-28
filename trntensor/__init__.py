@@ -5,7 +5,7 @@ Einstein summation, contraction planning, and tensor decompositions
 for scientific computing. Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 from ._region import get_region_backend, set_region_backend
 from ._region import region as compiled_region
